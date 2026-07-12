@@ -1,0 +1,1 @@
+# rustfmt 기본값 사용 (edition은 각 crate Cargo.toml에서 전달됨)
