@@ -83,3 +83,147 @@ impl Command {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn send_parses_body_positional() {
+        let cli = Cli::try_parse_from(["discord", "send", "123", "hello world"]).unwrap();
+        match cli.command {
+            Command::Send {
+                channel,
+                body,
+                text,
+            } => {
+                assert_eq!(channel, "123");
+                assert_eq!(body.as_deref(), Some("hello world"));
+                assert_eq!(text, None);
+            }
+            other => panic!("expected Send, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn send_parses_text_flag() {
+        let cli = Cli::try_parse_from(["discord", "send", "123", "--text", "hi"]).unwrap();
+        match cli.command {
+            Command::Send {
+                channel,
+                body,
+                text,
+            } => {
+                assert_eq!(channel, "123");
+                assert_eq!(body, None);
+                assert_eq!(text.as_deref(), Some("hi"));
+            }
+            other => panic!("expected Send, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn read_uses_default_limit_when_omitted() {
+        let cli = Cli::try_parse_from(["discord", "read", "123"]).unwrap();
+        match cli.command {
+            Command::Read {
+                channel,
+                after,
+                limit,
+            } => {
+                assert_eq!(channel, "123");
+                assert_eq!(after, None);
+                assert_eq!(limit, 50);
+            }
+            other => panic!("expected Read, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn read_parses_after_and_limit_overrides() {
+        let cli = Cli::try_parse_from(["discord", "read", "123", "--after", "99", "--limit", "10"])
+            .unwrap();
+        match cli.command {
+            Command::Read {
+                channel,
+                after,
+                limit,
+            } => {
+                assert_eq!(channel, "123");
+                assert_eq!(after.as_deref(), Some("99"));
+                assert_eq!(limit, 10);
+            }
+            other => panic!("expected Read, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn wait_uses_default_timeout_interval_and_limit_when_omitted() {
+        let cli = Cli::try_parse_from(["discord", "wait", "123"]).unwrap();
+        match cli.command {
+            Command::Wait {
+                channel,
+                after,
+                timeout,
+                interval,
+                limit,
+            } => {
+                assert_eq!(channel, "123");
+                assert_eq!(after, None);
+                assert_eq!(timeout, 60);
+                assert_eq!(interval, 5);
+                assert_eq!(limit, 50);
+            }
+            other => panic!("expected Wait, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn wait_parses_all_overrides() {
+        let cli = Cli::try_parse_from([
+            "discord",
+            "wait",
+            "123",
+            "--after",
+            "5",
+            "--timeout",
+            "30",
+            "--interval",
+            "2",
+            "--limit",
+            "20",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Wait {
+                channel,
+                after,
+                timeout,
+                interval,
+                limit,
+            } => {
+                assert_eq!(channel, "123");
+                assert_eq!(after.as_deref(), Some("5"));
+                assert_eq!(timeout, 30);
+                assert_eq!(interval, 2);
+                assert_eq!(limit, 20);
+            }
+            other => panic!("expected Wait, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn global_flags_apply_alongside_subcommand() {
+        let cli =
+            Cli::try_parse_from(["discord", "--human", "--token", "abc", "send", "123", "hi"])
+                .unwrap();
+        assert!(cli.human);
+        assert_eq!(cli.token.as_deref(), Some("abc"));
+        assert_eq!(cli.command.name(), "send");
+    }
+
+    #[test]
+    fn missing_subcommand_is_a_usage_error() {
+        assert!(Cli::try_parse_from(["discord"]).is_err());
+    }
+}

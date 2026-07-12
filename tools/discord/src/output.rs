@@ -353,4 +353,66 @@ mod tests {
         assert_eq!(code, 3);
         assert_eq!(text, "error [auth]: invalid token (http 401)");
     }
+
+    #[test]
+    fn human_send_success_renders_readable_text() {
+        let payload = Payload::Send(SendData {
+            message_id: "123".into(),
+            channel_id: "456".into(),
+            timestamp: "2024-01-01T00:00:00Z".into(),
+        });
+        let (text, code) = render("send", &Ok(payload), true);
+        assert_eq!(code, 0);
+        assert_eq!(
+            text,
+            "sent message 123 to channel 456 at 2024-01-01T00:00:00Z"
+        );
+    }
+
+    #[test]
+    fn human_read_success_renders_readable_text() {
+        let payload = Payload::Read(ReadData {
+            channel_id: "c".into(),
+            count: 1,
+            cursor: Some("10".into()),
+            messages: vec![sample_message()],
+        });
+        let (text, code) = render("read", &Ok(payload), true);
+        assert_eq!(code, 0);
+        assert_eq!(
+            text,
+            "channel c: 1 message(s) (next --after 10)\n[2024-01-01T00:00:00Z] alice: hi"
+        );
+    }
+
+    #[test]
+    fn human_wait_new_messages_renders_readable_text() {
+        let payload = Payload::Wait(WaitData {
+            channel_id: "c".into(),
+            count: 1,
+            cursor: None,
+            timed_out: false,
+            messages: vec![sample_message()],
+        });
+        let (text, code) = render("wait", &Ok(payload), true);
+        assert_eq!(code, 0);
+        assert_eq!(
+            text,
+            "channel c: 1 new message(s)\n[2024-01-01T00:00:00Z] alice: hi"
+        );
+    }
+
+    #[test]
+    fn human_wait_timeout_renders_readable_text() {
+        let payload = Payload::Wait(WaitData {
+            channel_id: "c".into(),
+            count: 0,
+            cursor: None,
+            timed_out: true,
+            messages: vec![],
+        });
+        let (text, code) = render("wait", &Ok(payload), true);
+        assert_eq!(code, 0);
+        assert_eq!(text, "channel c: timed out, no new messages");
+    }
 }

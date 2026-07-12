@@ -156,4 +156,18 @@ mod tests {
         let err = parse_config("{not json").unwrap_err();
         assert_eq!(err.kind, ErrorKind::Config);
     }
+
+    #[test]
+    fn load_config_missing_file_returns_none_not_error() {
+        // Unique path under the OS temp dir that is guaranteed not to exist;
+        // a missing config file is a valid state (token may come from flag/env).
+        let path = std::env::temp_dir().join(format!(
+            "areum-discord-missing-config-{}.json",
+            std::process::id()
+        ));
+        assert!(!path.exists());
+
+        let result = load_config(&path).unwrap();
+        assert!(result.is_none());
+    }
 }

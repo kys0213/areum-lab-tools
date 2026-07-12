@@ -43,3 +43,41 @@ pub struct SentMessage {
     pub channel_id: String,
     pub timestamp: String,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn message_deserializes_with_empty_content() {
+        let json = r#"{
+            "id": "10",
+            "channel_id": "chan",
+            "author": {"id": "u1", "username": "alice", "bot": false},
+            "content": "",
+            "timestamp": "2024-01-01T00:00:00Z"
+        }"#;
+        let message: Message = serde_json::from_str(json).unwrap();
+        assert_eq!(message.content, "");
+    }
+
+    #[test]
+    fn author_bot_defaults_to_false_when_field_is_absent() {
+        let json = r#"{"id": "u1", "username": "alice"}"#;
+        let author: Author = serde_json::from_str(json).unwrap();
+        assert!(!author.bot);
+    }
+
+    #[test]
+    fn message_with_absent_author_bot_field_deserializes() {
+        let json = r#"{
+            "id": "10",
+            "channel_id": "chan",
+            "author": {"id": "u1", "username": "alice"},
+            "content": "hi",
+            "timestamp": "2024-01-01T00:00:00Z"
+        }"#;
+        let message: Message = serde_json::from_str(json).unwrap();
+        assert!(!message.author.bot);
+    }
+}
