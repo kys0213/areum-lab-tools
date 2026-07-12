@@ -1,0 +1,79 @@
+name: Release
+
+# 도구별 독립 릴리스. 태그 형식: `<tool>-vX.Y.Z` (예: discord-v0.1.0).
+# version은 항상 태그의 "마지막" "-v" 뒤 문자열이다 — 도구 이름 자체에 "-v"가
+# 들어 있어도(예: `my-v-tool-v1.0.0`) 안전하게 분리된다.
+# tools/<tool>/Cargo.toml의 version 리터럴과 태그 버전이 다르면 fail-fast.
+on:
+  push:
+    tags: ['*-v[0-9]+.[0-9]+.[0-9]+']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tool tag to build (e.g. hello-v0.0.0)"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    # Apple Silicon 네이티브 러너 — aarch64-apple-darwin 빌드에 rustup target
+    # add가 불필요하다.
+    runs-on: macos-14
+    strategy:
+      matrix:
+        # 실대상 발생 시 다른 target(x86_64-apple-darwin 등)을 이 배열에 추가.
+        target: [aarch64-apple-darwin]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Parse tag into tool + version
+        id: parse
+        run: |
+          TAG="${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}"
+          # version은 마지막 "-v" 뒤 (도구 이름에 "-v"가 포함될 수 있으므로 %-v*/##*-v 사용).
+          TOOL="${TAG%-v*}"
+          VERSION="${TAG##*-v}"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "tool=$TOOL" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Validate tag version matches Cargo.toml (fail-fast)
+        run: |
+          TOOL="${{ steps.parse.outputs.tool }}"
+          VERSION="${{ steps.parse.outputs.version }}"
+          MANIFEST="tools/$TOOL/Cargo.toml"
+
+          if [ ! -d "tools/$TOOL" ]; then
+            echo "::error::tools/$TOOL does not exist (parsed tool from tag ${{ steps.parse.outputs.tag }})"
+            exit 1
+          fi
+
+          MANIFEST_VERSION="$(grep -m1 '^version = ' "$MANIFEST" | sed -E 's/version = "(.*)"/\1/')"
+
+          if [ "$MANIFEST_VERSION" != "$VERSION" ]; then
+            echo "::error::tag version ($VERSION) does not match $MANIFEST version ($MANIFEST_VERSION)"
+            exit 1
+          fi
+
+      # toolchain 버전/components는 rust-toolchain.toml이 SSOT이므로 여기서
+      # 재기재하지 않는다. 별도 Swatinem 캐시 스텝도 추가하지 않는다.
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+
+      - name: Build release binary
+        run: cargo build --release -p ${{ steps.parse.outputs.tool }} --target ${{ matrix.target }}
+
+      - name: Package tar.gz
+        run: |
+          TOOL="${{ steps.parse.outputs.tool }}"
+          VERSION="${{ steps.parse.outputs.version }}"
+          tar czf "$TOOL-$VERSION-${{ matrix.target }}.tar.gz" \
+            -C "target/${{ matrix.target }}/release" "$TOOL"
+
+      - name: Upload to GitHub Release
+        # workflow_dispatch는 빌드 검증용이므로 실제 태그 push일 때만 Release에 첨부.
+        if: github.event_name == 'push'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ steps.parse.outputs.tool }}-${{ steps.parse.outputs.version }}-${{ matrix.target }}.tar.gz
