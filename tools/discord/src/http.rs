@@ -213,6 +213,11 @@ mod tests {
     }
 
     #[test]
+    fn parse_retry_after_reads_header_integer_seconds() {
+        assert_eq!(parse_retry_after(Some("2"), None), Some(2000));
+    }
+
+    #[test]
     fn parse_retry_after_reads_body_seconds() {
         let body = serde_json::json!({ "retry_after": 0.25 });
         assert_eq!(parse_retry_after(None, Some(&body)), Some(250));
@@ -266,6 +271,21 @@ mod tests {
         assert_eq!(sent.id, "999");
         assert_eq!(sent.channel_id, "chan1");
         assert_eq!(sent.timestamp, "2024-01-01T00:00:00Z");
+    }
+
+    #[test]
+    fn deserialize_error_maps_json_parse_failure_to_api_kind_without_fallback() {
+        // A malformed body must surface as an Api error, not silently fall back
+        // to a default-constructed Message/SentMessage.
+        let body = b"{ not valid json";
+        let parse_err = serde_json::from_slice::<Message>(body).unwrap_err();
+        let err = deserialize_error(body, &parse_err);
+        assert_eq!(err.kind, ErrorKind::Api);
+        assert!(
+            err.message
+                .contains("failed to deserialize Discord response")
+        );
+        assert!(err.message.contains("not valid json"));
     }
 
     #[test]
