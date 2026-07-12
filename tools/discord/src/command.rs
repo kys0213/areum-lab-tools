@@ -497,6 +497,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn run_read_accepts_limit_boundaries_1_and_100() {
+        let api = MockDiscordApi::with_get_responses(vec![Ok(vec![]), Ok(vec![])]);
+
+        assert!(run_read(&api, "c", None, 1).await.is_ok());
+        assert!(run_read(&api, "c", None, 100).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn run_read_rejects_non_numeric_message_id_as_api_error() {
+        // A non-snowflake id in the response is an API contract violation,
+        // not a client-side usage mistake.
+        let api = MockDiscordApi::with_get_responses(vec![Ok(vec![message("not-a-number")])]);
+
+        let err = run_read(&api, "c", None, 50).await.unwrap_err();
+
+        assert_eq!(err.kind, ErrorKind::Api);
+    }
+
+    #[tokio::test]
     async fn run_read_passes_channel_after_and_limit_to_api() {
         let api = MockDiscordApi::with_get_responses(vec![Ok(vec![])]);
 
@@ -527,6 +546,32 @@ mod tests {
             other => panic!("expected Wait, got {other:?}"),
         }
         assert_eq!(sleeper.calls.borrow().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn run_wait_sorts_and_derives_cursor_same_as_read_when_found() {
+        // Wait reuses sort_ascending_by_id/newest_cursor; verify the found
+        // path applies the same ordering and cursor rule as `read`.
+        let api = MockDiscordApi::with_get_responses(vec![Ok(vec![
+            message("30"),
+            message("10"),
+            message("20"),
+        ])]);
+        let sleeper = FakeSleeper::new();
+
+        let payload = run_wait(&api, &sleeper, "c", None, 30, 5, 50)
+            .await
+            .unwrap();
+
+        match payload {
+            Payload::Wait(data) => {
+                let ids: Vec<&str> = data.messages.iter().map(|m| m.id.as_str()).collect();
+                assert_eq!(ids, vec!["10", "20", "30"]);
+                assert_eq!(data.count, 3);
+                assert_eq!(data.cursor.as_deref(), Some("30"));
+            }
+            other => panic!("expected Wait, got {other:?}"),
+        }
     }
 
     #[tokio::test]
@@ -575,6 +620,41 @@ mod tests {
         }
         assert_eq!(api.get_calls.borrow().len(), 4);
         assert_eq!(sleeper.calls.borrow().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn run_wait_poll_count_is_exact_when_timeout_divides_interval_evenly() {
+        // timeout 10 / interval 5 -> ceil(10/5) = 2 polls, 1 sleep between them.
+        let api = MockDiscordApi::with_get_responses(vec![Ok(vec![]), Ok(vec![])]);
+        let sleeper = FakeSleeper::new();
+
+        let payload = run_wait(&api, &sleeper, "c", None, 10, 5, 50)
+            .await
+            .unwrap();
+
+        match payload {
+            Payload::Wait(data) => assert!(data.timed_out),
+            other => panic!("expected Wait, got {other:?}"),
+        }
+        assert_eq!(api.get_calls.borrow().len(), 2);
+        assert_eq!(sleeper.calls.borrow().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn run_wait_polls_at_least_once_when_timeout_is_zero() {
+        // timeout 0 / interval 5 -> ceil(0/5) = 0, but max_polls floors at 1
+        // poll so `wait` always checks at least once.
+        let api = MockDiscordApi::with_get_responses(vec![Ok(vec![])]);
+        let sleeper = FakeSleeper::new();
+
+        let payload = run_wait(&api, &sleeper, "c", None, 0, 5, 50).await.unwrap();
+
+        match payload {
+            Payload::Wait(data) => assert!(data.timed_out),
+            other => panic!("expected Wait, got {other:?}"),
+        }
+        assert_eq!(api.get_calls.borrow().len(), 1);
+        assert_eq!(sleeper.calls.borrow().len(), 0);
     }
 
     #[tokio::test]
