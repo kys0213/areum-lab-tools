@@ -7,7 +7,7 @@
 
 INSTALL_ROOT ?= $(HOME)/.local
 
-.PHONY: help build release test lint fmt fmt-check check install install-all new clean
+.PHONY: help build release test lint fmt fmt-check check install install-all new clean dist-build dist-tag
 
 help: ## Show this help message
 	@echo "Available targets:"
@@ -63,3 +63,42 @@ new: ## Scaffold a new tool from templates/: make new NAME=<name>
 
 clean: ## Remove build artifacts
 	cargo clean
+
+dist-build: ## Package a release tarball into dist/: make dist-build TOOL=<name>
+	@if [ -z "$(TOOL)" ]; then \
+		echo "error: TOOL is required. usage: make dist-build TOOL=<name>" >&2; \
+		exit 1; \
+	fi
+	@VERSION=$$(grep -m1 '^version = ' tools/$(TOOL)/Cargo.toml | sed -E 's/version = "(.*)"/\1/'); \
+	if [ -z "$$VERSION" ]; then \
+		echo "error: could not read version from tools/$(TOOL)/Cargo.toml" >&2; \
+		exit 1; \
+	fi; \
+	cargo build --release -p $(TOOL) --target aarch64-apple-darwin; \
+	mkdir -p dist; \
+	tar czf "dist/$(TOOL)-$$VERSION-aarch64-apple-darwin.tar.gz" -C target/aarch64-apple-darwin/release $(TOOL); \
+	echo "created dist/$(TOOL)-$$VERSION-aarch64-apple-darwin.tar.gz"
+
+dist-tag: ## Tag + push a release: make dist-tag TOOL=<name> (needs clean tree on main)
+	@if [ -z "$(TOOL)" ]; then \
+		echo "error: TOOL is required. usage: make dist-tag TOOL=<name>" >&2; \
+		exit 1; \
+	fi
+	@if [ -n "$$(git status --porcelain)" ]; then \
+		echo "error: working tree is not clean; commit or stash changes first" >&2; \
+		exit 1; \
+	fi
+	@branch=$$(git rev-parse --abbrev-ref HEAD); \
+	if [ "$$branch" != "main" ]; then \
+		echo "error: dist-tag must run on main (current branch: $$branch)" >&2; \
+		exit 1; \
+	fi
+	@VERSION=$$(grep -m1 '^version = ' tools/$(TOOL)/Cargo.toml | sed -E 's/version = "(.*)"/\1/'); \
+	if [ -z "$$VERSION" ]; then \
+		echo "error: could not read version from tools/$(TOOL)/Cargo.toml" >&2; \
+		exit 1; \
+	fi; \
+	TAG="$(TOOL)-v$$VERSION"; \
+	git tag "$$TAG"; \
+	git push origin "$$TAG"; \
+	echo "tagged and pushed $$TAG"

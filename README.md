@@ -47,7 +47,51 @@ make install TOOL=hello INSTALL_ROOT=/path   # 설치 경로 지정
 make install-all                             # tools/* 전체 설치
 ```
 
-배포판(dist) 빌드/태깅 관련 문서는 이후 추가된다.
+## 배포 (Release)
+
+도구별로 독립적으로 릴리스한다. 태그 규약: `<tool>-vX.Y.Z` (예: `hello-v0.0.0`).
+**version은 항상 태그의 마지막 `-v` 뒤**다 (도구 이름에 `-v`가 포함돼도 안전하게
+분리된다). 태그의 버전은 `tools/<tool>/Cargo.toml`의 `version` 리터럴과 반드시
+일치해야 하며, 불일치 시 `release.yml`이 즉시 실패한다.
+
+### 릴리스 절차 (CI 경유)
+
+```sh
+# tools/<tool>/Cargo.toml의 version을 먼저 bump한 뒤 커밋/main 반영
+make dist-tag TOOL=hello   # 워킹트리 clean + main 브랜치일 때만 태그 push
+```
+
+`dist-tag`가 `hello-v0.0.0` 같은 태그를 push하면 GitHub Actions
+(`.github/workflows/release.yml`)가 macOS arm64(`aarch64-apple-darwin`)
+러너에서 바이너리를 빌드해 tar.gz로 패키징하고, 해당 태그의 GitHub Release에
+첨부한다.
+
+### 다른 머신에 설치하기
+
+```sh
+gh release download hello-v0.0.0 -R kys0213/areum-lab-tools -p '*aarch64-apple-darwin*'
+tar xz -C ~/.local/bin -f hello-0.0.0-aarch64-apple-darwin.tar.gz
+```
+
+미서명 바이너리이므로 macOS Gatekeeper가 격리(quarantine)할 수 있다. 실행이
+막히면 격리 속성을 제거한다.
+
+```sh
+xattr -d com.apple.quarantine ~/.local/bin/hello
+```
+
+폴백(대상 머신에 Rust가 있는 경우): `cargo install --git
+https://github.com/kys0213/areum-lab-tools hello`
+
+### 무설정 경로 (CI 없이 로컬에서)
+
+같은 아키텍처(macOS arm64) 머신에 직접 배포할 때는 CI 없이 로컬 빌드 후
+scp로 옮기면 된다.
+
+```sh
+make dist-build TOOL=hello   # dist/hello-0.0.0-aarch64-apple-darwin.tar.gz 생성
+scp dist/hello-0.0.0-aarch64-apple-darwin.tar.gz user@host:/tmp/
+```
 
 ## 디렉토리 구조
 
