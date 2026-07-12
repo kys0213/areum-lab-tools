@@ -70,7 +70,7 @@ impl HttpDiscordApi {
                 let retry_after_ms = parse_retry_after(header.as_deref(), body_json.as_ref());
 
                 match retry_after_ms {
-                    Some(ms) if retries < MAX_RATE_LIMIT_RETRIES => {
+                    Some(ms) if should_retry_after(ms) && retries < MAX_RATE_LIMIT_RETRIES => {
                         retries += 1;
                         tokio::time::sleep(Duration::from_millis(ms)).await;
                         continue;
@@ -153,27 +153,55 @@ fn network_error(err: reqwest::Error) -> AppError {
 }
 
 fn deserialize_error(body: &[u8], err: &serde_json::Error) -> AppError {
-    let snippet = String::from_utf8_lossy(body);
+    let snippet: String = String::from_utf8_lossy(body).chars().take(200).collect();
     AppError::new(
         ErrorKind::Api,
         format!("failed to deserialize Discord response: {err}; body: {snippet}"),
     )
 }
 
+/// Retry-after waits above this are not worth blocking the CLI process for —
+/// `execute` returns `RateLimit` immediately instead of sleeping, so the
+/// caller (agent) decides its own backoff for multi-minute delays.
+const MAX_RETRY_SLEEP_MS: u64 = 300_000;
+
+/// Whether `execute` should sleep and retry for a parsed retry-after value,
+/// rather than returning `RateLimit` immediately. Pure so the 300s boundary
+/// is testable without driving a real 429 loop.
+fn should_retry_after(retry_after_ms: u64) -> bool {
+    retry_after_ms <= MAX_RETRY_SLEEP_MS
+}
+
 /// Parses the 429 retry delay: `Retry-After` header (seconds, decimal) takes
 /// priority over the JSON body's `retry_after` (seconds, float). `None` when
-/// neither is parseable — the caller does not retry in that case.
+/// neither is parseable, including a value that parses as a float but is
+/// negative/NaN/infinite — such a source is treated as unparseable and the
+/// next source is tried, same as a plain parse failure.
 fn parse_retry_after(header: Option<&str>, body: Option<&serde_json::Value>) -> Option<u64> {
-    if let Some(seconds) = header.and_then(|h| h.parse::<f64>().ok()) {
-        return Some((seconds * 1000.0).round() as u64);
+    if let Some(ms) = header
+        .and_then(|h| h.parse::<f64>().ok())
+        .and_then(seconds_to_ms)
+    {
+        return Some(ms);
     }
-    if let Some(seconds) = body
+    if let Some(ms) = body
         .and_then(|v| v.get("retry_after"))
         .and_then(|v| v.as_f64())
+        .and_then(seconds_to_ms)
     {
-        return Some((seconds * 1000.0).round() as u64);
+        return Some(ms);
     }
     None
+}
+
+/// Converts seconds to milliseconds, rejecting negative/NaN/infinite input.
+/// Without this guard, a hostile "-5" saturates to 0ms (tight retry loop)
+/// and `f64::INFINITY` saturates to `u64::MAX`ms on the `as u64` cast.
+fn seconds_to_ms(seconds: f64) -> Option<u64> {
+    if !seconds.is_finite() || seconds < 0.0 {
+        return None;
+    }
+    Some((seconds * 1000.0).round() as u64)
 }
 
 #[cfg(test)]
@@ -238,6 +266,38 @@ mod tests {
     }
 
     #[test]
+    fn parse_retry_after_rejects_negative_header_seconds() {
+        // A hostile "-5" must not saturate to 0 and trigger a tight retry loop.
+        assert_eq!(parse_retry_after(Some("-5"), None), None);
+    }
+
+    #[test]
+    fn parse_retry_after_rejects_nan_and_infinite_header_seconds() {
+        assert_eq!(parse_retry_after(Some("NaN"), None), None);
+        assert_eq!(parse_retry_after(Some("inf"), None), None);
+    }
+
+    #[test]
+    fn parse_retry_after_falls_back_to_body_when_header_is_hostile() {
+        let body = serde_json::json!({ "retry_after": 0.25 });
+        assert_eq!(parse_retry_after(Some("-5"), Some(&body)), Some(250));
+    }
+
+    #[test]
+    fn parse_retry_after_parses_huge_seconds_but_should_retry_after_suppresses_it() {
+        // "1e12" seconds parses fine (no overflow/panic) but is far above the
+        // 300s ceiling — execute() must not sleep for it.
+        let ms = parse_retry_after(Some("1e12"), None).expect("huge finite value still parses");
+        assert!(!should_retry_after(ms));
+    }
+
+    #[test]
+    fn should_retry_after_allows_up_to_300_seconds() {
+        assert!(should_retry_after(300_000));
+        assert!(!should_retry_after(300_001));
+    }
+
+    #[test]
     fn get_messages_url_includes_after_when_present() {
         let url = get_messages_url(API_BASE, "123", Some("456"), 50);
         assert_eq!(
@@ -286,6 +346,22 @@ mod tests {
                 .contains("failed to deserialize Discord response")
         );
         assert!(err.message.contains("not valid json"));
+    }
+
+    #[test]
+    fn deserialize_error_caps_body_snippet_to_200_chars_multibyte_safe() {
+        // Multi-byte chars so a naive byte-index cap would panic on a
+        // non-boundary split; `.chars().take(200)` must not.
+        let long_body = "안".repeat(10_000);
+        let parse_err = serde_json::from_slice::<Message>(long_body.as_bytes()).unwrap_err();
+        let err = deserialize_error(long_body.as_bytes(), &parse_err);
+        let snippet = err
+            .message
+            .split("body: ")
+            .nth(1)
+            .expect("message contains a body marker");
+        assert_eq!(snippet.chars().count(), 200);
+        assert_eq!(snippet, "안".repeat(200));
     }
 
     #[test]
