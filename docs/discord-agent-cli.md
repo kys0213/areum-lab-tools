@@ -31,6 +31,7 @@ Discord는 인증 수단이 두 종류이고 할 수 있는 일이 다르다.
 - **OAuth로 로그인해 "내 계정으로 메시지 보내는" CLI는 불가능** — Discord에 그런 API가 없다.
 - **유저 토큰을 뽑아 자동화(셀프봇)는 ToS 위반 → 계정 밴 대상.** 절대 채택하지 않는다.
 - OAuth로는 읽기 위주(내 정보, 서버/채널 목록, 연결 계정)만 가능.
+- REST(`GET /channels/{id}/messages`)로 과거 메시지 본문을 읽을 때 **MESSAGE CONTENT 특권 인텐트가 필요한지는 아직 미검증** — 첫 live 실행 시 확인 필요(§6).
 
 ---
 
@@ -42,7 +43,7 @@ CLI가 대신할 수 없는 1회성 수동 작업:
 2. Bot 탭에서 봇 추가 → **Token** 발급 (한 번만 노출되므로 안전 저장)
 3. **Privileged Gateway Intents → MESSAGE CONTENT INTENT 활성화**
    - gateway로 메시지 본문을 실시간 수신하려면 필수.
-   - REST(`GET /channels/{id}/messages`)로 과거 메시지 본문을 읽는 것은 채널 읽기 권한이 있으면 가능 — 구현 시 실제 확인 필요.
+   - REST로 과거 메시지 본문을 읽는 데도 필요한지는 실사용 시 검증 필요(§2, §6).
 4. OAuth2 → URL Generator에서 `bot` scope + 권한(최소: View Channels, Send Messages, Read Message History) 선택 → 생성된 초대 링크로 봇을 **대상 서버에 초대**
 5. 봇이 접근할 채널의 **Channel ID** 확보 (Discord 개발자 모드 → 채널 우클릭 → ID 복사)
 
@@ -68,21 +69,133 @@ discord wait <channel_id> [--after <id>] [--timeout N]         # 새 메시지 �
 - **Gateway(websocket)** — 실시간이지만 상주 프로세스 필요. 봇 상주가 목적일 때만.
 - 1차 구현은 **REST 폴링** 권장.
 
+이 초안은 §5의 확정 계약으로 구체화되었다. 아래 §5가 실제 CLI 표면·출력 스펙의 SSOT다.
+
 ---
 
-## 5. 열린 설계 결정 (작업 전 확정 필요)
+## 5. 인터페이스 계약 (확정)
+
+이 CLI의 1차 사용자는 **AI 에이전트**다. 아래 절만 보고 파싱 코드를 작성할 수 있어야 한다.
+근거: `tools/discord/src/cli.rs`(인자 파싱), `tools/discord/src/output.rs`(JSON 봉투·exit code).
+
+### CLI surface
+
+```
+discord [--token <TOKEN>] [--config <PATH>] [--human] <COMMAND>
+  send <CHANNEL> [BODY]   # BODY 생략 또는 '-' → stdin. --text <TEXT>는 BODY와 상호배타
+  read <CHANNEL> [--after <MSG_ID>] [--limit N]          # limit 기본 50, 1..=100
+  wait <CHANNEL> [--after <MSG_ID>] [--timeout SECS] [--interval SECS] [--limit N]  # 기본 60/5/50
+```
+
+- `CHANNEL` = raw channel id 또는 config alias.
+- `--token`/`--config`/`--human`은 전역 플래그로, 서브커맨드 앞뒤 어디서나 지정 가능.
+- 긴 본문은 `echo "..." | discord send ops -` (셸 이스케이프 회피).
+
+### JSON 봉투 (stdout)
+
+성공:
+```json
+{"ok":true,"command":"send|read|wait","data":{...}}
+```
+
+실패:
+```json
+{"ok":false,"command":"send|read|wait","error":{"kind":"usage|config|auth|api|rate_limit|network|internal","message":"...","http_status":401,"retry_after_ms":1200}}
+```
+`http_status`/`retry_after_ms`는 값이 있을 때만 포함된다(해당 없으면 키 자체가 없음).
+
+커맨드별 `data`:
+- `send.data` = `{message_id, channel_id, timestamp}`
+- `read.data` = `{channel_id, count, cursor, messages}`
+- `wait.data` = `{channel_id, count, cursor, timed_out, messages}`
+
+공통:
+- `messages`는 `[{id, channel_id, author:{id,username,bot}, content, timestamp}]`.
+- `messages`는 **오름차순(과거→최신)** 정렬.
+- `content`는 빈 문자열일 수 있다(첨부·임베드 전용 메시지).
+- `cursor`는 값이 없으면 `null`이며 키 자체는 항상 존재한다(생략되지 않음).
+
+### 커서 시맨틱 (stateless 폴링)
+
+에이전트는 이전 출력의 `.data.cursor`를 다음 호출의 `--after`에 그대로 전달하면 된다.
+
+- `cursor` = 이번 호출로 회수한 메시지들의 **max snowflake id**(수치 비교 기준).
+- 회수한 메시지가 0건이면 입력받은 `--after` 값을 그대로 echo(입력이 없었으면 `null`).
+- 에이전트 쪽에서 별도 상태(마지막으로 본 id 등)를 계산·저장할 필요가 없다.
+
+### exit code
+
+| code | 의미 | 발생 조건 | 에이전트 기대 행동 |
+|---|---|---|---|
+| 0 | 성공 | 정상 처리. `wait` 타임아웃(`data.timed_out:true`)도 포함 — 타임아웃은 정상 흐름 | 그대로 진행 |
+| 1 | 내부 오류 | 예기치 못한 내부 실패 | 재시도 무의미. 로그를 남기고 에스컬레이션 |
+| 2 | usage 오류 | 인자 조합이 스펙 위반(예: BODY와 --text 동시 지정), 또는 clap 소유 usage 에러 | 호출 인자를 고쳐서 재호출. 그대로 재시도 금지 |
+| 3 | config·인증 오류 | 토큰 없음, 401, 403 | 토큰/config 재점검 없이 재시도 무의미 |
+| 4 | API 오류 | 429를 제외한 4xx·5xx, 응답 스키마 불일치 | 채널 id·권한 등 요청 자체를 재검토. 단순 재시도 비권장 |
+| 5 | rate limit 소진 | 내부 자동 재시도(최대 3회) 후에도 429 지속 | `error.retry_after_ms`만큼 대기 후 재호출 |
+| 6 | 네트워크 오류 | 연결 실패·타임아웃 등 전송 계층 문제 | 잠시 후 재시도 가능 |
+
+### clap 경계 (봉투 없는 유일한 예외)
+
+미지 플래그·필수 인자 누락 등 **clap이 소유한 usage 에러**는 JSON 봉투 없이 stderr 출력 + exit 2로 끝난다.
+`--help`/`--version`도 비-JSON stdout이다.
+
+에이전트 규칙: **"stdout이 비었고 exit 2면 usage 오류, 그 외 stdout은 항상 봉투 JSON."**
+
+### config
+
+경로: `~/.areum/discord/config.json` (파일 권한 600 권장 — 아니면 stderr 경고만 출력하고 계속 진행).
+
+```json
+{"token": "...", "channels": {"alias": "channel_id"}}
+```
+두 필드 모두 선택(optional). 파일이 없어도 에러가 아니다(토큰이 `--token`/env로 올 수 있으므로).
+
+토큰 우선순위: `--token` > `DISCORD_BOT_TOKEN` env > `config.token`. 전부 없으면 exit 3.
+
+디렉토리·파일은 CLI가 생성하지 않는다 — 사용자가 1회 수동 셋업한다.
+
+### rate limit
+
+429 응답 시 `Retry-After`만큼 대기 후 자동 재시도, 최대 3회. 소진되면 exit 5 + `error.retry_after_ms` 반환.
+에이전트는 그 값만큼 backoff 후 재호출하면 된다.
+
+### 에이전트 사용 예
+
+send로 보내고, read로 초기 커서를 얻은 뒤, wait을 반복하며 `.data.cursor`를 이어받는 폴링 루프:
+
+```bash
+discord send ops "빌드 시작"
+
+cursor=$(discord read ops --limit 1 | jq -r '.data.cursor')
+
+while :; do
+  out=$(discord wait ops --after "$cursor" --timeout 60)
+  cursor=$(echo "$out" | jq -r '.data.cursor')
+  echo "$out" | jq -r '.data.messages[] | "\(.author.username): \(.content)"'
+done
+```
+
+---
+
+## 6. 설계 결정 현황
+
+**확정**
+- 스택: Rust — 이 레포(`areum-lab-tools`) `tools/discord` (workspace tool crate).
+- 토큰 저장 위치: `~/.areum/discord/config.json`.
+- 채널 지정 방식: raw channel_id와 config alias(`channels` 맵) 병용.
+- MCP 대안: 채택하지 않음 — CLI로 확정.
+
+**열림**
 
 1. **봇 재사용 vs 신규 봇**
    - 기존 yora#8040 봇 재사용 → 세팅 0, 단 메시지 주체가 yora로 섞임.
    - 신규 "agent" 봇 → 메시지 출처가 명확히 구분됨(추천 후보). 포털 세팅 1회 필요.
-2. **스택**: Node(v22, `discord.js` 또는 순수 fetch) vs Python(3.14, 순수 REST). 의존성 최소화 원하면 순수 REST 한 파일.
-3. **토큰 저장 위치**: 전용 config(`~/.areum/` 등) vs 환경변수. 시크릿이므로 파일 권한 `600`.
-4. **채널 지정 방식**: raw channel_id vs 별칭(alias) 매핑 파일.
-5. **MCP 대안**: 순수 CLI 대신 MCP 서버로 노출하면 Claude Code/Codex에 툴로 직접 붙일 수 있음(기존 `mcp/cloud-agents/` 패턴과 동일). 단 사용자는 "CLI로 소통"을 명시 → CLI 우선.
+2. **REST read의 MESSAGE CONTENT intent 필요 여부** — `GET /channels/{id}/messages`로 과거 메시지 본문을 읽는 데 특권 인텐트가 필요한지 문서상 불명확. 첫 live 실행 시 검증 필요(§2 주의사항과 연결).
 
 ---
 
-## 6. 참고: 기존 yora 환경 (조사 결과)
+## 7. 참고: 기존 yora 환경 (조사 결과)
 
 새 작업은 별도 레포(`/Users/kys0213/workspace/areum-lab-tools`)에서 진행하되, 아래는 참고용.
 
@@ -94,9 +207,10 @@ discord wait <channel_id> [--after <id>] [--timeout N]         # 새 메시지 �
 
 ---
 
-## 7. 다음 단계 제안
+## 8. 다음 단계 제안
 
-1. 위 §5 열린 결정 확정 (봇 재사용 여부 / 스택 / 토큰 저장)
-2. 봇 포털 세팅(§3) — 수동 1회
-3. `discord send` 최소 버전부터 구현 → 실제 채널 전송 검증
-4. `read` → `wait` 순으로 확장
+CLI 인터페이스 계약(§5)과 크레이트 골격은 확정됐다. 남은 것은 실사용 준비:
+
+1. §6의 남은 열린 결정 확정 — 봇 재사용 vs 신규 봇.
+2. 봇 포털 세팅(§3) — 신규 봇 채택 시 1회 수동 작업.
+3. 첫 live 실행으로 REST read의 MESSAGE CONTENT intent 필요 여부 검증(§6-2, §2).
