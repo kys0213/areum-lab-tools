@@ -176,10 +176,15 @@ fn format_attachment_filenames(attachments: &[Attachment]) -> String {
 
 fn format_message(message: &Message) -> String {
     let bot = if message.author.bot { " (bot)" } else { "" };
-    format!(
+    let mut line = format!(
         "[{}] {}{}: {}",
         message.timestamp, message.author.username, bot, message.content
-    )
+    );
+    if !message.attachments.is_empty() {
+        line.push('\n');
+        line.push_str(&format_attachment_filenames(&message.attachments));
+    }
+    line
 }
 
 #[derive(Serialize)]
@@ -512,6 +517,40 @@ mod tests {
         assert_eq!(
             text,
             "channel c: 1 new message(s)\n[2024-01-01T00:00:00Z] alice: hi"
+        );
+    }
+
+    #[test]
+    fn human_read_success_with_attachment_lists_filename_not_url() {
+        let mut message = sample_message();
+        message.attachments = vec![sample_attachment()];
+        let payload = Payload::Read(ReadData {
+            channel_id: "c".into(),
+            count: 1,
+            cursor: Some("10".into()),
+            messages: vec![message],
+        });
+        let (text, code) = render("read", &Ok(payload), true);
+        assert_eq!(code, 0);
+        assert_eq!(
+            text,
+            "channel c: 1 message(s) (next --after 10)\n[2024-01-01T00:00:00Z] alice: hi\nattachments: photo.png"
+        );
+        assert!(!text.contains("cdn.discordapp.com"));
+    }
+
+    #[test]
+    fn human_read_success_without_attachments_is_unchanged() {
+        let payload = Payload::Read(ReadData {
+            channel_id: "c".into(),
+            count: 1,
+            cursor: Some("10".into()),
+            messages: vec![sample_message()],
+        });
+        let (text, _) = render("read", &Ok(payload), true);
+        assert_eq!(
+            text,
+            "channel c: 1 message(s) (next --after 10)\n[2024-01-01T00:00:00Z] alice: hi"
         );
     }
 
