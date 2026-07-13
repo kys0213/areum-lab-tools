@@ -417,12 +417,29 @@ mod tests {
                 "author": {"id": "u1", "username": "alice", "bot": false},
                 "content": "",
                 "timestamp": "2024-01-01T00:00:00Z",
-                "attachments": [{"id": "a1", "filename": "x.png"}],
+                "attachments": [{"id": "a1", "filename": "x.png", "size": 10, "url": "https://cdn.discordapp.com/attachments/1/a1/x.png"}],
                 "embeds": []
             }
         ]"#;
         let messages: Vec<Message> = serde_json::from_str(json).unwrap();
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].content, "");
+        assert_eq!(messages[0].attachments.len(), 1);
+        assert_eq!(messages[0].attachments[0].filename, "x.png");
+    }
+
+    #[test]
+    fn messages_deserialize_with_attachments_key_absent_as_empty_vec() {
+        let json = r#"[
+            {
+                "id": "1",
+                "channel_id": "chan1",
+                "author": {"id": "u1", "username": "alice", "bot": false},
+                "content": "hi",
+                "timestamp": "2024-01-01T00:00:00Z"
+            }
+        ]"#;
+        let messages: Vec<Message> = serde_json::from_str(json).unwrap();
+        assert!(messages[0].attachments.is_empty());
     }
 }

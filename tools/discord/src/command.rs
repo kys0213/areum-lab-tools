@@ -38,6 +38,7 @@ pub async fn run_send(
         message_id: sent.id,
         channel_id: sent.channel_id,
         timestamp: sent.timestamp,
+        attachments: sent.attachments,
     }))
 }
 
@@ -218,7 +219,7 @@ mod tests {
     use std::collections::VecDeque;
 
     use super::*;
-    use crate::api::{Author, SentMessage};
+    use crate::api::{Attachment, Author, SentMessage};
 
     type GetCall = (String, Option<String>, u8);
 
@@ -306,6 +307,7 @@ mod tests {
             },
             content: "hi".into(),
             timestamp: "2024-01-01T00:00:00Z".into(),
+            attachments: vec![],
         }
     }
 
@@ -403,6 +405,7 @@ mod tests {
             id: "1".into(),
             channel_id: "c".into(),
             timestamp: "2024-01-01T00:00:00Z".into(),
+            attachments: vec![],
         }));
 
         let payload = run_send(&api, "c", None, Some("hi"), None, unreachable_stdin)
@@ -414,6 +417,36 @@ mod tests {
                 assert_eq!(data.message_id, "1");
                 assert_eq!(data.channel_id, "c");
                 assert_eq!(data.timestamp, "2024-01-01T00:00:00Z");
+                assert!(data.attachments.is_empty());
+            }
+            other => panic!("expected Send, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn run_send_maps_sent_message_attachments_to_send_data() {
+        let api = MockDiscordApi::new();
+        api.send_responses.borrow_mut().push_back(Ok(SentMessage {
+            id: "1".into(),
+            channel_id: "c".into(),
+            timestamp: "2024-01-01T00:00:00Z".into(),
+            attachments: vec![Attachment {
+                id: "a1".into(),
+                filename: "photo.png".into(),
+                size: 1024,
+                url: "https://cdn.discordapp.com/attachments/1/a1/photo.png".into(),
+                content_type: Some("image/png".into()),
+            }],
+        }));
+
+        let payload = run_send(&api, "c", None, Some("hi"), None, unreachable_stdin)
+            .await
+            .unwrap();
+
+        match payload {
+            Payload::Send(data) => {
+                assert_eq!(data.attachments.len(), 1);
+                assert_eq!(data.attachments[0].filename, "photo.png");
             }
             other => panic!("expected Send, got {other:?}"),
         }
@@ -426,6 +459,7 @@ mod tests {
             id: "1".into(),
             channel_id: "c".into(),
             timestamp: "2024-01-01T00:00:00Z".into(),
+            attachments: vec![],
         }));
 
         run_send(&api, "c", None, Some("hi"), Some("99"), unreachable_stdin)
@@ -446,6 +480,7 @@ mod tests {
             id: "1".into(),
             channel_id: "c".into(),
             timestamp: "2024-01-01T00:00:00Z".into(),
+            attachments: vec![],
         }));
 
         run_send(&api, "c", None, Some("hi"), None, unreachable_stdin)
@@ -468,6 +503,7 @@ mod tests {
             id: "1".into(),
             channel_id: "c".into(),
             timestamp: "2024-01-01T00:00:00Z".into(),
+            attachments: vec![],
         }));
 
         run_send(
@@ -496,6 +532,7 @@ mod tests {
             id: "1".into(),
             channel_id: "c".into(),
             timestamp: "2024-01-01T00:00:00Z".into(),
+            attachments: vec![],
         }));
 
         run_send(&api, "c", None, None, Some("77"), || {

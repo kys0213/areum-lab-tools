@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::api::Message;
+use crate::api::{Attachment, Message};
 
 /// Error taxonomy that drives both the JSON `error.kind` and the process
 /// exit code (see [`exit_code`]).
@@ -82,6 +82,9 @@ pub struct SendData {
     pub message_id: String,
     pub channel_id: String,
     pub timestamp: String,
+    /// Always serialized, even empty — agents should see the same shape on
+    /// every send response regardless of whether attachments were sent.
+    pub attachments: Vec<Attachment>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -117,10 +120,17 @@ pub enum Payload {
 impl Payload {
     fn to_human(&self) -> String {
         match self {
-            Payload::Send(d) => format!(
-                "sent message {} to channel {} at {}",
-                d.message_id, d.channel_id, d.timestamp
-            ),
+            Payload::Send(d) => {
+                let mut text = format!(
+                    "sent message {} to channel {} at {}",
+                    d.message_id, d.channel_id, d.timestamp
+                );
+                if !d.attachments.is_empty() {
+                    text.push('\n');
+                    text.push_str(&format_attachment_filenames(&d.attachments));
+                }
+                text
+            }
             Payload::Read(d) => format!(
                 "channel {}: {} message(s){}\n{}",
                 d.channel_id,
@@ -155,6 +165,13 @@ fn format_messages(messages: &[Message]) -> String {
         .map(format_message)
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// Human output lists attachment filenames only — the CDN `url` is exposed
+/// in JSON output alone (see docs §5).
+fn format_attachment_filenames(attachments: &[Attachment]) -> String {
+    let names: Vec<&str> = attachments.iter().map(|a| a.filename.as_str()).collect();
+    format!("attachments: {}", names.join(", "))
 }
 
 fn format_message(message: &Message) -> String {
@@ -225,7 +242,7 @@ fn error_json(command: &str, error: &AppError) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api::{Author, Message};
+    use crate::api::{Attachment, Author, Message};
 
     fn sample_message() -> Message {
         Message {
@@ -238,6 +255,17 @@ mod tests {
             },
             content: "hi".into(),
             timestamp: "2024-01-01T00:00:00Z".into(),
+            attachments: vec![],
+        }
+    }
+
+    fn sample_attachment() -> Attachment {
+        Attachment {
+            id: "a1".into(),
+            filename: "photo.png".into(),
+            size: 1024,
+            url: "https://cdn.discordapp.com/attachments/1/a1/photo.png".into(),
+            content_type: Some("image/png".into()),
         }
     }
 
@@ -247,12 +275,29 @@ mod tests {
             message_id: "123".into(),
             channel_id: "456".into(),
             timestamp: "2024-01-01T00:00:00Z".into(),
+            attachments: vec![],
         });
         let (json, code) = render("send", &Ok(payload), false);
         assert_eq!(code, 0);
         assert_eq!(
             json,
-            r#"{"ok":true,"command":"send","data":{"message_id":"123","channel_id":"456","timestamp":"2024-01-01T00:00:00Z"}}"#
+            r#"{"ok":true,"command":"send","data":{"message_id":"123","channel_id":"456","timestamp":"2024-01-01T00:00:00Z","attachments":[]}}"#
+        );
+    }
+
+    #[test]
+    fn send_success_with_attachments_includes_full_fields() {
+        let payload = Payload::Send(SendData {
+            message_id: "123".into(),
+            channel_id: "456".into(),
+            timestamp: "2024-01-01T00:00:00Z".into(),
+            attachments: vec![sample_attachment()],
+        });
+        let (json, code) = render("send", &Ok(payload), false);
+        assert_eq!(code, 0);
+        assert_eq!(
+            json,
+            r#"{"ok":true,"command":"send","data":{"message_id":"123","channel_id":"456","timestamp":"2024-01-01T00:00:00Z","attachments":[{"id":"a1","filename":"photo.png","size":1024,"url":"https://cdn.discordapp.com/attachments/1/a1/photo.png","content_type":"image/png"}]}}"#
         );
     }
 
@@ -267,7 +312,7 @@ mod tests {
         let (json, _) = render("read", &Ok(payload), false);
         assert_eq!(
             json,
-            r#"{"ok":true,"command":"read","data":{"channel_id":"c","count":1,"cursor":"10","messages":[{"id":"10","channel_id":"chan","author":{"id":"u1","username":"alice","bot":false},"content":"hi","timestamp":"2024-01-01T00:00:00Z"}]}}"#
+            r#"{"ok":true,"command":"read","data":{"channel_id":"c","count":1,"cursor":"10","messages":[{"id":"10","channel_id":"chan","author":{"id":"u1","username":"alice","bot":false},"content":"hi","timestamp":"2024-01-01T00:00:00Z","attachments":[]}]}}"#
         );
     }
 
@@ -360,6 +405,7 @@ mod tests {
             message_id: "123".into(),
             channel_id: "456".into(),
             timestamp: "2024-01-01T00:00:00Z".into(),
+            attachments: vec![],
         });
         let (text, code) = render("send", &Ok(payload), true);
         assert_eq!(code, 0);
@@ -367,6 +413,32 @@ mod tests {
             text,
             "sent message 123 to channel 456 at 2024-01-01T00:00:00Z"
         );
+    }
+
+    #[test]
+    fn human_send_success_with_attachments_lists_filenames_not_urls() {
+        let payload = Payload::Send(SendData {
+            message_id: "123".into(),
+            channel_id: "456".into(),
+            timestamp: "2024-01-01T00:00:00Z".into(),
+            attachments: vec![
+                sample_attachment(),
+                Attachment {
+                    id: "a2".into(),
+                    filename: "notes.txt".into(),
+                    size: 42,
+                    url: "https://cdn.discordapp.com/attachments/1/a2/notes.txt".into(),
+                    content_type: None,
+                },
+            ],
+        });
+        let (text, code) = render("send", &Ok(payload), true);
+        assert_eq!(code, 0);
+        assert_eq!(
+            text,
+            "sent message 123 to channel 456 at 2024-01-01T00:00:00Z\nattachments: photo.png, notes.txt"
+        );
+        assert!(!text.contains("cdn.discordapp.com"));
     }
 
     #[test]

@@ -106,15 +106,18 @@ discord [--token <TOKEN>] [--config <PATH>] [--human] <COMMAND>
 `http_status`/`retry_after_ms`는 값이 있을 때만 포함된다(해당 없으면 키 자체가 없음).
 
 커맨드별 `data`:
-- `send.data` = `{message_id, channel_id, timestamp}`
+- `send.data` = `{message_id, channel_id, timestamp, attachments}`
 - `read.data` = `{channel_id, count, cursor, messages}`
 - `wait.data` = `{channel_id, count, cursor, timed_out, messages}`
 
 공통:
-- `messages`는 `[{id, channel_id, author:{id,username,bot}, content, timestamp}]`.
+- `messages`는 `[{id, channel_id, author:{id,username,bot}, content, timestamp, attachments}]`.
 - `messages`는 **오름차순(과거→최신)** 정렬.
 - `content`는 빈 문자열일 수 있다(첨부·임베드 전용 메시지).
 - `cursor`는 값이 없으면 `null`이며 키 자체는 항상 존재한다(생략되지 않음).
+- `attachments`는 `[{id, filename, size, url, content_type?}]`. 첨부가 없으면 `[]`(키 자체는 항상 존재). `content_type`은 Discord가 값을 주지 않으면 키 자체가 생략된다.
+- `send.data.attachments`도 동일한 shape이며 항상 배열이다 — 텍스트만 보낸 경우에도 `[]`로 존재한다(파일 업로드 자체는 후속 작업 범위).
+- 첨부의 CDN `url`은 **JSON 출력에만** 노출된다. `--human` 출력은 첨부가 있을 때 파일명만 한 줄(`attachments: a.png, b.png`) 덧붙이고 url은 표시하지 않는다.
 
 ### 커서 시맨틱 (stateless 폴링)
 
