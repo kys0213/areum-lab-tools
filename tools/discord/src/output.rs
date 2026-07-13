@@ -317,6 +317,29 @@ mod tests {
     }
 
     #[test]
+    fn read_success_with_attachment_bearing_message_matches_contract() {
+        let mut message = sample_message();
+        message.attachments = vec![Attachment {
+            id: "a2".into(),
+            filename: "notes.txt".into(),
+            size: 42,
+            url: "https://cdn.discordapp.com/attachments/1/a2/notes.txt".into(),
+            content_type: None,
+        }];
+        let payload = Payload::Read(ReadData {
+            channel_id: "c".into(),
+            count: 1,
+            cursor: Some("10".into()),
+            messages: vec![message],
+        });
+        let (json, _) = render("read", &Ok(payload), false);
+        assert_eq!(
+            json,
+            r#"{"ok":true,"command":"read","data":{"channel_id":"c","count":1,"cursor":"10","messages":[{"id":"10","channel_id":"chan","author":{"id":"u1","username":"alice","bot":false},"content":"hi","timestamp":"2024-01-01T00:00:00Z","attachments":[{"id":"a2","filename":"notes.txt","size":42,"url":"https://cdn.discordapp.com/attachments/1/a2/notes.txt"}]}]}}"#
+        );
+    }
+
+    #[test]
     fn read_cursor_none_serializes_as_null() {
         let payload = Payload::Read(ReadData {
             channel_id: "c".into(),
@@ -345,6 +368,24 @@ mod tests {
         assert_eq!(
             json,
             r#"{"ok":true,"command":"wait","data":{"channel_id":"c","count":0,"cursor":null,"timed_out":true,"messages":[]}}"#
+        );
+    }
+
+    #[test]
+    fn wait_success_with_attachment_bearing_message_matches_contract() {
+        let mut message = sample_message();
+        message.attachments = vec![sample_attachment()];
+        let payload = Payload::Wait(WaitData {
+            channel_id: "c".into(),
+            count: 1,
+            cursor: Some("20".into()),
+            timed_out: false,
+            messages: vec![message],
+        });
+        let (json, _) = render("wait", &Ok(payload), false);
+        assert_eq!(
+            json,
+            r#"{"ok":true,"command":"wait","data":{"channel_id":"c","count":1,"cursor":"20","timed_out":false,"messages":[{"id":"10","channel_id":"chan","author":{"id":"u1","username":"alice","bot":false},"content":"hi","timestamp":"2024-01-01T00:00:00Z","attachments":[{"id":"a1","filename":"photo.png","size":1024,"url":"https://cdn.discordapp.com/attachments/1/a1/photo.png","content_type":"image/png"}]}]}}"#
         );
     }
 

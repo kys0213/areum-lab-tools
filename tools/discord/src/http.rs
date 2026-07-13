@@ -375,6 +375,7 @@ mod tests {
         assert_eq!(sent.id, "999");
         assert_eq!(sent.channel_id, "chan1");
         assert_eq!(sent.timestamp, "2024-01-01T00:00:00Z");
+        assert!(sent.attachments.is_empty());
     }
 
     #[test]

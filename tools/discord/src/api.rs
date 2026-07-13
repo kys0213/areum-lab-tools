@@ -203,4 +203,33 @@ mod tests {
         assert_eq!(message.attachments.len(), 1);
         assert_eq!(message.attachments[0].filename, "photo.png");
     }
+
+    #[test]
+    fn sent_message_deserializes_with_empty_attachments_when_key_is_absent() {
+        let json = r#"{
+            "id": "999",
+            "channel_id": "chan1",
+            "timestamp": "2024-01-01T00:00:00Z"
+        }"#;
+        let sent: SentMessage = serde_json::from_str(json).unwrap();
+        assert!(sent.attachments.is_empty());
+    }
+
+    #[test]
+    fn sent_message_deserializes_with_populated_attachments() {
+        let json = r#"{
+            "id": "999",
+            "channel_id": "chan1",
+            "timestamp": "2024-01-01T00:00:00Z",
+            "attachments": [{
+                "id": "a1",
+                "filename": "photo.png",
+                "size": 1024,
+                "url": "https://cdn.discordapp.com/attachments/1/a1/photo.png"
+            }]
+        }"#;
+        let sent: SentMessage = serde_json::from_str(json).unwrap();
+        assert_eq!(sent.attachments.len(), 1);
+        assert_eq!(sent.attachments[0].filename, "photo.png");
+    }
 }
