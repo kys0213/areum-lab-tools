@@ -38,6 +38,9 @@ pub enum Command {
         /// Message text. Exclusive with the BODY positional argument.
         #[arg(long)]
         text: Option<String>,
+        /// Reply to the given message id in the same channel.
+        #[arg(long = "reply-to")]
+        reply_to: Option<String>,
     },
 
     /// Read recent messages from a channel (id or config alias).
@@ -96,10 +99,12 @@ mod tests {
                 channel,
                 body,
                 text,
+                reply_to,
             } => {
                 assert_eq!(channel, "123");
                 assert_eq!(body.as_deref(), Some("hello world"));
                 assert_eq!(text, None);
+                assert_eq!(reply_to, None);
             }
             other => panic!("expected Send, got {other:?}"),
         }
@@ -113,10 +118,32 @@ mod tests {
                 channel,
                 body,
                 text,
+                reply_to,
             } => {
                 assert_eq!(channel, "123");
                 assert_eq!(body, None);
                 assert_eq!(text.as_deref(), Some("hi"));
+                assert_eq!(reply_to, None);
+            }
+            other => panic!("expected Send, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn send_parses_reply_to_flag() {
+        let cli =
+            Cli::try_parse_from(["discord", "send", "123", "hello", "--reply-to", "999"]).unwrap();
+        match cli.command {
+            Command::Send {
+                channel,
+                body,
+                text,
+                reply_to,
+            } => {
+                assert_eq!(channel, "123");
+                assert_eq!(body.as_deref(), Some("hello"));
+                assert_eq!(text, None);
+                assert_eq!(reply_to.as_deref(), Some("999"));
             }
             other => panic!("expected Send, got {other:?}"),
         }

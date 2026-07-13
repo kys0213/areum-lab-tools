@@ -49,6 +49,7 @@ async fn run(cli: Cli) -> Result<Payload, AppError> {
             channel,
             body,
             text,
+            reply_to,
         } => {
             let channel_id = config::resolve_channel(&channel, &cfg.channels);
             command::run_send(
@@ -56,6 +57,7 @@ async fn run(cli: Cli) -> Result<Payload, AppError> {
                 &channel_id,
                 body.as_deref(),
                 text.as_deref(),
+                reply_to.as_deref(),
                 read_stdin,
             )
             .await

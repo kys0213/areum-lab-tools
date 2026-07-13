@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use serde::de::DeserializeOwned;
 
-use crate::api::{DiscordApi, Message, SentMessage};
+use crate::api::{DiscordApi, Message, SendRequest, SentMessage};
 use crate::output::{AppError, ErrorKind};
 
 const API_BASE: &str = "https://discord.com/api/v10";
@@ -86,11 +86,11 @@ impl HttpDiscordApi {
 }
 
 impl DiscordApi for HttpDiscordApi {
-    async fn send_message(&self, channel_id: &str, content: &str) -> Result<SentMessage, AppError> {
-        let url = format!("{}/channels/{channel_id}/messages", self.base_url);
+    async fn send_message(&self, req: &SendRequest) -> Result<SentMessage, AppError> {
+        let url = format!("{}/channels/{}/messages", self.base_url, req.channel_id);
         let request = self
             .authorized(self.client.post(url))
-            .json(&serde_json::json!({ "content": content }));
+            .json(&build_send_payload(req));
         self.execute(request).await
     }
 
@@ -103,6 +103,21 @@ impl DiscordApi for HttpDiscordApi {
         let url = get_messages_url(&self.base_url, channel_id, after, limit);
         let request = self.authorized(self.client.get(url));
         self.execute(request).await
+    }
+}
+
+/// Pure JSON body assembly for `send_message`, testable without a network
+/// round trip. `reply_to: None` omits the `message_reference` key entirely
+/// rather than sending it as `null` — Discord's own default for a present
+/// `message_reference` is `fail_if_not_exists=true`, so replying to a
+/// deleted message surfaces as a plain 400 (`classify_status` -> `Api`).
+fn build_send_payload(req: &SendRequest) -> serde_json::Value {
+    match &req.reply_to {
+        Some(message_id) => serde_json::json!({
+            "content": req.content,
+            "message_reference": { "message_id": message_id },
+        }),
+        None => serde_json::json!({ "content": req.content }),
     }
 }
 
@@ -295,6 +310,35 @@ mod tests {
     fn should_retry_after_allows_up_to_300_seconds() {
         assert!(should_retry_after(300_000));
         assert!(!should_retry_after(300_001));
+    }
+
+    #[test]
+    fn build_send_payload_includes_message_reference_when_reply_to_is_some() {
+        let req = SendRequest {
+            channel_id: "c".into(),
+            content: "hi".into(),
+            reply_to: Some("42".into()),
+        };
+        let payload = build_send_payload(&req);
+        assert_eq!(
+            payload,
+            serde_json::json!({
+                "content": "hi",
+                "message_reference": { "message_id": "42" }
+            })
+        );
+    }
+
+    #[test]
+    fn build_send_payload_omits_message_reference_key_when_reply_to_is_none() {
+        let req = SendRequest {
+            channel_id: "c".into(),
+            content: "hi".into(),
+            reply_to: None,
+        };
+        let payload = build_send_payload(&req);
+        assert_eq!(payload, serde_json::json!({ "content": "hi" }));
+        assert!(payload.get("message_reference").is_none());
     }
 
     #[test]

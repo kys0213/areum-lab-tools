@@ -82,7 +82,7 @@ discord wait <channel_id> [--after <id>] [--timeout N]         # 새 메시지 �
 
 ```
 discord [--token <TOKEN>] [--config <PATH>] [--human] <COMMAND>
-  send <CHANNEL> [BODY]   # BODY 생략 또는 '-' → stdin. --text <TEXT>는 BODY와 상호배타
+  send <CHANNEL> [BODY] [--reply-to <MSG_ID>]   # BODY 생략 또는 '-' → stdin. --text <TEXT>는 BODY와 상호배타
   read <CHANNEL> [--after <MSG_ID>] [--limit N]          # limit 기본 50, 1..=100
   wait <CHANNEL> [--after <MSG_ID>] [--timeout SECS] [--interval SECS] [--limit N]  # 기본 60/5/50
 ```
@@ -90,6 +90,7 @@ discord [--token <TOKEN>] [--config <PATH>] [--human] <COMMAND>
 - `CHANNEL` = raw channel id 또는 config alias.
 - `--token`/`--config`/`--human`은 전역 플래그로, 서브커맨드 앞뒤 어디서나 지정 가능.
 - 긴 본문은 `echo "..." | discord send ops -` (셸 이스케이프 회피).
+- `--reply-to <MSG_ID>`는 같은 채널의 메시지에 답글을 단다. 대상 메시지가 삭제되었으면 Discord가 400을 반환해 `kind:"api"`/exit 4로 매핑된다.
 
 ### JSON 봉투 (stdout)
 

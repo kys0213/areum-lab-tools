@@ -7,7 +7,7 @@ use crate::output::AppError;
 /// Non-pub + static dispatch (`&impl DiscordApi`) on purpose: keeps the
 /// `async_fn_in_trait` lint quiet and lets `command` stay testable with a mock.
 pub(crate) trait DiscordApi {
-    async fn send_message(&self, channel_id: &str, content: &str) -> Result<SentMessage, AppError>;
+    async fn send_message(&self, req: &SendRequest) -> Result<SentMessage, AppError>;
 
     async fn get_messages(
         &self,
@@ -15,6 +15,17 @@ pub(crate) trait DiscordApi {
         after: Option<&str>,
         limit: u8,
     ) -> Result<Vec<Message>, AppError>;
+}
+
+/// Request for `POST /channels/{channel_id}/messages`. Plain struct (not a
+/// builder) on purpose — follow-up work (file attachments) extends this by
+/// adding a field, not by changing the shape.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SendRequest {
+    pub channel_id: String,
+    pub content: String,
+    /// Message id to reply to in the same channel; `None` sends a plain message.
+    pub reply_to: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

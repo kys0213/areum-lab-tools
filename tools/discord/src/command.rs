@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use crate::api::{DiscordApi, Message};
+use crate::api::{DiscordApi, Message, SendRequest};
 use crate::output::{AppError, ErrorKind, Payload, ReadData, SendData, WaitData};
 
 /// Clock seam so `wait` polling is testable without real time. `wait` drives a
@@ -18,17 +18,22 @@ impl Sleeper for TokioSleeper {
     }
 }
 
-/// Sends a message to a channel and reports the created message. T2 fills
-/// [`resolve_send_content`]; the send + envelope mapping is the settled contract.
+/// Sends a message to a channel and reports the created message.
 pub async fn run_send(
     api: &impl DiscordApi,
     channel_id: &str,
     body: Option<&str>,
     text: Option<&str>,
+    reply_to: Option<&str>,
     read_stdin: impl FnOnce() -> std::io::Result<String>,
 ) -> Result<Payload, AppError> {
     let content = resolve_send_content(body, text, read_stdin)?;
-    let sent = api.send_message(channel_id, &content).await?;
+    let req = SendRequest {
+        channel_id: channel_id.to_owned(),
+        content,
+        reply_to: reply_to.map(str::to_owned),
+    };
+    let sent = api.send_message(&req).await?;
     Ok(Payload::Send(SendData {
         message_id: sent.id,
         channel_id: sent.channel_id,
@@ -221,6 +226,7 @@ mod tests {
     /// records the arguments it was invoked with.
     struct MockDiscordApi {
         send_responses: RefCell<VecDeque<Result<SentMessage, AppError>>>,
+        send_calls: RefCell<Vec<SendRequest>>,
         get_responses: RefCell<VecDeque<Result<Vec<Message>, AppError>>>,
         get_calls: RefCell<Vec<GetCall>>,
     }
@@ -229,6 +235,7 @@ mod tests {
         fn new() -> Self {
             Self {
                 send_responses: RefCell::new(VecDeque::new()),
+                send_calls: RefCell::new(Vec::new()),
                 get_responses: RefCell::new(VecDeque::new()),
                 get_calls: RefCell::new(Vec::new()),
             }
@@ -242,11 +249,8 @@ mod tests {
     }
 
     impl DiscordApi for MockDiscordApi {
-        async fn send_message(
-            &self,
-            _channel_id: &str,
-            _content: &str,
-        ) -> Result<SentMessage, AppError> {
+        async fn send_message(&self, req: &SendRequest) -> Result<SentMessage, AppError> {
+            self.send_calls.borrow_mut().push(req.clone());
             self.send_responses
                 .borrow_mut()
                 .pop_front()
@@ -401,7 +405,7 @@ mod tests {
             timestamp: "2024-01-01T00:00:00Z".into(),
         }));
 
-        let payload = run_send(&api, "c", None, Some("hi"), unreachable_stdin)
+        let payload = run_send(&api, "c", None, Some("hi"), None, unreachable_stdin)
             .await
             .unwrap();
 
@@ -413,6 +417,44 @@ mod tests {
             }
             other => panic!("expected Send, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn run_send_passes_reply_to_some_into_send_request() {
+        let api = MockDiscordApi::new();
+        api.send_responses.borrow_mut().push_back(Ok(SentMessage {
+            id: "1".into(),
+            channel_id: "c".into(),
+            timestamp: "2024-01-01T00:00:00Z".into(),
+        }));
+
+        run_send(&api, "c", None, Some("hi"), Some("99"), unreachable_stdin)
+            .await
+            .unwrap();
+
+        let calls = api.send_calls.borrow();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].channel_id, "c");
+        assert_eq!(calls[0].content, "hi");
+        assert_eq!(calls[0].reply_to.as_deref(), Some("99"));
+    }
+
+    #[tokio::test]
+    async fn run_send_passes_reply_to_none_into_send_request() {
+        let api = MockDiscordApi::new();
+        api.send_responses.borrow_mut().push_back(Ok(SentMessage {
+            id: "1".into(),
+            channel_id: "c".into(),
+            timestamp: "2024-01-01T00:00:00Z".into(),
+        }));
+
+        run_send(&api, "c", None, Some("hi"), None, unreachable_stdin)
+            .await
+            .unwrap();
+
+        let calls = api.send_calls.borrow();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].reply_to, None);
     }
 
     // ---- run_read ----
