@@ -253,4 +253,16 @@ mod tests {
     fn missing_subcommand_is_a_usage_error() {
         assert!(Cli::try_parse_from(["discord"]).is_err());
     }
+
+    #[test]
+    fn reply_to_flag_is_rejected_on_read() {
+        // --reply-to is send-only; clap must reject it on read as an unknown
+        // argument rather than silently accepting and ignoring it.
+        assert!(Cli::try_parse_from(["discord", "read", "123", "--reply-to", "999"]).is_err());
+    }
+
+    #[test]
+    fn reply_to_flag_is_rejected_on_wait() {
+        assert!(Cli::try_parse_from(["discord", "wait", "123", "--reply-to", "999"]).is_err());
+    }
 }

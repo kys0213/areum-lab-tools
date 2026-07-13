@@ -454,7 +454,60 @@ mod tests {
 
         let calls = api.send_calls.borrow();
         assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].content, "hi");
         assert_eq!(calls[0].reply_to, None);
+    }
+
+    #[tokio::test]
+    async fn run_send_body_positional_content_is_independent_of_reply_to() {
+        // Content resolution (BODY/--text/stdin) and reply_to are orthogonal
+        // inputs; this exercises the BODY positional source together with
+        // reply_to Some to prove neither leaks into the other.
+        let api = MockDiscordApi::new();
+        api.send_responses.borrow_mut().push_back(Ok(SentMessage {
+            id: "1".into(),
+            channel_id: "c".into(),
+            timestamp: "2024-01-01T00:00:00Z".into(),
+        }));
+
+        run_send(
+            &api,
+            "c",
+            Some("body-text"),
+            None,
+            Some("55"),
+            unreachable_stdin,
+        )
+        .await
+        .unwrap();
+
+        let calls = api.send_calls.borrow();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].content, "body-text");
+        assert_eq!(calls[0].reply_to.as_deref(), Some("55"));
+    }
+
+    #[tokio::test]
+    async fn run_send_stdin_content_is_independent_of_reply_to() {
+        // Same orthogonality check as the BODY-positional case above, but for
+        // the stdin-read source (BODY and --text both absent).
+        let api = MockDiscordApi::new();
+        api.send_responses.borrow_mut().push_back(Ok(SentMessage {
+            id: "1".into(),
+            channel_id: "c".into(),
+            timestamp: "2024-01-01T00:00:00Z".into(),
+        }));
+
+        run_send(&api, "c", None, None, Some("77"), || {
+            Ok("from-stdin".to_owned())
+        })
+        .await
+        .unwrap();
+
+        let calls = api.send_calls.borrow();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].content, "from-stdin");
+        assert_eq!(calls[0].reply_to.as_deref(), Some("77"));
     }
 
     // ---- run_read ----
