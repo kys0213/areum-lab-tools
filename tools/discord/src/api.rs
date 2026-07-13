@@ -17,15 +17,27 @@ pub(crate) trait DiscordApi {
     ) -> Result<Vec<Message>, AppError>;
 }
 
+/// A file to upload as a message attachment. `bytes` is [`bytes::Bytes`] (an
+/// `Arc`-backed buffer) so retrying a multipart send clones a refcount, not the
+/// whole payload.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FilePart {
+    pub filename: String,
+    pub bytes: bytes::Bytes,
+    pub content_type: String,
+}
+
 /// Request for `POST /channels/{channel_id}/messages`. Plain struct (not a
-/// builder) on purpose — follow-up work (file attachments) extends this by
-/// adding a field, not by changing the shape.
+/// builder) on purpose — follow-up work extends this by adding a field, not by
+/// changing the shape.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SendRequest {
     pub channel_id: String,
     pub content: String,
     /// Message id to reply to in the same channel; `None` sends a plain message.
     pub reply_to: Option<String>,
+    /// Files to upload; empty sends a plain JSON message (no multipart body).
+    pub files: Vec<FilePart>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

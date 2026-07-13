@@ -82,7 +82,7 @@ discord wait <channel_id> [--after <id>] [--timeout N]         # 새 메시지 �
 
 ```
 discord [--token <TOKEN>] [--config <PATH>] [--human] <COMMAND>
-  send <CHANNEL> [BODY] [--reply-to <MSG_ID>]   # BODY 생략 또는 '-' → stdin. --text <TEXT>는 BODY와 상호배타
+  send <CHANNEL> [BODY] [--reply-to <MSG_ID>] [--file <PATH>]...   # BODY 생략/'-' → stdin. --text <TEXT>는 BODY와 상호배타. --file 최대 10회 반복
   read <CHANNEL> [--after <MSG_ID>] [--limit N]          # limit 기본 50, 1..=100
   wait <CHANNEL> [--after <MSG_ID>] [--timeout SECS] [--interval SECS] [--limit N]  # 기본 60/5/50
 ```
@@ -90,7 +90,27 @@ discord [--token <TOKEN>] [--config <PATH>] [--human] <COMMAND>
 - `CHANNEL` = raw channel id 또는 config alias.
 - `--token`/`--config`/`--human`은 전역 플래그로, 서브커맨드 앞뒤 어디서나 지정 가능.
 - 긴 본문은 `echo "..." | discord send ops -` (셸 이스케이프 회피).
-- `--reply-to <MSG_ID>`는 같은 채널의 메시지에 답글을 단다. 대상 메시지가 삭제되었으면 Discord가 400을 반환해 `kind:"api"`/exit 4로 매핑된다.
+- `--reply-to <MSG_ID>`는 같은 채널의 메시지에 답글을 단다. 대상 메시지가 삭제되었으면 Discord가 400을 반환해 `kind:"api"`/exit 4로 매핑된다. 빈 문자열(`--reply-to ""`)은 usage 오류(exit 2).
+
+#### 파일 첨부 (`--file`)
+
+`--file <PATH>`를 반복해 최대 10개 파일을 첨부한다. 캡션(메시지 본문)과 파일의 조합 규칙:
+
+| 파일 | BODY / --text | 결과 캡션 |
+|---|---|---|
+| 있음 | 없음 | 빈 캡션. **stdin을 읽지 않는다** (파이프가 없어도 블로킹 없음) |
+| 있음 | `'-'` | stdin에서 캡션을 읽는다 (명시적) |
+| 있음 | 있음 | 해당 값이 캡션 (2000자 제한·BODY↔--text 상호배타 유지) |
+| 없음 | — | 기존과 동일 (빈 본문 거부, BODY 생략/`'-'` → stdin 폴백) |
+
+파일 검증(모두 usage 오류, exit 2, 메시지에 경로 포함):
+
+- 파일 11개 이상 → exit 2 (Discord 메시지당 첨부 10개 상한).
+- 읽기 실패(부재·권한) → exit 2.
+- 0바이트 파일 → exit 2 (업로드 실수 fail-fast).
+- 파일 크기 100 MiB 초과 → exit 2 (전량 메모리 적재 구조의 새너티 상한; Discord 최고 부스트 티어 상한과 정합).
+
+전송 시 `filename`은 경로의 마지막 컴포넌트만 노출하고, MIME 타입은 확장자로 추론한다(모르면 `application/octet-stream`). 서버 측 업로드 상한(요금제별)을 넘으면 Discord가 413을 반환해 `kind:"api"`/exit 4로 매핑된다. 업로드가 성공하면 `data.attachments`에 Discord CDN `url`이 채워져 돌아온다(아래 공통 스키마와 동일 shape).
 
 ### JSON 봉투 (stdout)
 
@@ -116,7 +136,7 @@ discord [--token <TOKEN>] [--config <PATH>] [--human] <COMMAND>
 - `content`는 빈 문자열일 수 있다(첨부·임베드 전용 메시지).
 - `cursor`는 값이 없으면 `null`이며 키 자체는 항상 존재한다(생략되지 않음).
 - `attachments`는 `[{id, filename, size, url, content_type?}]`. 첨부가 없으면 `[]`(키 자체는 항상 존재). `content_type`은 Discord가 값을 주지 않으면 키 자체가 생략된다.
-- `send.data.attachments`도 동일한 shape이며 항상 배열이다 — 텍스트만 보낸 경우에도 `[]`로 존재한다(파일 업로드 자체는 후속 작업 범위).
+- `send.data.attachments`도 동일한 shape이며 항상 배열이다 — 텍스트만 보낸 경우엔 `[]`, `--file`로 업로드하면 각 파일의 CDN `url`이 담겨 돌아온다.
 - 첨부의 CDN `url`은 **JSON 출력에만** 노출된다. `--human` 출력은 첨부가 있을 때 파일명만 한 줄(`attachments: a.png, b.png`) 덧붙이고 url은 표시하지 않는다.
 
 ### 커서 시맨틱 (stateless 폴링)

@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use crate::api::{DiscordApi, Message, SendRequest};
+use crate::api::{DiscordApi, FilePart, Message, SendRequest};
 use crate::output::{AppError, ErrorKind, Payload, ReadData, SendData, WaitData};
 
 /// Clock seam so `wait` polling is testable without real time. `wait` drives a
@@ -18,20 +18,39 @@ impl Sleeper for TokioSleeper {
     }
 }
 
-/// Sends a message to a channel and reports the created message.
+/// Sends a message (optionally with file attachments) to a channel and reports
+/// the created message.
+///
+/// Over clippy's arg ceiling by one: the extra parameters are the two I/O
+/// seams (`read_stdin`, `read_file`) kept injectable for black-box tests
+/// rather than reaching for `std` directly — bundling them into a struct would
+/// obscure that intent.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_send(
     api: &impl DiscordApi,
     channel_id: &str,
     body: Option<&str>,
     text: Option<&str>,
     reply_to: Option<&str>,
+    file_paths: &[String],
     read_stdin: impl FnOnce() -> std::io::Result<String>,
+    read_file: impl Fn(&str) -> std::io::Result<Vec<u8>>,
 ) -> Result<Payload, AppError> {
-    let content = resolve_send_content(body, text, read_stdin)?;
+    // An explicit empty --reply-to is a caller mistake, not "no reply": reject
+    // it rather than sending message_reference with an empty message_id.
+    if reply_to == Some("") {
+        return Err(AppError::new(
+            ErrorKind::Usage,
+            "--reply-to must not be an empty string",
+        ));
+    }
+    let files = resolve_files(file_paths, read_file)?;
+    let content = resolve_send_content(body, text, !files.is_empty(), read_stdin)?;
     let req = SendRequest {
         channel_id: channel_id.to_owned(),
         content,
         reply_to: reply_to.map(str::to_owned),
+        files,
     };
     let sent = api.send_message(&req).await?;
     Ok(Payload::Send(SendData {
@@ -45,12 +64,24 @@ pub async fn run_send(
 /// Discord rejects empty messages and caps content at 2000 codepoints.
 const MAX_BODY_CHARS: usize = 2000;
 
-/// Resolves the outgoing message content: BODY vs --text are mutually
-/// exclusive (usage error), stdin is read when `body` is `None` or `"-"`, and
-/// the result must be non-empty and within the 2000-codepoint limit.
+/// Discord allows at most 10 attachments per message.
+const MAX_FILES: usize = 10;
+
+/// Files are read fully into memory before upload, so this bounds how much a
+/// single file can pull into RAM before Discord's own 413 would reject it. It
+/// is a sanity ceiling, not a spec match — it aligns with Discord's highest
+/// boost-tier per-file limit (100 MiB).
+const MAX_FILE_BYTES: usize = 100 * 1024 * 1024;
+
+/// Resolves the outgoing caption. BODY vs --text stay mutually exclusive and
+/// the 2000-codepoint cap always applies. Emptiness handling depends on files:
+/// with attachments present an empty caption is allowed and stdin is NOT read;
+/// without attachments the pre-file behaviour is unchanged (empty rejected,
+/// stdin read when BODY is `None` or `"-"`).
 fn resolve_send_content(
     body: Option<&str>,
     text: Option<&str>,
+    has_files: bool,
     read_stdin: impl FnOnce() -> std::io::Result<String>,
 ) -> Result<String, AppError> {
     if body.is_some() && text.is_some() {
@@ -62,11 +93,15 @@ fn resolve_send_content(
 
     let content = match (body, text) {
         (_, Some(text)) => text.to_owned(),
-        (Some("-"), None) | (None, None) => read_stdin_to_string(read_stdin)?,
+        (Some("-"), None) => read_stdin_to_string(read_stdin)?,
+        // Files present with no explicit caption: send an empty caption rather
+        // than blocking on stdin (the agent isn't piping one in).
+        (None, None) if has_files => String::new(),
+        (None, None) => read_stdin_to_string(read_stdin)?,
         (Some(body), None) => body.to_owned(),
     };
 
-    validate_body(&content)?;
+    validate_body(&content, has_files)?;
     Ok(content)
 }
 
@@ -77,8 +112,8 @@ fn read_stdin_to_string(
         .map_err(|e| AppError::new(ErrorKind::Internal, format!("failed to read stdin: {e}")))
 }
 
-fn validate_body(content: &str) -> Result<(), AppError> {
-    if content.is_empty() {
+fn validate_body(content: &str, has_files: bool) -> Result<(), AppError> {
+    if content.is_empty() && !has_files {
         return Err(AppError::new(
             ErrorKind::Usage,
             "message body must not be empty",
@@ -92,6 +127,69 @@ fn validate_body(content: &str) -> Result<(), AppError> {
         ));
     }
     Ok(())
+}
+
+/// Reads and validates each attachment path into a [`FilePart`]. All failures
+/// map to usage errors (exit 2) with the offending path in the message, since
+/// they are caller-side mistakes caught before any network call.
+fn resolve_files(
+    file_paths: &[String],
+    read_file: impl Fn(&str) -> std::io::Result<Vec<u8>>,
+) -> Result<Vec<FilePart>, AppError> {
+    if file_paths.len() > MAX_FILES {
+        return Err(AppError::new(
+            ErrorKind::Usage,
+            format!(
+                "at most {MAX_FILES} files per message (got {})",
+                file_paths.len()
+            ),
+        ));
+    }
+    file_paths
+        .iter()
+        .map(|path| resolve_file(path, &read_file))
+        .collect()
+}
+
+fn resolve_file(
+    path: &str,
+    read_file: impl Fn(&str) -> std::io::Result<Vec<u8>>,
+) -> Result<FilePart, AppError> {
+    let bytes = read_file(path)
+        .map_err(|e| AppError::new(ErrorKind::Usage, format!("cannot read file '{path}': {e}")))?;
+    if bytes.is_empty() {
+        return Err(AppError::new(
+            ErrorKind::Usage,
+            format!("file '{path}' is empty; nothing to upload"),
+        ));
+    }
+    if bytes.len() > MAX_FILE_BYTES {
+        return Err(AppError::new(
+            ErrorKind::Usage,
+            format!(
+                "file '{path}' exceeds {MAX_FILE_BYTES} bytes (got {})",
+                bytes.len()
+            ),
+        ));
+    }
+    let filename = file_name_of(path);
+    let content_type = mime_guess::from_path(&filename)
+        .first_or_octet_stream()
+        .to_string();
+    Ok(FilePart {
+        filename,
+        bytes: bytes::Bytes::from(bytes),
+        content_type,
+    })
+}
+
+/// The last path component — Discord (and other viewers) should see the file's
+/// name, not the caller's full local path.
+fn file_name_of(path: &str) -> String {
+    std::path::Path::new(path)
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.to_owned())
 }
 
 /// Reads recent messages. T2 owns cursor derivation and the `Payload::Read`
@@ -221,6 +319,10 @@ mod tests {
     use super::*;
     use crate::api::{Attachment, Author, SentMessage};
 
+    fn unreachable_read_file(_: &str) -> std::io::Result<Vec<u8>> {
+        panic!("read_file should not be called")
+    }
+
     type GetCall = (String, Option<String>, u8);
 
     /// Scripted [`DiscordApi`]: each call pops the next queued response and
@@ -319,65 +421,66 @@ mod tests {
 
     #[test]
     fn resolve_send_content_uses_text_when_provided() {
-        let content = resolve_send_content(None, Some("hi"), unreachable_stdin).unwrap();
+        let content = resolve_send_content(None, Some("hi"), false, unreachable_stdin).unwrap();
         assert_eq!(content, "hi");
     }
 
     #[test]
     fn resolve_send_content_uses_body_when_provided() {
-        let content = resolve_send_content(Some("hello"), None, unreachable_stdin).unwrap();
+        let content = resolve_send_content(Some("hello"), None, false, unreachable_stdin).unwrap();
         assert_eq!(content, "hello");
     }
 
     #[test]
     fn resolve_send_content_reads_stdin_when_body_is_dash() {
         let content =
-            resolve_send_content(Some("-"), None, || Ok("from stdin".to_owned())).unwrap();
+            resolve_send_content(Some("-"), None, false, || Ok("from stdin".to_owned())).unwrap();
         assert_eq!(content, "from stdin");
     }
 
     #[test]
     fn resolve_send_content_reads_stdin_when_body_and_text_absent() {
-        let content = resolve_send_content(None, None, || Ok("from stdin".to_owned())).unwrap();
+        let content =
+            resolve_send_content(None, None, false, || Ok("from stdin".to_owned())).unwrap();
         assert_eq!(content, "from stdin");
     }
 
     #[test]
     fn resolve_send_content_preserves_trailing_newline_from_stdin() {
-        let content = resolve_send_content(None, None, || Ok("line\n".to_owned())).unwrap();
+        let content = resolve_send_content(None, None, false, || Ok("line\n".to_owned())).unwrap();
         assert_eq!(content, "line\n");
     }
 
     #[test]
     fn resolve_send_content_rejects_body_and_text_together() {
-        let err = resolve_send_content(Some("a"), Some("b"), unreachable_stdin).unwrap_err();
+        let err = resolve_send_content(Some("a"), Some("b"), false, unreachable_stdin).unwrap_err();
         assert_eq!(err.kind, ErrorKind::Usage);
     }
 
     #[test]
     fn resolve_send_content_rejects_empty_body() {
-        let err = resolve_send_content(Some(""), None, unreachable_stdin).unwrap_err();
+        let err = resolve_send_content(Some(""), None, false, unreachable_stdin).unwrap_err();
         assert_eq!(err.kind, ErrorKind::Usage);
     }
 
     #[test]
     fn resolve_send_content_stdin_failure_is_internal_error() {
-        let err =
-            resolve_send_content(None, None, || Err(std::io::Error::other("boom"))).unwrap_err();
+        let err = resolve_send_content(None, None, false, || Err(std::io::Error::other("boom")))
+            .unwrap_err();
         assert_eq!(err.kind, ErrorKind::Internal);
     }
 
     #[test]
     fn resolve_send_content_allows_2000_chars() {
         let text = "a".repeat(2000);
-        let content = resolve_send_content(None, Some(&text), unreachable_stdin).unwrap();
+        let content = resolve_send_content(None, Some(&text), false, unreachable_stdin).unwrap();
         assert_eq!(content.chars().count(), 2000);
     }
 
     #[test]
     fn resolve_send_content_rejects_2001_chars() {
         let text = "a".repeat(2001);
-        let err = resolve_send_content(None, Some(&text), unreachable_stdin).unwrap_err();
+        let err = resolve_send_content(None, Some(&text), false, unreachable_stdin).unwrap_err();
         assert_eq!(err.kind, ErrorKind::Usage);
     }
 
@@ -387,13 +490,98 @@ mod tests {
         // 2001-char limit, not a byte-length check.
         let too_long = "가".repeat(2001);
         assert_eq!(too_long.len(), 6003);
-        let err = resolve_send_content(None, Some(&too_long), unreachable_stdin).unwrap_err();
+        let err =
+            resolve_send_content(None, Some(&too_long), false, unreachable_stdin).unwrap_err();
         assert_eq!(err.kind, ErrorKind::Usage);
 
         let exactly_at_limit = "가".repeat(2000);
         let content =
-            resolve_send_content(None, Some(&exactly_at_limit), unreachable_stdin).unwrap();
+            resolve_send_content(None, Some(&exactly_at_limit), false, unreachable_stdin).unwrap();
         assert_eq!(content.chars().count(), 2000);
+    }
+
+    // ---- caption rules with files present ----
+
+    #[test]
+    fn resolve_send_content_files_present_no_body_gives_empty_caption_without_reading_stdin() {
+        // read_stdin panics if touched: files-present + no caption must not
+        // fall back to stdin (that would block an agent that pipes nothing).
+        let content = resolve_send_content(None, None, true, unreachable_stdin).unwrap();
+        assert_eq!(content, "");
+    }
+
+    #[test]
+    fn resolve_send_content_files_present_body_dash_reads_stdin() {
+        let content =
+            resolve_send_content(Some("-"), None, true, || Ok("piped caption".to_owned())).unwrap();
+        assert_eq!(content, "piped caption");
+    }
+
+    #[test]
+    fn resolve_send_content_files_present_body_is_used_as_caption() {
+        let content = resolve_send_content(Some("look"), None, true, unreachable_stdin).unwrap();
+        assert_eq!(content, "look");
+    }
+
+    #[test]
+    fn resolve_send_content_files_present_still_enforces_2000_char_cap() {
+        let text = "a".repeat(2001);
+        let err = resolve_send_content(None, Some(&text), true, unreachable_stdin).unwrap_err();
+        assert_eq!(err.kind, ErrorKind::Usage);
+    }
+
+    // ---- resolve_files ----
+
+    #[test]
+    fn resolve_file_uses_last_path_component_as_filename() {
+        let part = resolve_file("/home/user/pics/photo.png", |_| Ok(vec![1, 2, 3])).unwrap();
+        assert_eq!(part.filename, "photo.png");
+    }
+
+    #[test]
+    fn resolve_file_infers_mime_from_extension() {
+        let part = resolve_file("photo.png", |_| Ok(vec![1])).unwrap();
+        assert_eq!(part.content_type, "image/png");
+    }
+
+    #[test]
+    fn resolve_file_falls_back_to_octet_stream_without_extension() {
+        let part = resolve_file("noext", |_| Ok(vec![1])).unwrap();
+        assert_eq!(part.content_type, "application/octet-stream");
+    }
+
+    #[test]
+    fn resolve_file_read_error_is_usage_with_path() {
+        let err = resolve_file("missing.txt", |_| Err(std::io::Error::other("nope"))).unwrap_err();
+        assert_eq!(err.kind, ErrorKind::Usage);
+        assert!(err.message.contains("missing.txt"));
+    }
+
+    #[test]
+    fn resolve_file_rejects_empty_file() {
+        let err = resolve_file("empty.txt", |_| Ok(vec![])).unwrap_err();
+        assert_eq!(err.kind, ErrorKind::Usage);
+        assert!(err.message.contains("empty"));
+    }
+
+    #[test]
+    fn resolve_file_rejects_file_over_max_bytes() {
+        let err = resolve_file("huge.bin", |_| Ok(vec![0u8; MAX_FILE_BYTES + 1])).unwrap_err();
+        assert_eq!(err.kind, ErrorKind::Usage);
+    }
+
+    #[test]
+    fn resolve_files_rejects_more_than_ten() {
+        let paths: Vec<String> = (0..11).map(|i| format!("f{i}.txt")).collect();
+        let err = resolve_files(&paths, |_| Ok(vec![1])).unwrap_err();
+        assert_eq!(err.kind, ErrorKind::Usage);
+    }
+
+    #[test]
+    fn resolve_files_accepts_exactly_ten() {
+        let paths: Vec<String> = (0..10).map(|i| format!("f{i}.txt")).collect();
+        let parts = resolve_files(&paths, |_| Ok(vec![1])).unwrap();
+        assert_eq!(parts.len(), 10);
     }
 
     // ---- run_send ----
@@ -408,9 +596,18 @@ mod tests {
             attachments: vec![],
         }));
 
-        let payload = run_send(&api, "c", None, Some("hi"), None, unreachable_stdin)
-            .await
-            .unwrap();
+        let payload = run_send(
+            &api,
+            "c",
+            None,
+            Some("hi"),
+            None,
+            &[],
+            unreachable_stdin,
+            unreachable_read_file,
+        )
+        .await
+        .unwrap();
 
         match payload {
             Payload::Send(data) => {
@@ -439,9 +636,18 @@ mod tests {
             }],
         }));
 
-        let payload = run_send(&api, "c", None, Some("hi"), None, unreachable_stdin)
-            .await
-            .unwrap();
+        let payload = run_send(
+            &api,
+            "c",
+            None,
+            Some("hi"),
+            None,
+            &[],
+            unreachable_stdin,
+            unreachable_read_file,
+        )
+        .await
+        .unwrap();
 
         match payload {
             Payload::Send(data) => {
@@ -462,9 +668,18 @@ mod tests {
             attachments: vec![],
         }));
 
-        run_send(&api, "c", None, Some("hi"), Some("99"), unreachable_stdin)
-            .await
-            .unwrap();
+        run_send(
+            &api,
+            "c",
+            None,
+            Some("hi"),
+            Some("99"),
+            &[],
+            unreachable_stdin,
+            unreachable_read_file,
+        )
+        .await
+        .unwrap();
 
         let calls = api.send_calls.borrow();
         assert_eq!(calls.len(), 1);
@@ -483,9 +698,18 @@ mod tests {
             attachments: vec![],
         }));
 
-        run_send(&api, "c", None, Some("hi"), None, unreachable_stdin)
-            .await
-            .unwrap();
+        run_send(
+            &api,
+            "c",
+            None,
+            Some("hi"),
+            None,
+            &[],
+            unreachable_stdin,
+            unreachable_read_file,
+        )
+        .await
+        .unwrap();
 
         let calls = api.send_calls.borrow();
         assert_eq!(calls.len(), 1);
@@ -512,7 +736,9 @@ mod tests {
             Some("body-text"),
             None,
             Some("55"),
+            &[],
             unreachable_stdin,
+            unreachable_read_file,
         )
         .await
         .unwrap();
@@ -535,9 +761,16 @@ mod tests {
             attachments: vec![],
         }));
 
-        run_send(&api, "c", None, None, Some("77"), || {
-            Ok("from-stdin".to_owned())
-        })
+        run_send(
+            &api,
+            "c",
+            None,
+            None,
+            Some("77"),
+            &[],
+            || Ok("from-stdin".to_owned()),
+            unreachable_read_file,
+        )
         .await
         .unwrap();
 
@@ -545,6 +778,57 @@ mod tests {
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].content, "from-stdin");
         assert_eq!(calls[0].reply_to.as_deref(), Some("77"));
+    }
+
+    #[tokio::test]
+    async fn run_send_rejects_empty_reply_to() {
+        let api = MockDiscordApi::new();
+        let err = run_send(
+            &api,
+            "c",
+            None,
+            Some("hi"),
+            Some(""),
+            &[],
+            unreachable_stdin,
+            unreachable_read_file,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.kind, ErrorKind::Usage);
+    }
+
+    #[tokio::test]
+    async fn run_send_passes_resolved_files_into_send_request() {
+        let api = MockDiscordApi::new();
+        api.send_responses.borrow_mut().push_back(Ok(SentMessage {
+            id: "1".into(),
+            channel_id: "c".into(),
+            timestamp: "2024-01-01T00:00:00Z".into(),
+            attachments: vec![],
+        }));
+
+        run_send(
+            &api,
+            "c",
+            None,
+            None,
+            None,
+            &["/tmp/photo.png".to_owned()],
+            unreachable_stdin,
+            |_| Ok(vec![1, 2, 3]),
+        )
+        .await
+        .unwrap();
+
+        let calls = api.send_calls.borrow();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].files.len(), 1);
+        assert_eq!(calls[0].files[0].filename, "photo.png");
+        assert_eq!(calls[0].files[0].content_type, "image/png");
+        assert_eq!(calls[0].files[0].bytes.as_ref(), &[1, 2, 3]);
+        // Files present with no BODY/--text yields an empty caption.
+        assert_eq!(calls[0].content, "");
     }
 
     // ---- run_read ----

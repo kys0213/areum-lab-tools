@@ -41,6 +41,9 @@ pub enum Command {
         /// Reply to the given message id in the same channel.
         #[arg(long = "reply-to")]
         reply_to: Option<String>,
+        /// Attach a file by path; repeat up to 10 times.
+        #[arg(long = "file")]
+        files: Vec<String>,
     },
 
     /// Read recent messages from a channel (id or config alias).
@@ -100,11 +103,13 @@ mod tests {
                 body,
                 text,
                 reply_to,
+                files,
             } => {
                 assert_eq!(channel, "123");
                 assert_eq!(body.as_deref(), Some("hello world"));
                 assert_eq!(text, None);
                 assert_eq!(reply_to, None);
+                assert!(files.is_empty());
             }
             other => panic!("expected Send, got {other:?}"),
         }
@@ -119,11 +124,13 @@ mod tests {
                 body,
                 text,
                 reply_to,
+                files,
             } => {
                 assert_eq!(channel, "123");
                 assert_eq!(body, None);
                 assert_eq!(text.as_deref(), Some("hi"));
                 assert_eq!(reply_to, None);
+                assert!(files.is_empty());
             }
             other => panic!("expected Send, got {other:?}"),
         }
@@ -139,11 +146,27 @@ mod tests {
                 body,
                 text,
                 reply_to,
+                files,
             } => {
                 assert_eq!(channel, "123");
                 assert_eq!(body.as_deref(), Some("hello"));
                 assert_eq!(text, None);
                 assert_eq!(reply_to.as_deref(), Some("999"));
+                assert!(files.is_empty());
+            }
+            other => panic!("expected Send, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn send_collects_repeated_file_flags_in_order() {
+        let cli = Cli::try_parse_from([
+            "discord", "send", "123", "hi", "--file", "a.png", "--file", "b.txt",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Send { files, .. } => {
+                assert_eq!(files, vec!["a.png".to_owned(), "b.txt".to_owned()]);
             }
             other => panic!("expected Send, got {other:?}"),
         }
