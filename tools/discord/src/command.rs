@@ -530,6 +530,23 @@ mod tests {
         assert_eq!(err.kind, ErrorKind::Usage);
     }
 
+    #[test]
+    fn resolve_send_content_files_present_text_flag_is_used_as_caption() {
+        // Distinct from the BODY-positional case above: exercises the
+        // `--text` source specifically with files present.
+        let content = resolve_send_content(None, Some("caption"), true, unreachable_stdin).unwrap();
+        assert_eq!(content, "caption");
+    }
+
+    #[test]
+    fn resolve_send_content_files_present_allows_2000_chars() {
+        // The 2000-char boundary pass, not just the 2001 reject above, must
+        // also hold when files are present.
+        let text = "a".repeat(2000);
+        let content = resolve_send_content(None, Some(&text), true, unreachable_stdin).unwrap();
+        assert_eq!(content.chars().count(), 2000);
+    }
+
     // ---- resolve_files ----
 
     #[test]
@@ -551,6 +568,14 @@ mod tests {
     }
 
     #[test]
+    fn resolve_file_falls_back_to_octet_stream_for_unknown_extension() {
+        // Distinct from the no-extension case above: a dotted extension that
+        // mime_guess does not recognize must also fall back, not error.
+        let part = resolve_file("data.notarealext", |_| Ok(vec![1])).unwrap();
+        assert_eq!(part.content_type, "application/octet-stream");
+    }
+
+    #[test]
     fn resolve_file_read_error_is_usage_with_path() {
         let err = resolve_file("missing.txt", |_| Err(std::io::Error::other("nope"))).unwrap_err();
         assert_eq!(err.kind, ErrorKind::Usage);
@@ -568,6 +593,13 @@ mod tests {
     fn resolve_file_rejects_file_over_max_bytes() {
         let err = resolve_file("huge.bin", |_| Ok(vec![0u8; MAX_FILE_BYTES + 1])).unwrap_err();
         assert_eq!(err.kind, ErrorKind::Usage);
+    }
+
+    #[test]
+    fn resolve_file_accepts_exactly_max_bytes() {
+        // Boundary pass complementing the over-limit reject above.
+        let part = resolve_file("max.bin", |_| Ok(vec![0u8; MAX_FILE_BYTES])).unwrap();
+        assert_eq!(part.bytes.len(), MAX_FILE_BYTES);
     }
 
     #[test]
@@ -796,6 +828,60 @@ mod tests {
         .await
         .unwrap_err();
         assert_eq!(err.kind, ErrorKind::Usage);
+    }
+
+    #[tokio::test]
+    async fn run_send_rejects_empty_reply_to_before_touching_files() {
+        // reply_to validation must short-circuit before file resolution:
+        // unreachable_read_file panics if resolve_files is ever reached.
+        let api = MockDiscordApi::new();
+        let err = run_send(
+            &api,
+            "c",
+            None,
+            Some("hi"),
+            Some(""),
+            &["/tmp/photo.png".to_owned()],
+            unreachable_stdin,
+            unreachable_read_file,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.kind, ErrorKind::Usage);
+        assert!(api.send_calls.borrow().is_empty());
+    }
+
+    #[tokio::test]
+    async fn run_send_passes_files_and_reply_to_together() {
+        // Files and reply_to are independent inputs; both must land on the
+        // same SendRequest without one clobbering the other.
+        let api = MockDiscordApi::new();
+        api.send_responses.borrow_mut().push_back(Ok(SentMessage {
+            id: "1".into(),
+            channel_id: "c".into(),
+            timestamp: "2024-01-01T00:00:00Z".into(),
+            attachments: vec![],
+        }));
+
+        run_send(
+            &api,
+            "c",
+            None,
+            Some("look"),
+            Some("42"),
+            &["/tmp/photo.png".to_owned()],
+            unreachable_stdin,
+            |_| Ok(vec![1, 2, 3]),
+        )
+        .await
+        .unwrap();
+
+        let calls = api.send_calls.borrow();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].reply_to.as_deref(), Some("42"));
+        assert_eq!(calls[0].files.len(), 1);
+        assert_eq!(calls[0].files[0].filename, "photo.png");
+        assert_eq!(calls[0].content, "look");
     }
 
     #[tokio::test]
