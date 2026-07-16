@@ -607,4 +607,145 @@ mod tests {
         assert_eq!(code, 0);
         assert_eq!(text, "channel c: timed out, no new messages");
     }
+
+    #[test]
+    fn json_read_success_routes_to_stdout_with_exit_zero() {
+        let payload = Payload::Read(ReadData {
+            channel_id: "c".into(),
+            count: 1,
+            cursor: Some("10".into()),
+            messages: vec![sample_message()],
+        });
+        let (sink, _, code) = render("read", &Ok(payload), true);
+        assert_eq!(sink, Sink::Stdout);
+        assert_eq!(code, 0);
+    }
+
+    #[test]
+    fn json_wait_success_with_attachments_routes_to_stdout_with_exit_zero() {
+        let mut message = sample_message();
+        message.attachments = vec![sample_attachment()];
+        let payload = Payload::Wait(WaitData {
+            channel_id: "c".into(),
+            count: 1,
+            cursor: Some("20".into()),
+            timed_out: false,
+            messages: vec![message],
+        });
+        let (sink, _, code) = render("wait", &Ok(payload), true);
+        assert_eq!(sink, Sink::Stdout);
+        assert_eq!(code, 0);
+    }
+
+    #[test]
+    fn human_success_output_never_contains_json_envelope_marker() {
+        // json=false success must be plain text, never the {"ok":...}
+        // envelope shape — this is the boundary agents rely on to tell modes
+        // apart, so assert its absence directly rather than only asserting
+        // the expected human string.
+        let send = Payload::Send(SendData {
+            message_id: "1".into(),
+            channel_id: "c".into(),
+            timestamp: "2024-01-01T00:00:00Z".into(),
+            attachments: vec![],
+        });
+        let read = Payload::Read(ReadData {
+            channel_id: "c".into(),
+            count: 1,
+            cursor: Some("10".into()),
+            messages: vec![sample_message()],
+        });
+        let wait = Payload::Wait(WaitData {
+            channel_id: "c".into(),
+            count: 0,
+            cursor: None,
+            timed_out: true,
+            messages: vec![],
+        });
+
+        for payload in [send, read, wait] {
+            let (sink, text, code) = render("cmd", &Ok(payload), false);
+            assert_eq!(sink, Sink::Stdout);
+            assert_eq!(code, 0);
+            assert!(
+                !text.contains(r#"{"ok"#),
+                "human output leaked json envelope: {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn human_read_success_routes_to_stdout() {
+        let payload = Payload::Read(ReadData {
+            channel_id: "c".into(),
+            count: 1,
+            cursor: Some("10".into()),
+            messages: vec![sample_message()],
+        });
+        let (sink, _, code) = render("read", &Ok(payload), false);
+        assert_eq!(sink, Sink::Stdout);
+        assert_eq!(code, 0);
+    }
+
+    #[test]
+    fn human_wait_success_routes_to_stdout() {
+        let payload = Payload::Wait(WaitData {
+            channel_id: "c".into(),
+            count: 1,
+            cursor: None,
+            timed_out: false,
+            messages: vec![sample_message()],
+        });
+        let (sink, _, code) = render("wait", &Ok(payload), false);
+        assert_eq!(sink, Sink::Stdout);
+        assert_eq!(code, 0);
+    }
+
+    #[test]
+    fn human_wait_success_with_attachment_lists_filename_not_url() {
+        // Regression coverage matching the send/read filename-not-url
+        // contract, but for wait specifically — no prior test exercised
+        // this combination.
+        let mut message = sample_message();
+        message.attachments = vec![sample_attachment()];
+        let payload = Payload::Wait(WaitData {
+            channel_id: "c".into(),
+            count: 1,
+            cursor: Some("20".into()),
+            timed_out: false,
+            messages: vec![message],
+        });
+        let (_, text, code) = render("wait", &Ok(payload), false);
+        assert_eq!(code, 0);
+        assert_eq!(
+            text,
+            "channel c: 1 new message(s) (next --after 20)\n[2024-01-01T00:00:00Z] alice: hi\nattachments: photo.png"
+        );
+        assert!(!text.contains("cdn.discordapp.com"));
+    }
+
+    #[test]
+    fn exit_code_matches_across_json_and_human_modes_for_every_kind() {
+        // The CLI contract promises identical exit codes regardless of
+        // --json; verify render() itself preserves that for every error
+        // kind, not just the standalone exit_code() mapping function.
+        let kinds = [
+            ErrorKind::Usage,
+            ErrorKind::Config,
+            ErrorKind::Auth,
+            ErrorKind::Api,
+            ErrorKind::RateLimit,
+            ErrorKind::Network,
+            ErrorKind::Internal,
+        ];
+        for kind in kinds {
+            let err = AppError::new(kind, "boom");
+            let (_, _, json_code) = render("send", &Err(err.clone()), true);
+            let (_, _, human_code) = render("send", &Err(err), false);
+            assert_eq!(
+                json_code, human_code,
+                "exit code diverged between modes for {kind:?}"
+            );
+        }
+    }
 }

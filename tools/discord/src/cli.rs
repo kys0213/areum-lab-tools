@@ -274,6 +274,16 @@ mod tests {
     }
 
     #[test]
+    fn json_flag_parses_after_subcommand_and_args() {
+        // --json is global=true, so it must parse in both positions;
+        // global_flags_apply_alongside_subcommand above only covers the
+        // pre-subcommand position.
+        let cli = Cli::try_parse_from(["discord", "send", "123", "hi", "--json"]).unwrap();
+        assert!(cli.json);
+        assert_eq!(cli.command.name(), "send");
+    }
+
+    #[test]
     fn human_flag_is_rejected_as_unknown() {
         // --human was removed once human text became the default output —
         // clap must reject it as an unknown flag rather than ignoring it.
