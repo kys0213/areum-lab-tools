@@ -62,7 +62,7 @@ discord wait <channel_id> [--after <id>] [--timeout N]         # 새 메시지 �
 - **전송**: `POST /channels/{channel_id}/messages`
 - **조회**: `GET /channels/{channel_id}/messages?limit=N&after=<id>`
 - **대기**: 조회를 폴링 루프로 감싸 새 메시지 등장 시 반환 (상주 프로세스 불필요)
-- 출력은 JSON(에이전트 파싱 친화) 기본, `--text`로 사람용 포맷 옵션 고려
+- 출력 포맷·플래그 계약은 §5 참조
 
 ### 받기 방식: REST 폴링 vs Gateway
 - **REST 폴링** — 원샷 CLI에 적합. 지속 연결 불필요, 구현 단순. 지연·rate limit만 관리.
