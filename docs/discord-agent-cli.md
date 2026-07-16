@@ -78,17 +78,19 @@ discord wait <channel_id> [--after <id>] [--timeout N]         # 새 메시지 �
 이 CLI의 1차 사용자는 **AI 에이전트**다. 아래 절만 보고 파싱 코드를 작성할 수 있어야 한다.
 근거: `tools/discord/src/cli.rs`(인자 파싱), `tools/discord/src/output.rs`(JSON 봉투·exit code).
 
+기본 출력은 **사람용 텍스트**다. **에이전트는 항상 `--json`을 붙여** 아래 봉투 계약을 받는다.
+
 ### CLI surface
 
 ```
-discord [--token <TOKEN>] [--config <PATH>] [--human] <COMMAND>
+discord [--token <TOKEN>] [--config <PATH>] [--json] <COMMAND>
   send <CHANNEL> [BODY] [--reply-to <MSG_ID>] [--file <PATH>]...   # BODY 생략/'-' → stdin. --text <TEXT>는 BODY와 상호배타. --file 최대 10회 반복
   read <CHANNEL> [--after <MSG_ID>] [--limit N]          # limit 기본 50, 1..=100
   wait <CHANNEL> [--after <MSG_ID>] [--timeout SECS] [--interval SECS] [--limit N]  # 기본 60/5/50
 ```
 
 - `CHANNEL` = raw channel id 또는 config alias.
-- `--token`/`--config`/`--human`은 전역 플래그로, 서브커맨드 앞뒤 어디서나 지정 가능.
+- `--token`/`--config`/`--json`은 전역 플래그로, 서브커맨드 앞뒤 어디서나 지정 가능.
 - 긴 본문은 `echo "..." | discord send ops -` (셸 이스케이프 회피).
 - `--reply-to <MSG_ID>`는 같은 채널의 메시지에 답글을 단다. 대상 메시지가 삭제되었으면 Discord가 400을 반환해 `kind:"api"`/exit 4로 매핑된다. 빈 문자열(`--reply-to ""`)은 usage 오류(exit 2).
 
@@ -112,7 +114,7 @@ discord [--token <TOKEN>] [--config <PATH>] [--human] <COMMAND>
 
 전송 시 `filename`은 경로의 마지막 컴포넌트만 노출하고, MIME 타입은 확장자로 추론한다(모르면 `application/octet-stream`). 서버 측 업로드 상한(요금제별)을 넘으면 Discord가 413을 반환해 `kind:"api"`/exit 4로 매핑된다. 업로드가 성공하면 `data.attachments`에 Discord CDN `url`이 채워져 돌아온다(아래 공통 스키마와 동일 shape).
 
-### JSON 봉투 (stdout)
+### JSON 봉투 (stdout, `--json` 시)
 
 성공:
 ```json
@@ -137,7 +139,7 @@ discord [--token <TOKEN>] [--config <PATH>] [--human] <COMMAND>
 - `cursor`는 값이 없으면 `null`이며 키 자체는 항상 존재한다(생략되지 않음).
 - `attachments`는 `[{id, filename, size, url, content_type?}]`. 첨부가 없으면 `[]`(키 자체는 항상 존재). `content_type`은 Discord가 값을 주지 않으면 키 자체가 생략된다.
 - `send.data.attachments`도 동일한 shape이며 항상 배열이다 — 텍스트만 보낸 경우엔 `[]`, `--file`로 업로드하면 각 파일의 CDN `url`이 담겨 돌아온다.
-- 첨부의 CDN `url`은 **JSON 출력에만** 노출된다. `--human` 출력은 첨부가 있을 때 파일명만 한 줄(`attachments: a.png, b.png`) 덧붙이고 url은 표시하지 않는다.
+- 첨부의 CDN `url`은 **`--json` 출력에만** 노출된다. 기본 human 출력은 첨부가 있을 때 파일명만 한 줄(`attachments: a.png, b.png`) 덧붙이고 url은 표시하지 않는다.
 
 ### 커서 시맨틱 (stateless 폴링)
 
@@ -161,10 +163,12 @@ discord [--token <TOKEN>] [--config <PATH>] [--human] <COMMAND>
 
 ### clap 경계 (봉투 없는 유일한 예외)
 
-미지 플래그·필수 인자 누락 등 **clap이 소유한 usage 에러**는 JSON 봉투 없이 stderr 출력 + exit 2로 끝난다.
+미지 플래그·필수 인자 누락 등 **clap이 소유한 usage 에러**는 `--json` 여부와 무관하게 봉투 없이 stderr 출력 + exit 2로 끝난다.
 `--help`/`--version`도 비-JSON stdout이다.
 
-에이전트 규칙: **"stdout이 비었고 exit 2면 usage 오류, 그 외 stdout은 항상 봉투 JSON."**
+에이전트 규칙:
+- `--json` 시 stdout은 항상 봉투 JSON이다 (유일한 예외: clap 소유 usage 에러·`--help`/`--version`은 봉투 없음).
+- 기본(human) 모드의 에러는 stderr로 가고 stdout은 비어 있다 — 진단은 stderr라는 원칙.
 
 ### config
 
@@ -186,15 +190,15 @@ discord [--token <TOKEN>] [--config <PATH>] [--human] <COMMAND>
 
 ### 에이전트 사용 예
 
-send로 보내고, read로 초기 커서를 얻은 뒤, wait을 반복하며 `.data.cursor`를 이어받는 폴링 루프:
+에이전트는 항상 `--json`을 붙여 jq로 파싱한다. send로 보내고, read로 초기 커서를 얻은 뒤, wait을 반복하며 `.data.cursor`를 이어받는 폴링 루프:
 
 ```bash
-discord send ops "빌드 시작"
+discord send ops "빌드 시작" --json
 
-cursor=$(discord read ops --limit 1 | jq -r '.data.cursor')
+cursor=$(discord read ops --limit 1 --json | jq -r '.data.cursor')
 
 while :; do
-  out=$(discord wait ops --after "$cursor" --timeout 60)
+  out=$(discord wait ops --after "$cursor" --timeout 60 --json)
   cursor=$(echo "$out" | jq -r '.data.cursor')
   echo "$out" | jq -r '.data.messages[] | "\(.author.username): \(.content)"'
 done
