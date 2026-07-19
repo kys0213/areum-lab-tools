@@ -35,18 +35,25 @@ INSTALL_ROOT="${INSTALL_ROOT:-$HOME/.local}"
 
 if [ -z "$VERSION" ]; then
 	# GitHub's /releases/latest is repo-wide, not per-tool, so we scan the
-	# release list (already newest-first) for the first tag with this
-	# tool's "<tool>-v" prefix.
+	# release list (already newest-first) and pick the first tag belonging
+	# to this tool.
 	RELEASES_JSON="$(curl -fsSL "$API_BASE/repos/kys0213/areum-lab-tools/releases?per_page=100")"
-	# Anchor on "-v<digit>" so a similarly-prefixed tool's tag (e.g. a
-	# "discord-vx-v9.9.9" release for tool "discord-vx") is never mistaken
-	# for this tool's release via plain substring matching.
-	TAG="$(printf '%s\n' "$RELEASES_JSON" | grep -o "\"tag_name\": *\"${TOOL}-v[0-9][^\"]*\"" | head -n1 | sed -E "s/\"tag_name\": *\"${TOOL}-v(.*)\"/\1/")"
-	if [ -z "$TAG" ]; then
+	# grep only extracts candidate tag names; ownership is decided by
+	# splitting each tag at its last "-v" (same convention as release.yml)
+	# and requiring the tool part to equal $TOOL exactly. Prefix or
+	# substring heuristics mismatch similarly named tools (e.g. tags
+	# "discord-vx-v9.9.9" or "discord-v2-v1.0.0" when installing "discord").
+	TAG_CANDIDATES="$(printf '%s\n' "$RELEASES_JSON" | grep -o '"tag_name": *"[^"]*-v[^"]*"' | sed -E 's/"tag_name": *"([^"]*)"/\1/')"
+	for tag in $TAG_CANDIDATES; do
+		if [ "${tag%-v*}" = "$TOOL" ]; then
+			VERSION="${tag##*-v}"
+			break
+		fi
+	done
+	if [ -z "$VERSION" ]; then
 		echo "error: no release found for $TOOL" >&2
 		exit 1
 	fi
-	VERSION="$TAG"
 fi
 
 ASSET="$TOOL-$VERSION-$TARGET.tar.gz"

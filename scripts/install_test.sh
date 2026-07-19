@@ -209,15 +209,19 @@ case_similar_name_guard() {
 	case_dir="$WORK_DIR/case_d"
 	www="$case_dir/www"
 
-	# "discord-vx" is a distinct tool whose tag happens to contain "discord-v"
-	# as a substring. It is listed first (newest) specifically to catch a
-	# substring-matching tag filter that would pick it for TOOL=discord.
+	# "discord-vx" and "discord-v2" are distinct tools whose tags contain
+	# "discord-v" as a substring; "discord-v2" additionally defeats a
+	# "-v<digit>" anchor heuristic. Both are listed first (newest)
+	# specifically to catch any tag filter short of an exact tool-name
+	# match for TOOL=discord.
 	releases_fixture "$www" '[
   {"tag_name": "discord-vx-v9.9.9"},
+  {"tag_name": "discord-v2-v1.0.0"},
   {"tag_name": "discord-v1.0.0"}
 ]'
-	# What a substring-matching filter would wrongly resolve to and download.
+	# What a loose-matching filter would wrongly resolve to and download.
 	make_asset "$www/download/discord-vx-v9.9.9/discord-x-v9.9.9-aarch64-apple-darwin.tar.gz" "discord" "WRONG-discord-vx-binary"
+	make_asset "$www/download/discord-v2-v1.0.0/discord-2-v1.0.0-aarch64-apple-darwin.tar.gz" "discord" "WRONG-discord-v2-binary"
 	# The actual "discord" release.
 	make_asset "$www/download/discord-v1.0.0/discord-1.0.0-aarch64-apple-darwin.tar.gz" "discord" "discord-v1.0.0-ok"
 
@@ -230,7 +234,7 @@ case_similar_name_guard() {
 	fi
 	output="$("$install_root/bin/discord" 2>/dev/null || true)"
 	if [ "$output" != "discord-v1.0.0-ok" ]; then
-		fail "$label: installed the wrong release (got '$output'); tag filter matched discord-vx-v9.9.9 by substring instead of anchoring to discord-v<digit>"
+		fail "$label: installed the wrong release (got '$output'); tag filter must match the tool name exactly, not by prefix/substring"
 		return
 	fi
 	pass "$label"
