@@ -20,7 +20,7 @@ paths:
 
 ## DO
 
-`tools/hello/src/main.rs`처럼 순수 함수를 분리하고 동일 파일에서 테스트한다.
+`tools/hello/src/main.rs`처럼 순수 함수를 분리하고 테스트한다 (테스트 배치 기준은 `module-structure.md` 참조).
 
 ```rust
 fn greeting(name: &str) -> String {
