@@ -2,7 +2,8 @@ use clap::{Parser, Subcommand};
 
 /// Discord bot CLI for AI agents: send, read, and wait for channel messages.
 ///
-/// Output is JSON by default (machine-parseable). Pass --human for text.
+/// Output is human-readable text by default. Pass --json to emit the
+/// machine-readable envelope; agents should always pass --json.
 /// Token resolution order: --token flag > env DISCORD_BOT_TOKEN > config file.
 #[derive(Parser, Debug)]
 #[command(name = "discord", version, about)]
@@ -15,9 +16,10 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub config: Option<String>,
 
-    /// Human-readable text output (default is JSON).
+    /// Emit machine-readable JSON envelope instead of human text.
+    /// Agents should always pass this flag.
     #[arg(long, global = true)]
-    pub human: bool,
+    pub json: bool,
 
     #[command(subcommand)]
     pub command: Command,
@@ -264,12 +266,28 @@ mod tests {
 
     #[test]
     fn global_flags_apply_alongside_subcommand() {
-        let cli =
-            Cli::try_parse_from(["discord", "--human", "--token", "abc", "send", "123", "hi"])
-                .unwrap();
-        assert!(cli.human);
+        let cli = Cli::try_parse_from(["discord", "--json", "--token", "abc", "send", "123", "hi"])
+            .unwrap();
+        assert!(cli.json);
         assert_eq!(cli.token.as_deref(), Some("abc"));
         assert_eq!(cli.command.name(), "send");
+    }
+
+    #[test]
+    fn json_flag_parses_after_subcommand_and_args() {
+        // --json is global=true, so it must parse in both positions;
+        // global_flags_apply_alongside_subcommand above only covers the
+        // pre-subcommand position.
+        let cli = Cli::try_parse_from(["discord", "send", "123", "hi", "--json"]).unwrap();
+        assert!(cli.json);
+        assert_eq!(cli.command.name(), "send");
+    }
+
+    #[test]
+    fn human_flag_is_rejected_as_unknown() {
+        // --human was removed once human text became the default output —
+        // clap must reject it as an unknown flag rather than ignoring it.
+        assert!(Cli::try_parse_from(["discord", "--human", "send", "123", "hi"]).is_err());
     }
 
     #[test]

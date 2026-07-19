@@ -201,25 +201,41 @@ struct ErrorEnvelope<'a> {
     error: &'a AppError,
 }
 
-/// Renders a command result to the string printed on stdout plus the process
-/// exit code. JSON by default; text when `human` is set.
-pub fn render(command: &str, result: &Result<Payload, AppError>, human: bool) -> (String, i32) {
+/// Which stream a rendered line belongs on. Human-mode errors are
+/// diagnostics and must not pollute stdout; every other case is a result
+/// payload and belongs on stdout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Sink {
+    Stdout,
+    Stderr,
+}
+
+/// Renders a command result to the stream it belongs on, the line to print,
+/// and the process exit code. Human text by default; the JSON envelope when
+/// `json` is set. In human mode, errors go to stderr and stdout stays empty
+/// ("diagnostics on stderr"); the JSON envelope always goes to stdout.
+pub fn render(
+    command: &str,
+    result: &Result<Payload, AppError>,
+    json: bool,
+) -> (Sink, String, i32) {
     match result {
         Ok(payload) => {
-            let text = if human {
-                payload.to_human()
-            } else {
+            let text = if json {
                 success_json(command, payload)
+            } else {
+                payload.to_human()
             };
-            (text, 0)
+            (Sink::Stdout, text, 0)
         }
         Err(err) => {
-            let text = if human {
-                err.to_human()
-            } else {
+            let text = if json {
                 error_json(command, err)
+            } else {
+                err.to_human()
             };
-            (text, exit_code(err))
+            let sink = if json { Sink::Stdout } else { Sink::Stderr };
+            (sink, text, exit_code(err))
         }
     }
 }
@@ -282,7 +298,8 @@ mod tests {
             timestamp: "2024-01-01T00:00:00Z".into(),
             attachments: vec![],
         });
-        let (json, code) = render("send", &Ok(payload), false);
+        let (sink, json, code) = render("send", &Ok(payload), true);
+        assert_eq!(sink, Sink::Stdout);
         assert_eq!(code, 0);
         assert_eq!(
             json,
@@ -298,7 +315,8 @@ mod tests {
             timestamp: "2024-01-01T00:00:00Z".into(),
             attachments: vec![sample_attachment()],
         });
-        let (json, code) = render("send", &Ok(payload), false);
+        let (sink, json, code) = render("send", &Ok(payload), true);
+        assert_eq!(sink, Sink::Stdout);
         assert_eq!(code, 0);
         assert_eq!(
             json,
@@ -314,7 +332,7 @@ mod tests {
             cursor: Some("10".into()),
             messages: vec![sample_message()],
         });
-        let (json, _) = render("read", &Ok(payload), false);
+        let (_, json, _) = render("read", &Ok(payload), true);
         assert_eq!(
             json,
             r#"{"ok":true,"command":"read","data":{"channel_id":"c","count":1,"cursor":"10","messages":[{"id":"10","channel_id":"chan","author":{"id":"u1","username":"alice","bot":false},"content":"hi","timestamp":"2024-01-01T00:00:00Z","attachments":[]}]}}"#
@@ -337,7 +355,7 @@ mod tests {
             cursor: Some("10".into()),
             messages: vec![message],
         });
-        let (json, _) = render("read", &Ok(payload), false);
+        let (_, json, _) = render("read", &Ok(payload), true);
         assert_eq!(
             json,
             r#"{"ok":true,"command":"read","data":{"channel_id":"c","count":1,"cursor":"10","messages":[{"id":"10","channel_id":"chan","author":{"id":"u1","username":"alice","bot":false},"content":"hi","timestamp":"2024-01-01T00:00:00Z","attachments":[{"id":"a2","filename":"notes.txt","size":42,"url":"https://cdn.discordapp.com/attachments/1/a2/notes.txt"}]}]}}"#
@@ -352,7 +370,7 @@ mod tests {
             cursor: None,
             messages: vec![],
         });
-        let (json, _) = render("read", &Ok(payload), false);
+        let (_, json, _) = render("read", &Ok(payload), true);
         assert_eq!(
             json,
             r#"{"ok":true,"command":"read","data":{"channel_id":"c","count":0,"cursor":null,"messages":[]}}"#
@@ -368,7 +386,8 @@ mod tests {
             timed_out: true,
             messages: vec![],
         });
-        let (json, code) = render("wait", &Ok(payload), false);
+        let (sink, json, code) = render("wait", &Ok(payload), true);
+        assert_eq!(sink, Sink::Stdout);
         assert_eq!(code, 0);
         assert_eq!(
             json,
@@ -387,7 +406,7 @@ mod tests {
             timed_out: false,
             messages: vec![message],
         });
-        let (json, _) = render("wait", &Ok(payload), false);
+        let (_, json, _) = render("wait", &Ok(payload), true);
         assert_eq!(
             json,
             r#"{"ok":true,"command":"wait","data":{"channel_id":"c","count":1,"cursor":"20","timed_out":false,"messages":[{"id":"10","channel_id":"chan","author":{"id":"u1","username":"alice","bot":false},"content":"hi","timestamp":"2024-01-01T00:00:00Z","attachments":[{"id":"a1","filename":"photo.png","size":1024,"url":"https://cdn.discordapp.com/attachments/1/a1/photo.png","content_type":"image/png"}]}]}}"#
@@ -397,7 +416,8 @@ mod tests {
     #[test]
     fn error_omits_absent_optionals() {
         let err = AppError::new(ErrorKind::Config, "no bot token");
-        let (json, code) = render("send", &Err(err), false);
+        let (sink, json, code) = render("send", &Err(err), true);
+        assert_eq!(sink, Sink::Stdout);
         assert_eq!(code, 3);
         assert_eq!(
             json,
@@ -413,7 +433,8 @@ mod tests {
             http_status: Some(429),
             retry_after_ms: Some(1200),
         };
-        let (json, code) = render("read", &Err(err), false);
+        let (sink, json, code) = render("read", &Err(err), true);
+        assert_eq!(sink, Sink::Stdout);
         assert_eq!(code, 5);
         assert_eq!(
             json,
@@ -440,9 +461,26 @@ mod tests {
             http_status: Some(401),
             retry_after_ms: None,
         };
-        let (text, code) = render("send", &Err(err), true);
+        let (sink, text, code) = render("send", &Err(err), false);
+        assert_eq!(sink, Sink::Stderr);
         assert_eq!(code, 3);
         assert_eq!(text, "error [auth]: invalid token (http 401)");
+    }
+
+    #[test]
+    fn human_mode_error_routes_to_stderr_not_stdout() {
+        // "diagnostics on stderr": a human-mode error must never appear as
+        // the stdout line, since agents piping stdout would see nothing.
+        let err = AppError::new(ErrorKind::Api, "channel not found");
+        let (sink, _, _) = render("read", &Err(err), false);
+        assert_eq!(sink, Sink::Stderr);
+    }
+
+    #[test]
+    fn json_mode_error_still_routes_to_stdout() {
+        let err = AppError::new(ErrorKind::Api, "channel not found");
+        let (sink, _, _) = render("read", &Err(err), true);
+        assert_eq!(sink, Sink::Stdout);
     }
 
     #[test]
@@ -453,7 +491,8 @@ mod tests {
             timestamp: "2024-01-01T00:00:00Z".into(),
             attachments: vec![],
         });
-        let (text, code) = render("send", &Ok(payload), true);
+        let (sink, text, code) = render("send", &Ok(payload), false);
+        assert_eq!(sink, Sink::Stdout);
         assert_eq!(code, 0);
         assert_eq!(
             text,
@@ -478,7 +517,7 @@ mod tests {
                 },
             ],
         });
-        let (text, code) = render("send", &Ok(payload), true);
+        let (_, text, code) = render("send", &Ok(payload), false);
         assert_eq!(code, 0);
         assert_eq!(
             text,
@@ -495,7 +534,7 @@ mod tests {
             cursor: Some("10".into()),
             messages: vec![sample_message()],
         });
-        let (text, code) = render("read", &Ok(payload), true);
+        let (_, text, code) = render("read", &Ok(payload), false);
         assert_eq!(code, 0);
         assert_eq!(
             text,
@@ -512,7 +551,7 @@ mod tests {
             timed_out: false,
             messages: vec![sample_message()],
         });
-        let (text, code) = render("wait", &Ok(payload), true);
+        let (_, text, code) = render("wait", &Ok(payload), false);
         assert_eq!(code, 0);
         assert_eq!(
             text,
@@ -530,7 +569,7 @@ mod tests {
             cursor: Some("10".into()),
             messages: vec![message],
         });
-        let (text, code) = render("read", &Ok(payload), true);
+        let (_, text, code) = render("read", &Ok(payload), false);
         assert_eq!(code, 0);
         assert_eq!(
             text,
@@ -547,7 +586,7 @@ mod tests {
             cursor: Some("10".into()),
             messages: vec![sample_message()],
         });
-        let (text, _) = render("read", &Ok(payload), true);
+        let (_, text, _) = render("read", &Ok(payload), false);
         assert_eq!(
             text,
             "channel c: 1 message(s) (next --after 10)\n[2024-01-01T00:00:00Z] alice: hi"
@@ -563,8 +602,150 @@ mod tests {
             timed_out: true,
             messages: vec![],
         });
-        let (text, code) = render("wait", &Ok(payload), true);
+        let (sink, text, code) = render("wait", &Ok(payload), false);
+        assert_eq!(sink, Sink::Stdout);
         assert_eq!(code, 0);
         assert_eq!(text, "channel c: timed out, no new messages");
+    }
+
+    #[test]
+    fn json_read_success_routes_to_stdout_with_exit_zero() {
+        let payload = Payload::Read(ReadData {
+            channel_id: "c".into(),
+            count: 1,
+            cursor: Some("10".into()),
+            messages: vec![sample_message()],
+        });
+        let (sink, _, code) = render("read", &Ok(payload), true);
+        assert_eq!(sink, Sink::Stdout);
+        assert_eq!(code, 0);
+    }
+
+    #[test]
+    fn json_wait_success_with_attachments_routes_to_stdout_with_exit_zero() {
+        let mut message = sample_message();
+        message.attachments = vec![sample_attachment()];
+        let payload = Payload::Wait(WaitData {
+            channel_id: "c".into(),
+            count: 1,
+            cursor: Some("20".into()),
+            timed_out: false,
+            messages: vec![message],
+        });
+        let (sink, _, code) = render("wait", &Ok(payload), true);
+        assert_eq!(sink, Sink::Stdout);
+        assert_eq!(code, 0);
+    }
+
+    #[test]
+    fn human_success_output_never_contains_json_envelope_marker() {
+        // json=false success must be plain text, never the {"ok":...}
+        // envelope shape — this is the boundary agents rely on to tell modes
+        // apart, so assert its absence directly rather than only asserting
+        // the expected human string.
+        let send = Payload::Send(SendData {
+            message_id: "1".into(),
+            channel_id: "c".into(),
+            timestamp: "2024-01-01T00:00:00Z".into(),
+            attachments: vec![],
+        });
+        let read = Payload::Read(ReadData {
+            channel_id: "c".into(),
+            count: 1,
+            cursor: Some("10".into()),
+            messages: vec![sample_message()],
+        });
+        let wait = Payload::Wait(WaitData {
+            channel_id: "c".into(),
+            count: 0,
+            cursor: None,
+            timed_out: true,
+            messages: vec![],
+        });
+
+        for payload in [send, read, wait] {
+            let (sink, text, code) = render("cmd", &Ok(payload), false);
+            assert_eq!(sink, Sink::Stdout);
+            assert_eq!(code, 0);
+            assert!(
+                !text.contains(r#"{"ok"#),
+                "human output leaked json envelope: {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn human_read_success_routes_to_stdout() {
+        let payload = Payload::Read(ReadData {
+            channel_id: "c".into(),
+            count: 1,
+            cursor: Some("10".into()),
+            messages: vec![sample_message()],
+        });
+        let (sink, _, code) = render("read", &Ok(payload), false);
+        assert_eq!(sink, Sink::Stdout);
+        assert_eq!(code, 0);
+    }
+
+    #[test]
+    fn human_wait_success_routes_to_stdout() {
+        let payload = Payload::Wait(WaitData {
+            channel_id: "c".into(),
+            count: 1,
+            cursor: None,
+            timed_out: false,
+            messages: vec![sample_message()],
+        });
+        let (sink, _, code) = render("wait", &Ok(payload), false);
+        assert_eq!(sink, Sink::Stdout);
+        assert_eq!(code, 0);
+    }
+
+    #[test]
+    fn human_wait_success_with_attachment_lists_filename_not_url() {
+        // Regression coverage matching the send/read filename-not-url
+        // contract, but for wait specifically — no prior test exercised
+        // this combination.
+        let mut message = sample_message();
+        message.attachments = vec![sample_attachment()];
+        let payload = Payload::Wait(WaitData {
+            channel_id: "c".into(),
+            count: 1,
+            cursor: Some("20".into()),
+            timed_out: false,
+            messages: vec![message],
+        });
+        let (_, text, code) = render("wait", &Ok(payload), false);
+        assert_eq!(code, 0);
+        assert_eq!(
+            text,
+            "channel c: 1 new message(s) (next --after 20)\n[2024-01-01T00:00:00Z] alice: hi\nattachments: photo.png"
+        );
+        assert!(!text.contains("cdn.discordapp.com"));
+    }
+
+    #[test]
+    fn exit_code_matches_across_json_and_human_modes_for_every_kind() {
+        // The CLI contract promises identical exit codes regardless of
+        // --json; verify render() itself preserves that for every error
+        // kind, not just the standalone exit_code() mapping function.
+        let kinds = [
+            ErrorKind::Usage,
+            ErrorKind::Config,
+            ErrorKind::Auth,
+            ErrorKind::Api,
+            ErrorKind::RateLimit,
+            ErrorKind::Network,
+            ErrorKind::Internal,
+        ];
+        for kind in kinds {
+            let err = AppError::new(kind, "boom");
+            let (_, _, json_code) = render("send", &Err(err.clone()), true);
+            let (_, _, human_code) = render("send", &Err(err), false);
+            assert_eq!(
+                json_code, human_code,
+                "exit code diverged between modes for {kind:?}"
+            );
+        }
     }
 }
