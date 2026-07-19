@@ -1,5 +1,5 @@
 use crate::common::api::{CreateThreadRequest, DiscordApi};
-use crate::output::{AppError, Payload, ThreadData};
+use crate::output::{AppError, ErrorKind, Payload, ThreadData};
 
 /// Creates a thread on a channel, or on a specific message when
 /// `from_message` is given. Discord itself decides thread_id semantics (a
@@ -15,6 +15,17 @@ pub(crate) async fn run_thread_create(
     name: &str,
     from_message: Option<&str>,
 ) -> Result<Payload, AppError> {
+    if name.is_empty() {
+        return Err(AppError::new(ErrorKind::Usage, "--name must not be empty"));
+    }
+    // An explicit empty --from-message is a caller mistake, not "no message":
+    // reject it rather than assembling ".../messages//threads".
+    if from_message == Some("") {
+        return Err(AppError::new(
+            ErrorKind::Usage,
+            "--from-message must not be an empty string",
+        ));
+    }
     let req = CreateThreadRequest {
         channel_id: channel_id.to_owned(),
         name: name.to_owned(),
@@ -79,6 +90,32 @@ mod tests {
         assert_eq!(calls[0].channel_id, "chan1");
         assert_eq!(calls[0].name, "from-msg");
         assert_eq!(calls[0].from_message_id.as_deref(), Some("999"));
+    }
+
+    #[tokio::test]
+    async fn run_thread_create_rejects_empty_name() {
+        // Mirrors send's "--reply-to must not be an empty string" / "message
+        // body must not be empty" local-validation convention: an empty
+        // --name is a caller mistake, not something to forward to Discord.
+        let api = MockDiscordApi::new();
+        let err = run_thread_create(&api, "chan1", "", None)
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind, ErrorKind::Usage);
+        assert!(api.thread_calls.borrow().is_empty());
+    }
+
+    #[tokio::test]
+    async fn run_thread_create_rejects_empty_from_message() {
+        // An explicit empty --from-message would otherwise reach
+        // `create_thread_url` and assemble ".../messages//threads" — reject
+        // it locally instead, same as send's empty --reply-to check.
+        let api = MockDiscordApi::new();
+        let err = run_thread_create(&api, "chan1", "topic", Some(""))
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind, ErrorKind::Usage);
+        assert!(api.thread_calls.borrow().is_empty());
     }
 
     #[tokio::test]
