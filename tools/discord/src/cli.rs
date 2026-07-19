@@ -94,6 +94,27 @@ pub enum Command {
         #[arg(long, default_value_t = 50)]
         limit: u8,
     },
+
+    /// Thread operations on a channel (id or config alias).
+    #[command(subcommand)]
+    Thread(ThreadCommand),
+}
+
+#[derive(Subcommand, Debug)]
+pub enum ThreadCommand {
+    /// Create a thread on a channel, or on a specific message with
+    /// --from-message.
+    Create {
+        /// Channel id, or an alias defined in config.channels.
+        channel: String,
+        /// Thread name.
+        #[arg(long)]
+        name: String,
+        /// Create the thread from this existing message id instead of a
+        /// standalone channel thread.
+        #[arg(long = "from-message")]
+        from_message: Option<String>,
+    },
 }
 
 impl Command {
@@ -104,6 +125,7 @@ impl Command {
             Command::Init { .. } => "init",
             Command::Read { .. } => "read",
             Command::Wait { .. } => "wait",
+            Command::Thread(_) => "thread",
         }
     }
 }
@@ -383,6 +405,73 @@ mod tests {
         // --force is init-only; clap must reject it on send as an unknown
         // argument rather than silently accepting and ignoring it.
         assert!(Cli::try_parse_from(["discord", "send", "123", "hi", "--force"]).is_err());
+    }
+
+    #[test]
+    fn thread_create_parses_name_flag() {
+        let cli =
+            Cli::try_parse_from(["discord", "thread", "create", "123", "--name", "topic"]).unwrap();
+        match cli.command {
+            Command::Thread(ThreadCommand::Create {
+                channel,
+                name,
+                from_message,
+            }) => {
+                assert_eq!(channel, "123");
+                assert_eq!(name, "topic");
+                assert_eq!(from_message, None);
+            }
+            other => panic!("expected Thread(Create), got {other:?}"),
+        }
+        assert_eq!(
+            Cli::try_parse_from(["discord", "thread", "create", "123", "--name", "topic"])
+                .unwrap()
+                .command
+                .name(),
+            "thread"
+        );
+    }
+
+    #[test]
+    fn thread_create_parses_from_message_flag() {
+        let cli = Cli::try_parse_from([
+            "discord",
+            "thread",
+            "create",
+            "123",
+            "--name",
+            "topic",
+            "--from-message",
+            "999",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Thread(ThreadCommand::Create {
+                channel,
+                name,
+                from_message,
+            }) => {
+                assert_eq!(channel, "123");
+                assert_eq!(name, "topic");
+                assert_eq!(from_message.as_deref(), Some("999"));
+            }
+            other => panic!("expected Thread(Create), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn thread_create_requires_name_flag() {
+        assert!(Cli::try_parse_from(["discord", "thread", "create", "123"]).is_err());
+    }
+
+    #[test]
+    fn thread_create_json_flag_parses_after_subcommand_and_args() {
+        let cli = Cli::try_parse_from([
+            "discord", "thread", "create", "123", "--name", "topic", "--json",
+        ])
+        .unwrap();
+        assert!(cli.json);
+        assert_eq!(cli.command.name(), "thread");
     }
 
     #[test]
