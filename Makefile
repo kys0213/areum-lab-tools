@@ -7,7 +7,7 @@
 
 INSTALL_ROOT ?= $(HOME)/.local
 
-.PHONY: help build release test lint fmt fmt-check check install install-all install-release new clean dist-build dist-tag
+.PHONY: help build release test lint fmt fmt-check check install install-all install-release test-install new clean dist-build dist-tag
 
 help: ## Show this help message
 	@echo "Available targets:"
@@ -53,6 +53,9 @@ install-release: ## Install a tool from GitHub Release: make install-release TOO
 		exit 1; \
 	fi
 	INSTALL_ROOT=$(INSTALL_ROOT) ./scripts/install.sh $(TOOL) $(VERSION)
+
+test-install: ## Run install.sh smoke tests
+	./scripts/install_test.sh
 
 new: ## Scaffold a new tool from templates/: make new NAME=<name>
 	@if [ -z "$(NAME)" ]; then \
