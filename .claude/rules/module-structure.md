@@ -99,10 +99,16 @@ pub(crate) mod http;
 `send`/`read`/`wait`가 공유하는 헬퍼는 `mod.rs`가 아니라 개념을 드러내는 이름의 파일로 뺀다 (`tools/discord/src/commands/cursor.rs` 발췌) — `read.rs`/`wait.rs`는 `use super::cursor::{newest_cursor, sort_ascending_by_id, validate_limit};`로 가져다 쓴다.
 
 ```rust
-/// Discord 스노우플레이크 id는 수치로만 정렬 순서가 맞는다("9" > "10" 문자열 비교와 다름).
+/// Discord snowflake ids sort correctly only by numeric value, not lexically
+/// ("9" > "10" as strings). Parse failure means the API returned something
+/// that isn't a snowflake, which is an API contract violation, not a usage
+/// error.
 pub(crate) fn parse_snowflake(id: &str) -> Result<u64, AppError> {
     id.parse::<u64>().map_err(|_| {
-        AppError::new(ErrorKind::Api, format!("message id '{id}' is not a valid u64 snowflake"))
+        AppError::new(
+            ErrorKind::Api,
+            format!("message id '{id}' is not a valid u64 snowflake"),
+        )
     })
 }
 ```
@@ -158,9 +164,11 @@ pub(crate) fn to_human(&self) -> String { /* ... */ }
 ```rust
 use clap::Parser;
 
+/// Minimal placeholder CLI for the workspace scaffold.
 #[derive(Parser)]
 #[command(version, about)]
 struct Cli {
+    /// Name to greet
     #[arg(long, default_value = "world")]
     name: String,
 }
