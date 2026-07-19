@@ -52,7 +52,7 @@ install-release: ## Install a tool from GitHub Release: make install-release TOO
 		echo "error: TOOL is required. usage: make install-release TOOL=<name>" >&2; \
 		exit 1; \
 	fi
-	INSTALL_ROOT=$(INSTALL_ROOT) ./scripts/install.sh $(TOOL) $(VERSION)
+	INSTALL_ROOT="$(INSTALL_ROOT)" ./scripts/install.sh "$(TOOL)" "$(VERSION)"
 
 test-install: ## Run install.sh smoke tests
 	./scripts/install_test.sh

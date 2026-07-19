@@ -240,10 +240,56 @@ case_similar_name_guard() {
 	pass "$label"
 }
 
+# --- (e) make install-release must survive an INSTALL_ROOT with spaces ---
+case_make_install_release_spaces() {
+	label="(e) make install-release with spaces in INSTALL_ROOT"
+	case_dir="$WORK_DIR/case_e"
+	www="$case_dir/www"
+	repo_root="$(dirname "$SCRIPT_DIR")"
+
+	releases_fixture "$www" '[
+  {"tag_name": "discord-v1.0.0"}
+]'
+	make_asset "$www/download/discord-v1.0.0/discord-1.0.0-aarch64-apple-darwin.tar.gz" "discord" "discord-v1.0.0-ok"
+
+	install_root="$case_dir/install root with spaces"
+	STDOUT_LOG="$WORK_DIR/last-stdout.log"
+	STDERR_LOG="$WORK_DIR/last-stderr.log"
+
+	start_server "$www" || {
+		fail "$label: could not start fixture server"
+		return
+	}
+	# VERSION is intentionally left unset: the recipe must both quote its
+	# variables and still behave as "latest" when no version is given.
+	( cd "$repo_root" &&
+		AREUM_API_BASE="$BASE_URL/api" AREUM_DOWNLOAD_BASE="$BASE_URL/download" \
+			make install-release TOOL=discord INSTALL_ROOT="$install_root" ) \
+		>"$STDOUT_LOG" 2>"$STDERR_LOG"
+	RC=$?
+	stop_server
+
+	if [ "$RC" -ne 0 ]; then
+		fail "$label: make install-release exited $RC (expected 0); stderr: $(cat "$STDERR_LOG")"
+		return
+	fi
+	if [ ! -x "$install_root/bin/discord" ]; then
+		fail "$label: binary not installed at '$install_root/bin/discord' (unquoted recipe variables split the path)"
+		return
+	fi
+	output="$("$install_root/bin/discord")"
+	if [ "$output" != "discord-v1.0.0-ok" ]; then
+		fail "$label: unexpected binary output: $output"
+		return
+	fi
+	pass "$label"
+}
+
 case_normal_install
 case_checksum_mismatch
 case_no_release
 case_similar_name_guard
+case_make_install_release_spaces
 
 if [ "$FAIL" -ne 0 ]; then
 	echo "install.sh smoke tests: FAILED"
