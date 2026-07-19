@@ -40,6 +40,12 @@ pub struct WaitData {
     pub messages: Vec<Message>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ThreadData {
+    pub thread_id: String,
+    pub name: String,
+}
+
 /// Command result payload. `untagged` so each variant serializes as its inner
 /// object directly under the envelope `data` key.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -49,6 +55,7 @@ pub enum Payload {
     Init(InitData),
     Read(ReadData),
     Wait(WaitData),
+    Thread(ThreadData),
 }
 
 impl Payload {
@@ -84,6 +91,7 @@ impl Payload {
                 cursor_hint(&d.cursor),
                 format_messages(&d.messages)
             ),
+            Payload::Thread(d) => format!("created thread {} \"{}\"", d.thread_id, d.name),
         }
     }
 }
@@ -309,6 +317,18 @@ mod tests {
         assert_eq!(sink, Sink::Stdout);
         assert_eq!(code, 0);
         assert_eq!(text, "channel c: timed out, no new messages");
+    }
+
+    #[test]
+    fn human_thread_success_renders_readable_text() {
+        let payload = Payload::Thread(ThreadData {
+            thread_id: "111".into(),
+            name: "discussion".into(),
+        });
+        let (sink, text, code) = render("thread", &Ok(payload), false);
+        assert_eq!(sink, Sink::Stdout);
+        assert_eq!(code, 0);
+        assert_eq!(text, "created thread 111 \"discussion\"");
     }
 
     #[test]

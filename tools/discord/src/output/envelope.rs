@@ -43,7 +43,7 @@ mod tests {
     use super::*;
     use crate::common::api::{Attachment, Author, Message};
     use crate::common::error::ErrorKind;
-    use crate::output::payload::{InitData, ReadData, SendData, WaitData};
+    use crate::output::payload::{InitData, ReadData, SendData, ThreadData, WaitData};
     use crate::output::{Sink, render};
 
     fn sample_message() -> Message {
@@ -250,6 +250,21 @@ mod tests {
         assert_eq!(
             json,
             r#"{"ok":true,"command":"wait","data":{"channel_id":"c","count":1,"cursor":"20","timed_out":false,"messages":[{"id":"10","channel_id":"chan","author":{"id":"u1","username":"alice","bot":false},"content":"hi","timestamp":"2024-01-01T00:00:00Z","attachments":[{"id":"a1","filename":"photo.png","size":1024,"url":"https://cdn.discordapp.com/attachments/1/a1/photo.png","content_type":"image/png"}]}]}}"#
+        );
+    }
+
+    #[test]
+    fn thread_success_matches_contract() {
+        let payload = Payload::Thread(ThreadData {
+            thread_id: "111".into(),
+            name: "discussion".into(),
+        });
+        let (sink, json, code) = render("thread", &Ok(payload), true);
+        assert_eq!(sink, Sink::Stdout);
+        assert_eq!(code, 0);
+        assert_eq!(
+            json,
+            r#"{"ok":true,"command":"thread","data":{"thread_id":"111","name":"discussion"}}"#
         );
     }
 
