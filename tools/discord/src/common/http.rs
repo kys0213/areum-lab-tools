@@ -366,6 +366,28 @@ mod tests {
     }
 
     #[test]
+    fn status_error_maps_403_to_auth_kind_and_preserves_body() {
+        // Acceptance criterion: insufficient permissions on thread creation
+        // (Discord 403 "Missing Access"/"Missing Permissions") must classify
+        // as Auth, not a generic Api error.
+        let err = status_error(403, r#"{"message":"Missing Access","code":50001}"#);
+        assert_eq!(err.kind, ErrorKind::Auth);
+        assert_eq!(err.http_status, Some(403));
+        assert!(err.message.contains("Missing Access"));
+    }
+
+    #[test]
+    fn status_error_preserves_thread_already_created_body_verbatim() {
+        // The command-layer test (`api_error_propagates_as_is` in
+        // commands::thread) only checks the error already carries this text;
+        // this pins that `status_error` is where that text is captured
+        // verbatim from the Discord response body, not summarized/dropped.
+        let err = status_error(400, r#"{"message":"THREAD_ALREADY_CREATED","code":160004}"#);
+        assert_eq!(err.kind, ErrorKind::Api);
+        assert!(err.message.contains("THREAD_ALREADY_CREATED"));
+    }
+
+    #[test]
     fn parse_retry_after_reads_header_seconds() {
         assert_eq!(parse_retry_after(Some("1.5"), None), Some(1500));
     }

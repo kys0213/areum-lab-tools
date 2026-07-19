@@ -269,6 +269,46 @@ mod tests {
     }
 
     #[test]
+    fn thread_permission_denied_error_matches_contract() {
+        // Acceptance criterion 3: insufficient permission on thread create
+        // must surface as a `kind: "auth"` JSON envelope, not a generic
+        // error — pins the full serialized shape, not just the ErrorKind.
+        let err = AppError {
+            kind: ErrorKind::Auth,
+            message: "Discord API returned 403: Missing Access".into(),
+            http_status: Some(403),
+            retry_after_ms: None,
+        };
+        let (sink, json, code) = render("thread", &Err(err), true);
+        assert_eq!(sink, Sink::Stdout);
+        assert_eq!(code, 3);
+        assert_eq!(
+            json,
+            r#"{"ok":false,"command":"thread","error":{"kind":"auth","message":"Discord API returned 403: Missing Access","http_status":403}}"#
+        );
+    }
+
+    #[test]
+    fn thread_duplicate_creation_error_matches_contract() {
+        // Acceptance criterion 3: re-requesting a thread on a message that
+        // already has one (Discord's THREAD_ALREADY_CREATED) must surface as
+        // a clear JSON envelope with the Discord message preserved verbatim.
+        let err = AppError {
+            kind: ErrorKind::Api,
+            message: "Discord API returned 400: THREAD_ALREADY_CREATED".into(),
+            http_status: Some(400),
+            retry_after_ms: None,
+        };
+        let (sink, json, code) = render("thread", &Err(err), true);
+        assert_eq!(sink, Sink::Stdout);
+        assert_eq!(code, 4);
+        assert_eq!(
+            json,
+            r#"{"ok":false,"command":"thread","error":{"kind":"api","message":"Discord API returned 400: THREAD_ALREADY_CREATED","http_status":400}}"#
+        );
+    }
+
+    #[test]
     fn error_omits_absent_optionals() {
         let err = AppError::new(ErrorKind::Config, "no bot token");
         let (sink, json, code) = render("send", &Err(err), true);

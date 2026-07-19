@@ -82,6 +82,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn thread_id_can_be_used_as_send_channel_id() {
+        // Acceptance criterion 2: the thread id returned by `thread create`
+        // must work as the channel id for a subsequent `send --file` call.
+        // Both channel_id and thread_id are opaque Strings throughout this
+        // crate (SendRequest.channel_id: String, ThreadData.thread_id:
+        // String) — this pins that no special-casing breaks the handoff.
+        use crate::commands::run_send;
+        use crate::commands::testutil::unreachable_stdin;
+        use crate::common::api::SentMessage;
+
+        let thread_api = MockDiscordApi::with_thread_responses(vec![Ok(CreatedThread {
+            id: "222333".into(),
+            name: "from-msg".into(),
+        })]);
+        let payload = run_thread_create(&thread_api, "chan1", "from-msg", Some("111"))
+            .await
+            .unwrap();
+        let thread_id = match payload {
+            Payload::Thread(data) => data.thread_id,
+            other => panic!("expected Thread, got {other:?}"),
+        };
+
+        let send_api = MockDiscordApi::new();
+        send_api
+            .send_responses
+            .borrow_mut()
+            .push_back(Ok(SentMessage {
+                id: "1".into(),
+                channel_id: thread_id.clone(),
+                timestamp: "2024-01-01T00:00:00Z".into(),
+                attachments: vec![],
+            }));
+        run_send(
+            &send_api,
+            &thread_id,
+            None,
+            None,
+            None,
+            &["/tmp/photo.png".to_owned()],
+            unreachable_stdin,
+            |_| Ok(vec![1, 2, 3]),
+        )
+        .await
+        .unwrap();
+
+        let calls = send_api.send_calls.borrow();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].channel_id, thread_id);
+        assert_eq!(calls[0].files.len(), 1);
+        assert_eq!(calls[0].files[0].filename, "photo.png");
+    }
+
+    #[tokio::test]
     async fn api_error_propagates_as_is() {
         // THREAD_ALREADY_CREATED and any other Discord API error must surface
         // unchanged, not be swallowed or converted into a synthesized success.
