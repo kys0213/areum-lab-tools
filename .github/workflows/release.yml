@@ -4,6 +4,9 @@ name: Release
 # version은 항상 태그의 "마지막" "-v" 뒤 문자열이다 — 도구 이름 자체에 "-v"가
 # 들어 있어도(예: `my-v-tool-v1.0.0`) 안전하게 분리된다.
 # tools/<tool>/Cargo.toml의 version 리터럴과 태그 버전이 다르면 fail-fast.
+# 체크섬 계약: 각 tarball과 같은 디렉토리에 "<tarball명>.sha256"을 생성한다.
+# 내용은 `shasum -a 256 <tarball>` 출력 형식(해시 + 공백 두 칸 + tarball
+# 베이스네임, 경로 없음) — 설치 스크립트가 `shasum -a 256 -c`로 검증한다.
 on:
   push:
     tags: ['*-v[0-9]+.[0-9]+.[0-9]+']
@@ -68,12 +71,18 @@ jobs:
         run: |
           TOOL="${{ steps.parse.outputs.tool }}"
           VERSION="${{ steps.parse.outputs.version }}"
-          tar czf "$TOOL-$VERSION-${{ matrix.target }}.tar.gz" \
+          TARBALL="$TOOL-$VERSION-${{ matrix.target }}.tar.gz"
+          tar czf "$TARBALL" \
             -C "target/${{ matrix.target }}/release" "$TOOL"
+          # cwd가 repo root이고 $TARBALL이 베이스네임뿐이라 체크섬 파일의
+          # 파일명 필드에도 경로가 섞이지 않는다.
+          shasum -a 256 "$TARBALL" > "$TARBALL.sha256"
 
       - name: Upload to GitHub Release
         # workflow_dispatch는 빌드 검증용이므로 실제 태그 push일 때만 Release에 첨부.
         if: github.event_name == 'push'
         uses: softprops/action-gh-release@v2
         with:
-          files: ${{ steps.parse.outputs.tool }}-${{ steps.parse.outputs.version }}-${{ matrix.target }}.tar.gz
+          files: |
+            ${{ steps.parse.outputs.tool }}-${{ steps.parse.outputs.version }}-${{ matrix.target }}.tar.gz
+            ${{ steps.parse.outputs.tool }}-${{ steps.parse.outputs.version }}-${{ matrix.target }}.tar.gz.sha256
