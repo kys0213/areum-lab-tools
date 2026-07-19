@@ -2,7 +2,9 @@ use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::time::Duration;
 
-use crate::common::api::{Author, DiscordApi, Message, SendRequest, SentMessage};
+use crate::common::api::{
+    Author, CreateThreadRequest, CreatedThread, DiscordApi, Message, SendRequest, SentMessage,
+};
 use crate::output::AppError;
 
 use super::wait::Sleeper;
@@ -24,6 +26,8 @@ pub(crate) struct MockDiscordApi {
     pub(crate) send_calls: RefCell<Vec<SendRequest>>,
     pub(crate) get_responses: RefCell<VecDeque<Result<Vec<Message>, AppError>>>,
     pub(crate) get_calls: RefCell<Vec<GetCall>>,
+    pub(crate) thread_responses: RefCell<VecDeque<Result<CreatedThread, AppError>>>,
+    pub(crate) thread_calls: RefCell<Vec<CreateThreadRequest>>,
 }
 
 impl MockDiscordApi {
@@ -33,12 +37,20 @@ impl MockDiscordApi {
             send_calls: RefCell::new(Vec::new()),
             get_responses: RefCell::new(VecDeque::new()),
             get_calls: RefCell::new(Vec::new()),
+            thread_responses: RefCell::new(VecDeque::new()),
+            thread_calls: RefCell::new(Vec::new()),
         }
     }
 
     pub(crate) fn with_get_responses(responses: Vec<Result<Vec<Message>, AppError>>) -> Self {
         let api = Self::new();
         *api.get_responses.borrow_mut() = responses.into_iter().collect();
+        api
+    }
+
+    pub(crate) fn with_thread_responses(responses: Vec<Result<CreatedThread, AppError>>) -> Self {
+        let api = Self::new();
+        *api.thread_responses.borrow_mut() = responses.into_iter().collect();
         api
     }
 }
@@ -65,6 +77,14 @@ impl DiscordApi for MockDiscordApi {
             .borrow_mut()
             .pop_front()
             .expect("test must queue a get_messages response before calling get_messages")
+    }
+
+    async fn create_thread(&self, req: &CreateThreadRequest) -> Result<CreatedThread, AppError> {
+        self.thread_calls.borrow_mut().push(req.clone());
+        self.thread_responses
+            .borrow_mut()
+            .pop_front()
+            .expect("test must queue a thread response before calling create_thread")
     }
 }
 
