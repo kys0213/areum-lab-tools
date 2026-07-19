@@ -365,4 +365,41 @@ mod tests {
             "init"
         );
     }
+
+    #[test]
+    fn init_parses_token_and_force_together() {
+        let cli = Cli::try_parse_from(["discord", "init", "--token", "abc", "--force"]).unwrap();
+        match cli.command {
+            Command::Init { token, force } => {
+                assert_eq!(token.as_deref(), Some("abc"));
+                assert!(force);
+            }
+            other => panic!("expected Init, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn force_flag_is_rejected_on_send() {
+        // --force is init-only; clap must reject it on send as an unknown
+        // argument rather than silently accepting and ignoring it.
+        assert!(Cli::try_parse_from(["discord", "send", "123", "hi", "--force"]).is_err());
+    }
+
+    #[test]
+    fn config_flag_overrides_default_path() {
+        // --config is global=true and independent of the chosen subcommand;
+        // this exercises it against init, which is the command that consumes
+        // the resolved path.
+        let cli = Cli::try_parse_from([
+            "discord",
+            "--config",
+            "/tmp/custom-config.json",
+            "init",
+            "--token",
+            "abc",
+        ])
+        .unwrap();
+        assert_eq!(cli.config.as_deref(), Some("/tmp/custom-config.json"));
+        assert_eq!(cli.command.name(), "init");
+    }
 }

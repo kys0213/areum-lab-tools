@@ -360,6 +360,56 @@ mod tests {
     }
 
     #[test]
+    fn init_overwrite_success_matches_contract_exactly() {
+        // init_overwrite_reports_created_false above only spot-checks the
+        // `created` field; this pins the whole envelope for the --force
+        // (created:false) branch the same way init_success_matches_contract
+        // does for the fresh-create branch.
+        let payload = Payload::Init(InitData {
+            path: "/home/user/.areum/discord/config.json".into(),
+            created: false,
+        });
+        let (sink, json, code) = render("init", &Ok(payload), true);
+        assert_eq!(sink, Sink::Stdout);
+        assert_eq!(code, 0);
+        assert_eq!(
+            json,
+            r#"{"ok":true,"command":"init","data":{"path":"/home/user/.areum/discord/config.json","created":false}}"#
+        );
+    }
+
+    #[test]
+    fn init_error_json_matches_contract() {
+        let err = AppError::new(
+            ErrorKind::Usage,
+            "config already exists at /home/user/.areum/discord/config.json (use --force to overwrite)",
+        );
+        let (sink, json, code) = render("init", &Err(err), true);
+        assert_eq!(sink, Sink::Stdout);
+        assert_eq!(code, 2);
+        assert_eq!(
+            json,
+            r#"{"ok":false,"command":"init","error":{"kind":"usage","message":"config already exists at /home/user/.areum/discord/config.json (use --force to overwrite)"}}"#
+        );
+    }
+
+    #[test]
+    fn init_error_human_and_json_never_contain_token_value() {
+        // Mirrors init_output_never_contains_token_value_in_human_or_json but
+        // for the error path: init's AppError messages are built from the
+        // path/force state only, never the token, in both render modes.
+        let secret = "super-secret-token-value";
+        let err = AppError::new(
+            ErrorKind::Usage,
+            "config already exists at /home/user/.areum/discord/config.json (use --force to overwrite)",
+        );
+        let (_, human, _) = render("init", &Err(err.clone()), false);
+        let (_, json, _) = render("init", &Err(err), true);
+        assert!(!human.contains(secret));
+        assert!(!json.contains(secret));
+    }
+
+    #[test]
     fn human_init_success_renders_readable_text_without_token() {
         let payload = Payload::Init(InitData {
             path: "/home/user/.areum/discord/config.json".into(),

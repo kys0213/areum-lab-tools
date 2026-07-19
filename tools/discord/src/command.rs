@@ -1372,6 +1372,39 @@ mod tests {
     }
 
     #[test]
+    fn run_init_force_without_channels_keeps_minimal_form() {
+        // A --force overwrite of a file that never had a `channels` key must
+        // not introduce one — the minimal `{"token":...}` shape is preserved,
+        // not just the "channels present" branch covered by the sibling test.
+        let dir = unique_init_dir("force-no-channels");
+        let path = dir.join("config.json");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(&path, r#"{"token":"old"}"#).unwrap();
+
+        let payload = run_init(
+            &path,
+            Some("newtoken"),
+            true,
+            unreachable_stdin,
+            || path.exists(),
+            || config::load_config(&path),
+            |cfg| config::write_config_file(&path, cfg),
+        )
+        .unwrap();
+
+        match payload {
+            Payload::Init(data) => assert!(!data.created),
+            other => panic!("expected Init, got {other:?}"),
+        }
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            r#"{"token":"newtoken"}"#
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn run_init_force_with_unparseable_existing_config_fails_fast() {
         let dir = unique_init_dir("force-malformed");
         let path = dir.join("config.json");
@@ -1459,6 +1492,50 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn run_init_trims_leading_and_trailing_whitespace_from_stdin_token() {
+        let dir = unique_init_dir("stdin-trim-both-ends");
+        let path = dir.join("config.json");
+
+        run_init(
+            &path,
+            None,
+            false,
+            || Ok("  mytoken  \n".to_owned()),
+            || path.exists(),
+            || config::load_config(&path),
+            |cfg| config::write_config_file(&path, cfg),
+        )
+        .unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            r#"{"token":"mytoken"}"#
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn run_init_rejects_completely_empty_stdin_token() {
+        let dir = unique_init_dir("stdin-empty");
+        let path = dir.join("config.json");
+
+        let err = run_init(
+            &path,
+            None,
+            false,
+            || Ok(String::new()),
+            || path.exists(),
+            || config::load_config(&path),
+            |cfg| config::write_config_file(&path, cfg),
+        )
+        .unwrap_err();
+
+        assert_eq!(err.kind, ErrorKind::Usage);
+        assert!(!path.exists());
     }
 
     #[test]
