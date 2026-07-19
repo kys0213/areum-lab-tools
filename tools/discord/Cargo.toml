@@ -11,3 +11,5 @@ serde_json = { workspace = true }
 anyhow = { workspace = true }
 tokio = { workspace = true }
 reqwest = { workspace = true }
+bytes = { workspace = true }
+mime_guess = { workspace = true }

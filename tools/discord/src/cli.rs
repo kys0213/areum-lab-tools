@@ -2,7 +2,8 @@ use clap::{Parser, Subcommand};
 
 /// Discord bot CLI for AI agents: send, read, and wait for channel messages.
 ///
-/// Output is JSON by default (machine-parseable). Pass --human for text.
+/// Output is human-readable text by default. Pass --json to emit the
+/// machine-readable envelope; agents should always pass --json.
 /// Token resolution order: --token flag > env DISCORD_BOT_TOKEN > config file.
 #[derive(Parser, Debug)]
 #[command(name = "discord", version, about)]
@@ -15,9 +16,10 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub config: Option<String>,
 
-    /// Human-readable text output (default is JSON).
+    /// Emit machine-readable JSON envelope instead of human text.
+    /// Agents should always pass this flag.
     #[arg(long, global = true)]
-    pub human: bool,
+    pub json: bool,
 
     #[command(subcommand)]
     pub command: Command,
@@ -38,6 +40,12 @@ pub enum Command {
         /// Message text. Exclusive with the BODY positional argument.
         #[arg(long)]
         text: Option<String>,
+        /// Reply to the given message id in the same channel.
+        #[arg(long = "reply-to")]
+        reply_to: Option<String>,
+        /// Attach a file by path; repeat up to 10 times.
+        #[arg(long = "file")]
+        files: Vec<String>,
     },
 
     /// Read recent messages from a channel (id or config alias).
@@ -96,10 +104,14 @@ mod tests {
                 channel,
                 body,
                 text,
+                reply_to,
+                files,
             } => {
                 assert_eq!(channel, "123");
                 assert_eq!(body.as_deref(), Some("hello world"));
                 assert_eq!(text, None);
+                assert_eq!(reply_to, None);
+                assert!(files.is_empty());
             }
             other => panic!("expected Send, got {other:?}"),
         }
@@ -113,10 +125,50 @@ mod tests {
                 channel,
                 body,
                 text,
+                reply_to,
+                files,
             } => {
                 assert_eq!(channel, "123");
                 assert_eq!(body, None);
                 assert_eq!(text.as_deref(), Some("hi"));
+                assert_eq!(reply_to, None);
+                assert!(files.is_empty());
+            }
+            other => panic!("expected Send, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn send_parses_reply_to_flag() {
+        let cli =
+            Cli::try_parse_from(["discord", "send", "123", "hello", "--reply-to", "999"]).unwrap();
+        match cli.command {
+            Command::Send {
+                channel,
+                body,
+                text,
+                reply_to,
+                files,
+            } => {
+                assert_eq!(channel, "123");
+                assert_eq!(body.as_deref(), Some("hello"));
+                assert_eq!(text, None);
+                assert_eq!(reply_to.as_deref(), Some("999"));
+                assert!(files.is_empty());
+            }
+            other => panic!("expected Send, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn send_collects_repeated_file_flags_in_order() {
+        let cli = Cli::try_parse_from([
+            "discord", "send", "123", "hi", "--file", "a.png", "--file", "b.txt",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Send { files, .. } => {
+                assert_eq!(files, vec!["a.png".to_owned(), "b.txt".to_owned()]);
             }
             other => panic!("expected Send, got {other:?}"),
         }
@@ -214,16 +266,44 @@ mod tests {
 
     #[test]
     fn global_flags_apply_alongside_subcommand() {
-        let cli =
-            Cli::try_parse_from(["discord", "--human", "--token", "abc", "send", "123", "hi"])
-                .unwrap();
-        assert!(cli.human);
+        let cli = Cli::try_parse_from(["discord", "--json", "--token", "abc", "send", "123", "hi"])
+            .unwrap();
+        assert!(cli.json);
         assert_eq!(cli.token.as_deref(), Some("abc"));
         assert_eq!(cli.command.name(), "send");
     }
 
     #[test]
+    fn json_flag_parses_after_subcommand_and_args() {
+        // --json is global=true, so it must parse in both positions;
+        // global_flags_apply_alongside_subcommand above only covers the
+        // pre-subcommand position.
+        let cli = Cli::try_parse_from(["discord", "send", "123", "hi", "--json"]).unwrap();
+        assert!(cli.json);
+        assert_eq!(cli.command.name(), "send");
+    }
+
+    #[test]
+    fn human_flag_is_rejected_as_unknown() {
+        // --human was removed once human text became the default output —
+        // clap must reject it as an unknown flag rather than ignoring it.
+        assert!(Cli::try_parse_from(["discord", "--human", "send", "123", "hi"]).is_err());
+    }
+
+    #[test]
     fn missing_subcommand_is_a_usage_error() {
         assert!(Cli::try_parse_from(["discord"]).is_err());
+    }
+
+    #[test]
+    fn reply_to_flag_is_rejected_on_read() {
+        // --reply-to is send-only; clap must reject it on read as an unknown
+        // argument rather than silently accepting and ignoring it.
+        assert!(Cli::try_parse_from(["discord", "read", "123", "--reply-to", "999"]).is_err());
+    }
+
+    #[test]
+    fn reply_to_flag_is_rejected_on_wait() {
+        assert!(Cli::try_parse_from(["discord", "wait", "123", "--reply-to", "999"]).is_err());
     }
 }
