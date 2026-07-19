@@ -84,6 +84,7 @@ discord wait <channel_id> [--after <id>] [--timeout N]         # 새 메시지 �
 
 ```
 discord [--token <TOKEN>] [--config <PATH>] [--json] <COMMAND>
+  init [--token <TOKEN>] [--force]                        # 로컬 config 셋업, 네트워크 무접촉
   send <CHANNEL> [BODY] [--reply-to <MSG_ID>] [--file <PATH>]...   # BODY 생략/'-' → stdin. --text <TEXT>는 BODY와 상호배타. --file 최대 10회 반복
   read <CHANNEL> [--after <MSG_ID>] [--limit N]          # limit 기본 50, 1..=100
   wait <CHANNEL> [--after <MSG_ID>] [--timeout SECS] [--interval SECS] [--limit N]  # 기본 60/5/50
@@ -129,6 +130,7 @@ discord [--token <TOKEN>] [--config <PATH>] [--json] <COMMAND>
 
 커맨드별 `data`:
 - `send.data` = `{message_id, channel_id, timestamp, attachments}`
+- `init.data` = `{path, created}` (토큰 값은 포함하지 않는다)
 - `read.data` = `{channel_id, count, cursor, messages}`
 - `wait.data` = `{channel_id, count, cursor, timed_out, messages}`
 
@@ -181,7 +183,21 @@ discord [--token <TOKEN>] [--config <PATH>] [--json] <COMMAND>
 
 토큰 우선순위: `--token` > `DISCORD_BOT_TOKEN` env > `config.token`. 전부 없으면 exit 3.
 
-디렉토리·파일은 CLI가 생성하지 않는다 — 사용자가 1회 수동 셋업한다.
+디렉토리·파일은 CLI가 **암묵적으로** 만들지 않는다 — `discord init`으로 명시적으로 생성한다.
+
+#### `discord init` — config 셋업
+
+```
+discord init [--token <TOKEN>] [--force]
+```
+
+- 토큰 입력: `--token` 플래그 또는 stdin 전체(trim). **stdin 입력을 권장** — `--token`은 값이 셸 히스토리에 남는다. `echo "$TOKEN" | discord init`처럼 파이프하거나, 인자 없이 실행해 대화형으로 입력한다.
+- trim 후 빈 토큰은 usage 오류(exit 2).
+- 대상 경로에 config가 이미 있으면 `--force` 없이는 거부한다(exit 2, 파일은 무변경) — 실수로 기존 토큰을 덮어쓰지 않기 위함(멱등하지 않음, 명시적 재확인 필요).
+- `--force`를 붙이면 덮어쓴다. 기존 파일에 `channels`가 있으면 보존하고 `token`만 교체한다. 기존 파일이 파싱 불가능한 JSON이면 조용히 버리지 않고 에러로 실패한다.
+- 부모 디렉토리(`~/.areum/discord/`)가 없으면 생성한다(권한 700). 파일은 권한 600으로 쓴다.
+- 로컬 파일 쓰기만 수행한다 — 네트워크 호출 없이, 토큰 유효성도 검증하지 않는다.
+- 출력: human 모드는 `config written: <path>` 한 줄(stdout). `--json`은 `{"ok":true,"command":"init","data":{"path":"...","created":true|false}}` (`created`는 신규 생성 시 `true`, `--force` 덮어쓰기 시 `false`). 토큰 값은 어떤 출력 모드에도 노출되지 않는다.
 
 ### rate limit
 

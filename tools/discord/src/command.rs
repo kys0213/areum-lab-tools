@@ -1,7 +1,9 @@
+use std::path::Path;
 use std::time::Duration;
 
 use crate::api::{DiscordApi, FilePart, Message, SendRequest};
-use crate::output::{AppError, ErrorKind, Payload, ReadData, SendData, WaitData};
+use crate::config::Config;
+use crate::output::{AppError, ErrorKind, InitData, Payload, ReadData, SendData, WaitData};
 
 /// Clock seam so `wait` polling is testable without real time. `wait` drives a
 /// fixed number of polls (`ceil(timeout / interval)`), not wall-clock elapsed.
@@ -192,6 +194,73 @@ fn file_name_of(path: &str) -> String {
         .unwrap_or_else(|| path.to_owned())
 }
 
+/// Creates or overwrites the local config file with a bot token. Network-free
+/// (init is local setup only). I/O is injected (existence check, existing-file
+/// load, and the write itself) so the whole flow is blackbox-testable without
+/// touching the real filesystem — same seam pattern as `read_stdin`/`read_file`
+/// in [`run_send`].
+#[allow(clippy::too_many_arguments)]
+pub fn run_init(
+    path: &Path,
+    token_flag: Option<&str>,
+    force: bool,
+    read_stdin: impl FnOnce() -> std::io::Result<String>,
+    exists: impl FnOnce() -> bool,
+    load_existing: impl FnOnce() -> Result<Option<Config>, AppError>,
+    write: impl FnOnce(&Config) -> Result<(), AppError>,
+) -> Result<Payload, AppError> {
+    let token = resolve_init_token(token_flag, read_stdin)?;
+
+    let already_exists = exists();
+    if already_exists && !force {
+        return Err(AppError::new(
+            ErrorKind::Usage,
+            format!(
+                "config already exists at {} (use --force to overwrite)",
+                path.display()
+            ),
+        ));
+    }
+
+    // Preserve `channels` from a --force overwrite rather than discarding it;
+    // a malformed existing file fails fast here instead of being silently
+    // dropped.
+    let channels = if already_exists {
+        load_existing()?.map(|c| c.channels).unwrap_or_default()
+    } else {
+        Default::default()
+    };
+
+    let new_config = Config {
+        token: Some(token),
+        channels,
+    };
+    write(&new_config)?;
+
+    Ok(Payload::Init(InitData {
+        path: path.display().to_string(),
+        created: !already_exists,
+    }))
+}
+
+/// Resolves and trims the init token: `--token` if given, otherwise the full
+/// stdin. Empty after trim is a caller mistake (usage error) — init never
+/// silently proceeds with a blank token.
+fn resolve_init_token(
+    flag: Option<&str>,
+    read_stdin: impl FnOnce() -> std::io::Result<String>,
+) -> Result<String, AppError> {
+    let raw = match flag {
+        Some(t) => t.to_owned(),
+        None => read_stdin_to_string(read_stdin)?,
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(AppError::new(ErrorKind::Usage, "token must not be empty"));
+    }
+    Ok(trimmed.to_owned())
+}
+
 /// Reads recent messages. T2 owns cursor derivation and the `Payload::Read`
 /// assembly around the fetched messages.
 pub async fn run_read(
@@ -318,6 +387,7 @@ mod tests {
 
     use super::*;
     use crate::api::{Attachment, Author, SentMessage};
+    use crate::config;
 
     fn unreachable_read_file(_: &str) -> std::io::Result<Vec<u8>> {
         panic!("read_file should not be called")
@@ -1195,5 +1265,217 @@ mod tests {
 
         assert_eq!(err.kind, ErrorKind::Api);
         assert_eq!(sleeper.calls.borrow().len(), 0);
+    }
+
+    // ---- run_init ----
+
+    use std::path::PathBuf;
+
+    /// Unique, not-yet-existing directory under the OS temp dir so each test
+    /// can exercise the real "parent dir must be created" path without
+    /// clobbering other tests or runs.
+    fn unique_init_dir(label: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "areum-discord-run-init-test-{}-{label}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
+    #[test]
+    fn run_init_creates_fresh_config_with_token() {
+        let dir = unique_init_dir("fresh");
+        let path = dir.join("config.json");
+
+        let payload = run_init(
+            &path,
+            Some("mytoken"),
+            false,
+            unreachable_stdin,
+            || path.exists(),
+            || config::load_config(&path),
+            |cfg| config::write_config_file(&path, cfg),
+        )
+        .unwrap();
+
+        match payload {
+            Payload::Init(data) => {
+                assert_eq!(data.path, path.display().to_string());
+                assert!(data.created);
+            }
+            other => panic!("expected Init, got {other:?}"),
+        }
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            r#"{"token":"mytoken"}"#
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn run_init_rejects_existing_file_without_force_and_leaves_it_unchanged() {
+        let dir = unique_init_dir("no-force");
+        let path = dir.join("config.json");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(&path, r#"{"token":"old"}"#).unwrap();
+
+        let err = run_init(
+            &path,
+            Some("newtoken"),
+            false,
+            unreachable_stdin,
+            || path.exists(),
+            || config::load_config(&path),
+            |cfg| config::write_config_file(&path, cfg),
+        )
+        .unwrap_err();
+
+        assert_eq!(err.kind, ErrorKind::Usage);
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            r#"{"token":"old"}"#
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn run_init_force_preserves_channels_and_replaces_token() {
+        let dir = unique_init_dir("force-preserve");
+        let path = dir.join("config.json");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(&path, r#"{"token":"old","channels":{"general":"111"}}"#).unwrap();
+
+        let payload = run_init(
+            &path,
+            Some("newtoken"),
+            true,
+            unreachable_stdin,
+            || path.exists(),
+            || config::load_config(&path),
+            |cfg| config::write_config_file(&path, cfg),
+        )
+        .unwrap();
+
+        match payload {
+            Payload::Init(data) => assert!(!data.created),
+            other => panic!("expected Init, got {other:?}"),
+        }
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            r#"{"token":"newtoken","channels":{"general":"111"}}"#
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn run_init_force_with_unparseable_existing_config_fails_fast() {
+        let dir = unique_init_dir("force-malformed");
+        let path = dir.join("config.json");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(&path, "{not json").unwrap();
+
+        let err = run_init(
+            &path,
+            Some("newtoken"),
+            true,
+            unreachable_stdin,
+            || path.exists(),
+            || config::load_config(&path),
+            |cfg| config::write_config_file(&path, cfg),
+        )
+        .unwrap_err();
+
+        // Malformed existing config must fail loudly, not be silently
+        // discarded and overwritten.
+        assert_eq!(err.kind, ErrorKind::Config);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "{not json");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn run_init_rejects_empty_token_flag() {
+        let dir = unique_init_dir("empty-flag");
+        let path = dir.join("config.json");
+
+        let err = run_init(
+            &path,
+            Some("   "),
+            false,
+            unreachable_stdin,
+            || path.exists(),
+            || config::load_config(&path),
+            |cfg| config::write_config_file(&path, cfg),
+        )
+        .unwrap_err();
+
+        assert_eq!(err.kind, ErrorKind::Usage);
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn run_init_rejects_empty_stdin_token() {
+        let dir = unique_init_dir("empty-stdin");
+        let path = dir.join("config.json");
+
+        let err = run_init(
+            &path,
+            None,
+            false,
+            || Ok("   \n".to_owned()),
+            || path.exists(),
+            || config::load_config(&path),
+            |cfg| config::write_config_file(&path, cfg),
+        )
+        .unwrap_err();
+
+        assert_eq!(err.kind, ErrorKind::Usage);
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn run_init_trims_trailing_newline_from_stdin_token() {
+        let dir = unique_init_dir("stdin-trim");
+        let path = dir.join("config.json");
+
+        run_init(
+            &path,
+            None,
+            false,
+            || Ok("mytoken\n".to_owned()),
+            || path.exists(),
+            || config::load_config(&path),
+            |cfg| config::write_config_file(&path, cfg),
+        )
+        .unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            r#"{"token":"mytoken"}"#
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn run_init_empty_token_check_happens_before_any_file_io() {
+        // An invalid token must short-circuit before exists()/write() are
+        // even invoked, so a bad call can never touch the filesystem.
+        let err = run_init(
+            Path::new("/should/never/be/touched/config.json"),
+            Some(""),
+            false,
+            unreachable_stdin,
+            || panic!("exists should not be called"),
+            || panic!("load_existing should not be called"),
+            |_: &Config| panic!("write should not be called"),
+        )
+        .unwrap_err();
+
+        assert_eq!(err.kind, ErrorKind::Usage);
     }
 }

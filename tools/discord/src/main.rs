@@ -32,22 +32,26 @@ async fn main() {
 
 /// Wires config/token resolution to the HTTP client and dispatches to the
 /// command handlers. Pure delegation — no business logic lives here.
+///
+/// `init` is dispatched before token resolution: it is exactly the command
+/// that creates a missing token file, so it must not require one to already
+/// exist (unlike send/read/wait, which are network calls and do).
 async fn run(cli: Cli) -> Result<Payload, AppError> {
     let config_path = match &cli.config {
         Some(path) => PathBuf::from(path),
         None => config::default_config_path()?,
     };
-    let cfg = config::load_config(&config_path)?.unwrap_or_default();
-
-    let env_token = std::env::var("DISCORD_BOT_TOKEN").ok();
-    let token = config::resolve_token(
-        cli.token.as_deref(),
-        env_token.as_deref(),
-        cfg.token.as_deref(),
-    )?;
-    let api = HttpDiscordApi::new(token);
 
     match cli.command {
+        Command::Init { token, force } => command::run_init(
+            &config_path,
+            token.as_deref(),
+            force,
+            read_stdin,
+            || config_path.exists(),
+            || config::load_config(&config_path),
+            |cfg| config::write_config_file(&config_path, cfg),
+        ),
         Command::Send {
             channel,
             body,
@@ -55,7 +59,8 @@ async fn run(cli: Cli) -> Result<Payload, AppError> {
             reply_to,
             files,
         } => {
-            let channel_id = config::resolve_channel(&channel, &cfg.channels);
+            let (api, channels) = authenticated_api(&config_path, cli.token.as_deref())?;
+            let channel_id = config::resolve_channel(&channel, &channels);
             command::run_send(
                 &api,
                 &channel_id,
@@ -73,7 +78,8 @@ async fn run(cli: Cli) -> Result<Payload, AppError> {
             after,
             limit,
         } => {
-            let channel_id = config::resolve_channel(&channel, &cfg.channels);
+            let (api, channels) = authenticated_api(&config_path, cli.token.as_deref())?;
+            let channel_id = config::resolve_channel(&channel, &channels);
             command::run_read(&api, &channel_id, after.as_deref(), limit).await
         }
         Command::Wait {
@@ -83,7 +89,8 @@ async fn run(cli: Cli) -> Result<Payload, AppError> {
             interval,
             limit,
         } => {
-            let channel_id = config::resolve_channel(&channel, &cfg.channels);
+            let (api, channels) = authenticated_api(&config_path, cli.token.as_deref())?;
+            let channel_id = config::resolve_channel(&channel, &channels);
             let sleeper = TokioSleeper;
             command::run_wait(
                 &api,
@@ -97,6 +104,19 @@ async fn run(cli: Cli) -> Result<Payload, AppError> {
             .await
         }
     }
+}
+
+/// Loads config and resolves the bot token (flag > env > config file) for
+/// the network-calling commands (send/read/wait). Not used by `init`, which
+/// creates the config file rather than reading a token out of it.
+fn authenticated_api(
+    config_path: &std::path::Path,
+    token_flag: Option<&str>,
+) -> Result<(HttpDiscordApi, std::collections::HashMap<String, String>), AppError> {
+    let cfg = config::load_config(config_path)?.unwrap_or_default();
+    let env_token = std::env::var("DISCORD_BOT_TOKEN").ok();
+    let token = config::resolve_token(token_flag, env_token.as_deref(), cfg.token.as_deref())?;
+    Ok((HttpDiscordApi::new(token), cfg.channels))
 }
 
 fn read_stdin() -> std::io::Result<String> {
