@@ -11,3 +11,9 @@
 - 문서: `docs/<kebab-case>.md`
 - 워크플로: `.github/workflows/<목적>.yml` (예: `ci.yml`, `release.yml`)
 - 툴링 설정: 표준 Rust 파일명 그대로 사용한다 (`rust-toolchain.toml`, `rustfmt.toml` — 변형 금지)
+
+## 버전업·릴리스
+
+- 버전 SSOT는 `tools/<name>/Cargo.toml`의 `version` — 태그 버전과 불일치하면 `release.yml`이 즉시 실패한다
+- 버전업 절차: ① `tools/<name>/Cargo.toml` version bump 후 `cargo check -p <name>`으로 `Cargo.lock` 갱신 ② PR로 main 머지 ③ main에서 `make dist-tag TOOL=<name>` (태그 push → release.yml이 빌드·Release 첨부)
+- 릴리스 설치 확인: `make install-release TOOL=<name>`
