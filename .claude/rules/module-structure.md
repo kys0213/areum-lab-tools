@@ -49,7 +49,9 @@ mod <subcommand_a>;
 mod <subcommand_b>;
 pub(crate) use <subcommand_a>::run_<subcommand_a>;
 pub(crate) use <subcommand_b>::run_<subcommand_b>;
+```
 
+```rust
 // commands/<subcommand_a>.rs — 새 서브커맨드는 새 파일 추가로 끝난다
 pub(crate) fn run_<subcommand_a>(input: &Input) -> Result<Output, AppError> {
     validate(input).map(Output::from)
@@ -93,10 +95,10 @@ mod tests;
 
 ```rust
 // 부모 모듈에서만 호출되면 pub(super)
-pub(super) fn render_success(data: &Payload) -> String { /* ... */ }
+pub(super) fn render_success(data: &OutputData) -> String { /* ... */ }
 
 // 다른 트리(예: common::error)에서도 호출되면 pub(crate)
-pub(crate) fn to_human(&self) -> String { /* ... */ }
+pub(crate) fn describe(&self) -> String { /* ... */ }
 ```
 
 서브커맨드가 없거나 하나뿐이고 프로덕션이 ~150줄 이하면 `main.rs` 단일 파일을 유지한다.
@@ -134,10 +136,12 @@ pub(crate) const MAX_ITEMS: usize = 10; // commands/<subcommand_a>.rs로 되돌�
 
 ```rust
 // commands/mod.rs에 새 서브커맨드 분기를 직접 얹지 않는다 — 커맨드가 늘 때마다 이 함수를 계속 고쳐야 한다 (OCP 위반).
-match cmd {
-    "<subcommand_a>" => { /* ... */ }
-    "<subcommand_c>" => { /* ... */ }
-    _ => unreachable!(),
+fn dispatch(cmd: Command) {
+    match cmd {
+        "<subcommand_a>" => { /* ... */ }
+        "<subcommand_c>" => { /* ... */ }
+        _ => unreachable!(),
+    }
 }
 ```
 
