@@ -38,6 +38,35 @@ CI는 ubuntu 전용으로 동작한다. **macOS/Apple Silicon 환경에서의 �
 
 ## Install
 
+### 릴리스 설치 (권장)
+
+GitHub Release에서 미리 빌드된 바이너리를 받아 설치한다. 현재
+**Apple Silicon macOS**만 지원한다.
+
+**curl 원라이너** (레포 클론 불필요, 새 머신에서 부트스트랩):
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/kys0213/areum-lab-tools/main/scripts/install.sh \
+  | sh -s -- <tool> [version]
+
+# 예: hello 최신 릴리스 설치 (특정 버전은 `-- hello 0.0.0` 처럼 지정)
+curl -fsSL https://raw.githubusercontent.com/kys0213/areum-lab-tools/main/scripts/install.sh \
+  | sh -s -- hello
+```
+
+버전을 생략하면 해당 도구의 최신 릴리스를 자동으로 조회한다. 바이너리는
+체크섬(sha256)으로 검증한 뒤 `~/.local/bin`에 설치된다. `INSTALL_ROOT`
+환경 변수로 설치 경로를 변경할 수 있다.
+
+**레포 클론 후 설치** (또는 개발 환경):
+
+```sh
+make install-release TOOL=hello               # GitHub Release에서 다운로드, 검증, 설치
+make install-release TOOL=hello VERSION=0.0.0 # 특정 버전 지정
+```
+
+### 소스 빌드
+
 로컬 설치는 `cargo install --path`를 감싼 `make install`/`make install-all`로
 수행한다.
 
@@ -45,6 +74,15 @@ CI는 ubuntu 전용으로 동작한다. **macOS/Apple Silicon 환경에서의 �
 make install TOOL=hello                     # $HOME/.local 에 설치
 make install TOOL=hello INSTALL_ROOT=/path   # 설치 경로 지정
 make install-all                             # tools/* 전체 설치
+```
+
+### cargo install --git (폴백)
+
+Rust가 설치된 환경에서 Git 레포지토리에서 직접 빌드하여 설치한다.
+
+```sh
+cargo install --git https://github.com/kys0213/areum-lab-tools hello
+cargo install --git https://github.com/kys0213/areum-lab-tools hello --tag hello-v0.0.0
 ```
 
 ## 배포 (Release)
@@ -68,20 +106,9 @@ make dist-tag TOOL=hello   # 워킹트리 clean + main 브랜치일 때만 태�
 
 ### 다른 머신에 설치하기
 
-```sh
-gh release download hello-v0.0.0 -R kys0213/areum-lab-tools -p '*aarch64-apple-darwin*'
-tar xz -C ~/.local/bin -f hello-0.0.0-aarch64-apple-darwin.tar.gz
-```
-
-미서명 바이너리이므로 macOS Gatekeeper가 격리(quarantine)할 수 있다. 실행이
-막히면 격리 속성을 제거한다.
-
-```sh
-xattr -d com.apple.quarantine ~/.local/bin/hello
-```
-
-폴백(대상 머신에 Rust가 있는 경우): `cargo install --git
-https://github.com/kys0213/areum-lab-tools hello`
+릴리스 바이너리는 `install.sh`로 자동 다운로드 및 설치된다
+([위의 Install 섹션](#install) 참고). Rust가 설치된 환경이라면
+`cargo install --git`을 사용할 수도 있다.
 
 ### 무설정 경로 (CI 없이 로컬에서)
 
@@ -101,6 +128,7 @@ scp dist/hello-0.0.0-aarch64-apple-darwin.tar.gz user@host:/tmp/
 ├── rust-toolchain.toml     # Rust 버전 고정 (SSOT)
 ├── Makefile                # build/test/lint/install/new 등 태스크 러너
 ├── templates/tool/         # `make new`가 사용하는 스캐폴드 템플릿 (.tmpl)
+├── scripts/                # 설치 스크립트
 ├── tools/
 │   └── hello/               # 예시 CLI 도구
 └── docs/                    # 설계/조사 노트
