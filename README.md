@@ -95,8 +95,14 @@ cargo install --git https://github.com/kys0213/areum-lab-tools hello --tag hello
 ### 릴리스 절차 (CI 경유)
 
 ```sh
-# tools/<tool>/Cargo.toml의 version을 먼저 bump한 뒤 커밋/main 반영
-make dist-tag TOOL=hello   # 워킹트리 clean + main 브랜치일 때만 태그 push
+# 1. 버전 bump: tools/hello/Cargo.toml 의 version 수정 후 Cargo.lock 갱신
+cargo check -p hello
+
+# 2. 커밋 → PR → main 머지
+
+# 3. main 에서 태그 발행 (워킹트리 clean + main 브랜치에서만 동작)
+git switch main && git pull
+make dist-tag TOOL=hello   # hello-vX.Y.Z 태그 push → release.yml 이 빌드·Release 첨부
 ```
 
 `dist-tag`가 `hello-v0.0.0` 같은 태그를 push하면 GitHub Actions
