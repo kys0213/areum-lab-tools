@@ -1,16 +1,18 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::output::{AppError, ErrorKind};
 
 /// On-disk config at `~/.areum/discord/config.json`. Both fields optional.
-#[derive(Debug, Default, Deserialize)]
+/// `skip_serializing_if` keeps a fresh `init` write minimal (`{"token":"..."}`)
+/// rather than always emitting an empty `channels` map.
+#[derive(Debug, Default, Deserialize, Serialize)]
 pub struct Config {
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub channels: HashMap<String, String>,
 }
 
@@ -75,6 +77,72 @@ pub fn load_config(path: &Path) -> Result<Option<Config>, AppError> {
             format!("failed to read config {}: {e}", path.display()),
         )),
     }
+}
+
+/// Writes `config` to `path` as compact JSON, creating the parent directory
+/// (mode 700) if it doesn't exist and setting the file to mode 600. `init` is
+/// the only caller — this tool never creates config implicitly otherwise.
+pub fn write_config_file(path: &Path, config: &Config) -> Result<(), AppError> {
+    let contents = serde_json::to_string(config).map_err(|e| {
+        AppError::new(
+            ErrorKind::Internal,
+            format!("failed to serialize config: {e}"),
+        )
+    })?;
+
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| {
+            AppError::new(
+                ErrorKind::Internal,
+                format!(
+                    "failed to create config directory {}: {e}",
+                    parent.display()
+                ),
+            )
+        })?;
+        set_dir_permissions_700(parent)?;
+    }
+
+    std::fs::write(path, &contents).map_err(|e| {
+        AppError::new(
+            ErrorKind::Internal,
+            format!("failed to write config {}: {e}", path.display()),
+        )
+    })?;
+    set_file_permissions_600(path)?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn set_dir_permissions_700(path: &Path) -> Result<(), AppError> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).map_err(|e| {
+        AppError::new(
+            ErrorKind::Internal,
+            format!("failed to set permissions on {}: {e}", path.display()),
+        )
+    })
+}
+
+#[cfg(not(unix))]
+fn set_dir_permissions_700(_path: &Path) -> Result<(), AppError> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn set_file_permissions_600(path: &Path) -> Result<(), AppError> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).map_err(|e| {
+        AppError::new(
+            ErrorKind::Internal,
+            format!("failed to set permissions on {}: {e}", path.display()),
+        )
+    })
+}
+
+#[cfg(not(unix))]
+fn set_file_permissions_600(_path: &Path) -> Result<(), AppError> {
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -169,5 +237,75 @@ mod tests {
 
         let result = load_config(&path).unwrap();
         assert!(result.is_none());
+    }
+
+    fn unique_temp_dir(label: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "areum-discord-config-test-{}-{label}",
+            std::process::id()
+        ))
+    }
+
+    #[test]
+    fn serialize_config_omits_empty_channels() {
+        let cfg = Config {
+            token: Some("t".to_owned()),
+            channels: HashMap::new(),
+        };
+        assert_eq!(serde_json::to_string(&cfg).unwrap(), r#"{"token":"t"}"#);
+    }
+
+    #[test]
+    fn serialize_config_includes_non_empty_channels() {
+        let cfg = Config {
+            token: Some("t".to_owned()),
+            channels: channels(),
+        };
+        assert_eq!(
+            serde_json::to_string(&cfg).unwrap(),
+            r#"{"token":"t","channels":{"general":"111"}}"#
+        );
+    }
+
+    #[test]
+    fn write_config_file_creates_parent_dir_and_writes_minimal_json() {
+        let dir = unique_temp_dir("write-fresh");
+        let path = dir.join("config.json");
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(!dir.exists());
+
+        let cfg = Config {
+            token: Some("mytoken".to_owned()),
+            channels: HashMap::new(),
+        };
+        write_config_file(&path, &cfg).unwrap();
+
+        let contents = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(contents, r#"{"token":"mytoken"}"#);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_config_file_sets_dir_700_and_file_600() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = unique_temp_dir("write-perms");
+        let path = dir.join("config.json");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let cfg = Config {
+            token: Some("mytoken".to_owned()),
+            channels: HashMap::new(),
+        };
+        write_config_file(&path, &cfg).unwrap();
+
+        let dir_mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(dir_mode, 0o700);
+        let file_mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(file_mode, 0o600);
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

@@ -97,6 +97,14 @@ pub struct ReadData {
     pub messages: Vec<Message>,
 }
 
+/// `init` never echoes the token — only the path it wrote and whether the
+/// file was newly created vs. overwritten with `--force`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InitData {
+    pub path: String,
+    pub created: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WaitData {
     pub channel_id: String,
@@ -113,6 +121,7 @@ pub struct WaitData {
 #[serde(untagged)]
 pub enum Payload {
     Send(SendData),
+    Init(InitData),
     Read(ReadData),
     Wait(WaitData),
 }
@@ -131,6 +140,7 @@ impl Payload {
                 }
                 text
             }
+            Payload::Init(d) => format!("config written: {}", d.path),
             Payload::Read(d) => format!(
                 "channel {}: {} message(s){}\n{}",
                 d.channel_id,
@@ -322,6 +332,113 @@ mod tests {
             json,
             r#"{"ok":true,"command":"send","data":{"message_id":"123","channel_id":"456","timestamp":"2024-01-01T00:00:00Z","attachments":[{"id":"a1","filename":"photo.png","size":1024,"url":"https://cdn.discordapp.com/attachments/1/a1/photo.png","content_type":"image/png"}]}}"#
         );
+    }
+
+    #[test]
+    fn init_success_matches_contract() {
+        let payload = Payload::Init(InitData {
+            path: "/home/user/.areum/discord/config.json".into(),
+            created: true,
+        });
+        let (sink, json, code) = render("init", &Ok(payload), true);
+        assert_eq!(sink, Sink::Stdout);
+        assert_eq!(code, 0);
+        assert_eq!(
+            json,
+            r#"{"ok":true,"command":"init","data":{"path":"/home/user/.areum/discord/config.json","created":true}}"#
+        );
+    }
+
+    #[test]
+    fn init_overwrite_reports_created_false() {
+        let payload = Payload::Init(InitData {
+            path: "/home/user/.areum/discord/config.json".into(),
+            created: false,
+        });
+        let (_, json, _) = render("init", &Ok(payload), true);
+        assert!(json.contains(r#""created":false"#));
+    }
+
+    #[test]
+    fn init_overwrite_success_matches_contract_exactly() {
+        // init_overwrite_reports_created_false above only spot-checks the
+        // `created` field; this pins the whole envelope for the --force
+        // (created:false) branch the same way init_success_matches_contract
+        // does for the fresh-create branch.
+        let payload = Payload::Init(InitData {
+            path: "/home/user/.areum/discord/config.json".into(),
+            created: false,
+        });
+        let (sink, json, code) = render("init", &Ok(payload), true);
+        assert_eq!(sink, Sink::Stdout);
+        assert_eq!(code, 0);
+        assert_eq!(
+            json,
+            r#"{"ok":true,"command":"init","data":{"path":"/home/user/.areum/discord/config.json","created":false}}"#
+        );
+    }
+
+    #[test]
+    fn init_error_json_matches_contract() {
+        let err = AppError::new(
+            ErrorKind::Usage,
+            "config already exists at /home/user/.areum/discord/config.json (use --force to overwrite)",
+        );
+        let (sink, json, code) = render("init", &Err(err), true);
+        assert_eq!(sink, Sink::Stdout);
+        assert_eq!(code, 2);
+        assert_eq!(
+            json,
+            r#"{"ok":false,"command":"init","error":{"kind":"usage","message":"config already exists at /home/user/.areum/discord/config.json (use --force to overwrite)"}}"#
+        );
+    }
+
+    #[test]
+    fn init_error_human_and_json_never_contain_token_value() {
+        // Mirrors init_output_never_contains_token_value_in_human_or_json but
+        // for the error path: init's AppError messages are built from the
+        // path/force state only, never the token, in both render modes.
+        let secret = "super-secret-token-value";
+        let err = AppError::new(
+            ErrorKind::Usage,
+            "config already exists at /home/user/.areum/discord/config.json (use --force to overwrite)",
+        );
+        let (_, human, _) = render("init", &Err(err.clone()), false);
+        let (_, json, _) = render("init", &Err(err), true);
+        assert!(!human.contains(secret));
+        assert!(!json.contains(secret));
+    }
+
+    #[test]
+    fn human_init_success_renders_readable_text_without_token() {
+        let payload = Payload::Init(InitData {
+            path: "/home/user/.areum/discord/config.json".into(),
+            created: true,
+        });
+        let (sink, text, code) = render("init", &Ok(payload), false);
+        assert_eq!(sink, Sink::Stdout);
+        assert_eq!(code, 0);
+        assert_eq!(
+            text,
+            "config written: /home/user/.areum/discord/config.json"
+        );
+    }
+
+    #[test]
+    fn init_output_never_contains_token_value_in_human_or_json() {
+        // InitData structurally carries only path/created — this asserts the
+        // no-token-leak contract holds for both render modes.
+        fn init_payload() -> Payload {
+            Payload::Init(InitData {
+                path: "/home/user/.areum/discord/config.json".into(),
+                created: true,
+            })
+        }
+        let secret = "super-secret-token-value";
+        let (_, human, _) = render("init", &Ok(init_payload()), false);
+        let (_, json, _) = render("init", &Ok(init_payload()), true);
+        assert!(!human.contains(secret));
+        assert!(!json.contains(secret));
     }
 
     #[test]
@@ -662,8 +779,12 @@ mod tests {
             timed_out: true,
             messages: vec![],
         });
+        let init = Payload::Init(InitData {
+            path: "/home/user/.areum/discord/config.json".into(),
+            created: true,
+        });
 
-        for payload in [send, read, wait] {
+        for payload in [send, read, wait, init] {
             let (sink, text, code) = render("cmd", &Ok(payload), false);
             assert_eq!(sink, Sink::Stdout);
             assert_eq!(code, 0);

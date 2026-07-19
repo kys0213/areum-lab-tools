@@ -48,6 +48,21 @@ pub enum Command {
         files: Vec<String>,
     },
 
+    /// Create the local config file with a bot token (local setup only, no
+    /// network call).
+    ///
+    /// Rejects an already-existing config file unless --force is passed, so
+    /// a stray re-run can't silently clobber a saved token.
+    Init {
+        /// Bot token. WARNING: this value is left in shell history — prefer
+        /// piping it via stdin instead, e.g. `echo "$TOKEN" | discord init`.
+        #[arg(long)]
+        token: Option<String>,
+        /// Overwrite an existing config file. Preserves its `channels` field.
+        #[arg(long)]
+        force: bool,
+    },
+
     /// Read recent messages from a channel (id or config alias).
     Read {
         /// Channel id, or an alias defined in config.channels.
@@ -86,6 +101,7 @@ impl Command {
     pub fn name(&self) -> &'static str {
         match self {
             Command::Send { .. } => "send",
+            Command::Init { .. } => "init",
             Command::Read { .. } => "read",
             Command::Wait { .. } => "wait",
         }
@@ -305,5 +321,85 @@ mod tests {
     #[test]
     fn reply_to_flag_is_rejected_on_wait() {
         assert!(Cli::try_parse_from(["discord", "wait", "123", "--reply-to", "999"]).is_err());
+    }
+
+    #[test]
+    fn init_defaults_no_token_no_force() {
+        let cli = Cli::try_parse_from(["discord", "init"]).unwrap();
+        match cli.command {
+            Command::Init { token, force } => {
+                assert_eq!(token, None);
+                assert!(!force);
+            }
+            other => panic!("expected Init, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn init_parses_token_flag() {
+        let cli = Cli::try_parse_from(["discord", "init", "--token", "abc"]).unwrap();
+        match cli.command {
+            Command::Init { token, force } => {
+                assert_eq!(token.as_deref(), Some("abc"));
+                assert!(!force);
+            }
+            other => panic!("expected Init, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn init_parses_force_flag() {
+        let cli = Cli::try_parse_from(["discord", "init", "--force"]).unwrap();
+        match cli.command {
+            Command::Init { token, force } => {
+                assert_eq!(token, None);
+                assert!(force);
+            }
+            other => panic!("expected Init, got {other:?}"),
+        }
+        assert_eq!(
+            Cli::try_parse_from(["discord", "init"])
+                .unwrap()
+                .command
+                .name(),
+            "init"
+        );
+    }
+
+    #[test]
+    fn init_parses_token_and_force_together() {
+        let cli = Cli::try_parse_from(["discord", "init", "--token", "abc", "--force"]).unwrap();
+        match cli.command {
+            Command::Init { token, force } => {
+                assert_eq!(token.as_deref(), Some("abc"));
+                assert!(force);
+            }
+            other => panic!("expected Init, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn force_flag_is_rejected_on_send() {
+        // --force is init-only; clap must reject it on send as an unknown
+        // argument rather than silently accepting and ignoring it.
+        assert!(Cli::try_parse_from(["discord", "send", "123", "hi", "--force"]).is_err());
+    }
+
+    #[test]
+    fn config_flag_overrides_default_path() {
+        // --config is global=true and independent of the chosen subcommand;
+        // this exercises it against init, which is the command that consumes
+        // the resolved path.
+        let cli = Cli::try_parse_from([
+            "discord",
+            "--config",
+            "/tmp/custom-config.json",
+            "init",
+            "--token",
+            "abc",
+        ])
+        .unwrap();
+        assert_eq!(cli.config.as_deref(), Some("/tmp/custom-config.json"));
+        assert_eq!(cli.command.name(), "init");
     }
 }
