@@ -1,0 +1,284 @@
+use serde::Serialize;
+
+use crate::common::error::AppError;
+use crate::output::payload::Payload;
+
+#[derive(Serialize)]
+struct SuccessEnvelope<'a> {
+    ok: bool,
+    command: &'a str,
+    data: &'a Payload,
+}
+
+#[derive(Serialize)]
+struct ErrorEnvelope<'a> {
+    ok: bool,
+    command: &'a str,
+    error: &'a AppError,
+}
+
+// Called from `crate::output::render`, the parent module.
+pub(super) fn success_json(command: &str, data: &Payload) -> String {
+    let envelope = SuccessEnvelope {
+        ok: true,
+        command,
+        data,
+    };
+    serde_json::to_string(&envelope)
+        .expect("success envelope serialization is infallible for plain data")
+}
+
+pub(super) fn error_json(command: &str, error: &AppError) -> String {
+    let envelope = ErrorEnvelope {
+        ok: false,
+        command,
+        error,
+    };
+    serde_json::to_string(&envelope)
+        .expect("error envelope serialization is infallible for plain data")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::common::api::{Attachment, Author, Message};
+    use crate::common::error::ErrorKind;
+    use crate::output::payload::{InitData, ReadData, SendData, WaitData};
+    use crate::output::{Sink, render};
+
+    fn sample_message() -> Message {
+        Message {
+            id: "10".into(),
+            channel_id: "chan".into(),
+            author: Author {
+                id: "u1".into(),
+                username: "alice".into(),
+                bot: false,
+            },
+            content: "hi".into(),
+            timestamp: "2024-01-01T00:00:00Z".into(),
+            attachments: vec![],
+        }
+    }
+
+    fn sample_attachment() -> Attachment {
+        Attachment {
+            id: "a1".into(),
+            filename: "photo.png".into(),
+            size: 1024,
+            url: "https://cdn.discordapp.com/attachments/1/a1/photo.png".into(),
+            content_type: Some("image/png".into()),
+        }
+    }
+
+    #[test]
+    fn send_success_matches_contract() {
+        let payload = Payload::Send(SendData {
+            message_id: "123".into(),
+            channel_id: "456".into(),
+            timestamp: "2024-01-01T00:00:00Z".into(),
+            attachments: vec![],
+        });
+        let (sink, json, code) = render("send", &Ok(payload), true);
+        assert_eq!(sink, Sink::Stdout);
+        assert_eq!(code, 0);
+        assert_eq!(
+            json,
+            r#"{"ok":true,"command":"send","data":{"message_id":"123","channel_id":"456","timestamp":"2024-01-01T00:00:00Z","attachments":[]}}"#
+        );
+    }
+
+    #[test]
+    fn send_success_with_attachments_includes_full_fields() {
+        let payload = Payload::Send(SendData {
+            message_id: "123".into(),
+            channel_id: "456".into(),
+            timestamp: "2024-01-01T00:00:00Z".into(),
+            attachments: vec![sample_attachment()],
+        });
+        let (sink, json, code) = render("send", &Ok(payload), true);
+        assert_eq!(sink, Sink::Stdout);
+        assert_eq!(code, 0);
+        assert_eq!(
+            json,
+            r#"{"ok":true,"command":"send","data":{"message_id":"123","channel_id":"456","timestamp":"2024-01-01T00:00:00Z","attachments":[{"id":"a1","filename":"photo.png","size":1024,"url":"https://cdn.discordapp.com/attachments/1/a1/photo.png","content_type":"image/png"}]}}"#
+        );
+    }
+
+    #[test]
+    fn init_success_matches_contract() {
+        let payload = Payload::Init(InitData {
+            path: "/home/user/.areum/discord/config.json".into(),
+            created: true,
+        });
+        let (sink, json, code) = render("init", &Ok(payload), true);
+        assert_eq!(sink, Sink::Stdout);
+        assert_eq!(code, 0);
+        assert_eq!(
+            json,
+            r#"{"ok":true,"command":"init","data":{"path":"/home/user/.areum/discord/config.json","created":true}}"#
+        );
+    }
+
+    #[test]
+    fn init_overwrite_reports_created_false() {
+        let payload = Payload::Init(InitData {
+            path: "/home/user/.areum/discord/config.json".into(),
+            created: false,
+        });
+        let (_, json, _) = render("init", &Ok(payload), true);
+        assert!(json.contains(r#""created":false"#));
+    }
+
+    #[test]
+    fn init_overwrite_success_matches_contract_exactly() {
+        // init_overwrite_reports_created_false above only spot-checks the
+        // `created` field; this pins the whole envelope for the --force
+        // (created:false) branch the same way init_success_matches_contract
+        // does for the fresh-create branch.
+        let payload = Payload::Init(InitData {
+            path: "/home/user/.areum/discord/config.json".into(),
+            created: false,
+        });
+        let (sink, json, code) = render("init", &Ok(payload), true);
+        assert_eq!(sink, Sink::Stdout);
+        assert_eq!(code, 0);
+        assert_eq!(
+            json,
+            r#"{"ok":true,"command":"init","data":{"path":"/home/user/.areum/discord/config.json","created":false}}"#
+        );
+    }
+
+    #[test]
+    fn init_error_json_matches_contract() {
+        let err = AppError::new(
+            ErrorKind::Usage,
+            "config already exists at /home/user/.areum/discord/config.json (use --force to overwrite)",
+        );
+        let (sink, json, code) = render("init", &Err(err), true);
+        assert_eq!(sink, Sink::Stdout);
+        assert_eq!(code, 2);
+        assert_eq!(
+            json,
+            r#"{"ok":false,"command":"init","error":{"kind":"usage","message":"config already exists at /home/user/.areum/discord/config.json (use --force to overwrite)"}}"#
+        );
+    }
+
+    #[test]
+    fn read_success_has_no_timed_out_field() {
+        let payload = Payload::Read(ReadData {
+            channel_id: "c".into(),
+            count: 1,
+            cursor: Some("10".into()),
+            messages: vec![sample_message()],
+        });
+        let (_, json, _) = render("read", &Ok(payload), true);
+        assert_eq!(
+            json,
+            r#"{"ok":true,"command":"read","data":{"channel_id":"c","count":1,"cursor":"10","messages":[{"id":"10","channel_id":"chan","author":{"id":"u1","username":"alice","bot":false},"content":"hi","timestamp":"2024-01-01T00:00:00Z","attachments":[]}]}}"#
+        );
+    }
+
+    #[test]
+    fn read_success_with_attachment_bearing_message_matches_contract() {
+        let mut message = sample_message();
+        message.attachments = vec![Attachment {
+            id: "a2".into(),
+            filename: "notes.txt".into(),
+            size: 42,
+            url: "https://cdn.discordapp.com/attachments/1/a2/notes.txt".into(),
+            content_type: None,
+        }];
+        let payload = Payload::Read(ReadData {
+            channel_id: "c".into(),
+            count: 1,
+            cursor: Some("10".into()),
+            messages: vec![message],
+        });
+        let (_, json, _) = render("read", &Ok(payload), true);
+        assert_eq!(
+            json,
+            r#"{"ok":true,"command":"read","data":{"channel_id":"c","count":1,"cursor":"10","messages":[{"id":"10","channel_id":"chan","author":{"id":"u1","username":"alice","bot":false},"content":"hi","timestamp":"2024-01-01T00:00:00Z","attachments":[{"id":"a2","filename":"notes.txt","size":42,"url":"https://cdn.discordapp.com/attachments/1/a2/notes.txt"}]}]}}"#
+        );
+    }
+
+    #[test]
+    fn read_cursor_none_serializes_as_null() {
+        let payload = Payload::Read(ReadData {
+            channel_id: "c".into(),
+            count: 0,
+            cursor: None,
+            messages: vec![],
+        });
+        let (_, json, _) = render("read", &Ok(payload), true);
+        assert_eq!(
+            json,
+            r#"{"ok":true,"command":"read","data":{"channel_id":"c","count":0,"cursor":null,"messages":[]}}"#
+        );
+    }
+
+    #[test]
+    fn wait_success_includes_timed_out() {
+        let payload = Payload::Wait(WaitData {
+            channel_id: "c".into(),
+            count: 0,
+            cursor: None,
+            timed_out: true,
+            messages: vec![],
+        });
+        let (sink, json, code) = render("wait", &Ok(payload), true);
+        assert_eq!(sink, Sink::Stdout);
+        assert_eq!(code, 0);
+        assert_eq!(
+            json,
+            r#"{"ok":true,"command":"wait","data":{"channel_id":"c","count":0,"cursor":null,"timed_out":true,"messages":[]}}"#
+        );
+    }
+
+    #[test]
+    fn wait_success_with_attachment_bearing_message_matches_contract() {
+        let mut message = sample_message();
+        message.attachments = vec![sample_attachment()];
+        let payload = Payload::Wait(WaitData {
+            channel_id: "c".into(),
+            count: 1,
+            cursor: Some("20".into()),
+            timed_out: false,
+            messages: vec![message],
+        });
+        let (_, json, _) = render("wait", &Ok(payload), true);
+        assert_eq!(
+            json,
+            r#"{"ok":true,"command":"wait","data":{"channel_id":"c","count":1,"cursor":"20","timed_out":false,"messages":[{"id":"10","channel_id":"chan","author":{"id":"u1","username":"alice","bot":false},"content":"hi","timestamp":"2024-01-01T00:00:00Z","attachments":[{"id":"a1","filename":"photo.png","size":1024,"url":"https://cdn.discordapp.com/attachments/1/a1/photo.png","content_type":"image/png"}]}]}}"#
+        );
+    }
+
+    #[test]
+    fn error_omits_absent_optionals() {
+        let err = AppError::new(ErrorKind::Config, "no bot token");
+        let (sink, json, code) = render("send", &Err(err), true);
+        assert_eq!(sink, Sink::Stdout);
+        assert_eq!(code, 3);
+        assert_eq!(
+            json,
+            r#"{"ok":false,"command":"send","error":{"kind":"config","message":"no bot token"}}"#
+        );
+    }
+
+    #[test]
+    fn error_includes_http_status_and_retry() {
+        let err = AppError {
+            kind: ErrorKind::RateLimit,
+            message: "rate limited".into(),
+            http_status: Some(429),
+            retry_after_ms: Some(1200),
+        };
+        let (sink, json, code) = render("read", &Err(err), true);
+        assert_eq!(sink, Sink::Stdout);
+        assert_eq!(code, 5);
+        assert_eq!(
+            json,
+            r#"{"ok":false,"command":"read","error":{"kind":"rate_limit","message":"rate limited","http_status":429,"retry_after_ms":1200}}"#
+        );
+    }
+}

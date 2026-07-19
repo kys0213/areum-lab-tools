@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::output::{AppError, ErrorKind};
+use crate::common::error::{AppError, ErrorKind};
 
 /// On-disk config at `~/.areum/discord/config.json`. Both fields optional.
 /// `skip_serializing_if` keeps a fresh `init` write minimal (`{"token":"..."}`)

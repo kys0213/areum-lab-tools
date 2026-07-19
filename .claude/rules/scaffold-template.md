@@ -9,7 +9,7 @@ paths:
 
 ## 원칙
 
-1. **`tools/hello`와 컨벤션을 동기화한다**: clap derive + 순수 함수 분리 + 동일 파일 테스트라는 컨벤션이 바뀌면 `tools/hello`와 `templates/tool/`을 함께 갱신한다. 벌어지면 `make new` 직후 `make check`가 깨진다.
+1. **`tools/hello`와 컨벤션을 동기화한다**: clap derive + 순수 함수 분리 + 동일 파일 테스트라는 컨벤션이 바뀌면 `tools/hello`와 `templates/tool/`을 함께 갱신한다. 벌어지면 `make new` 직후 `make check`가 깨진다. `tools/hello`와 `templates/tool/`은 flat 단일 파일 구조를 유지하는 기준 사례다 (졸업 기준은 `module-structure.md` 참조).
 2. **`{{NAME}}`은 `make new`의 sed 치환 계약**: Makefile의 `new` 타깃이 `sed 's/{{NAME}}/$(NAME)/g'`로 치환한다. 다른 템플릿 문법(`{{ name }}`, `${NAME}` 등)을 도입하지 않는다.
 3. **최소 골격만 담는다**: 템플릿은 컴파일되는 가장 작은 예시여야 한다. 특정 도구의 기능(HTTP 호출, 파일 파싱 등)을 반영하지 않는다.
 4. **`make new`는 순수 파일 생성**: cargo를 호출하지 않는다 (`README.md`: "Cargo.lock을 오염시키지 않는다"). 템플릿이 후처리 cargo 명령을 암묵적으로 요구하는 구조를 만들지 않는다.

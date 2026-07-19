@@ -1,8 +1,6 @@
-mod api;
 mod cli;
-mod command;
-mod config;
-mod http;
+mod commands;
+mod common;
 mod output;
 
 use std::io::Read;
@@ -11,8 +9,9 @@ use std::path::PathBuf;
 use clap::Parser;
 
 use cli::{Cli, Command};
-use command::TokioSleeper;
-use http::HttpDiscordApi;
+use commands::TokioSleeper;
+use common::config;
+use common::http::HttpDiscordApi;
 use output::{AppError, Payload, Sink};
 
 #[tokio::main]
@@ -43,7 +42,7 @@ async fn run(cli: Cli) -> Result<Payload, AppError> {
     };
 
     match cli.command {
-        Command::Init { token, force } => command::run_init(
+        Command::Init { token, force } => commands::run_init(
             &config_path,
             token.as_deref(),
             force,
@@ -61,7 +60,7 @@ async fn run(cli: Cli) -> Result<Payload, AppError> {
         } => {
             let (api, channels) = authenticated_api(&config_path, cli.token.as_deref())?;
             let channel_id = config::resolve_channel(&channel, &channels);
-            command::run_send(
+            commands::run_send(
                 &api,
                 &channel_id,
                 body.as_deref(),
@@ -80,7 +79,7 @@ async fn run(cli: Cli) -> Result<Payload, AppError> {
         } => {
             let (api, channels) = authenticated_api(&config_path, cli.token.as_deref())?;
             let channel_id = config::resolve_channel(&channel, &channels);
-            command::run_read(&api, &channel_id, after.as_deref(), limit).await
+            commands::run_read(&api, &channel_id, after.as_deref(), limit).await
         }
         Command::Wait {
             channel,
@@ -92,7 +91,7 @@ async fn run(cli: Cli) -> Result<Payload, AppError> {
             let (api, channels) = authenticated_api(&config_path, cli.token.as_deref())?;
             let channel_id = config::resolve_channel(&channel, &channels);
             let sleeper = TokioSleeper;
-            command::run_wait(
+            commands::run_wait(
                 &api,
                 &sleeper,
                 &channel_id,
