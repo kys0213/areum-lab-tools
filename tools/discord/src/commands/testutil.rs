@@ -2,7 +2,7 @@ use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::time::Duration;
 
-use crate::api::{Author, DiscordApi, Message, SendRequest, SentMessage};
+use crate::common::api::{Author, DiscordApi, Message, SendRequest, SentMessage};
 use crate::output::AppError;
 
 use super::wait::Sleeper;

@@ -1,4 +1,4 @@
-use crate::api::DiscordApi;
+use crate::common::api::DiscordApi;
 use crate::output::{AppError, Payload, ReadData};
 
 use super::cursor::{newest_cursor, sort_ascending_by_id, validate_limit};

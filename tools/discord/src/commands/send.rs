@@ -1,4 +1,4 @@
-use crate::api::{DiscordApi, FilePart, SendRequest};
+use crate::common::api::{DiscordApi, FilePart, SendRequest};
 use crate::output::{AppError, ErrorKind, Payload, SendData};
 
 /// Sends a message (optionally with file attachments) to a channel and reports

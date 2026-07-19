@@ -1,8 +1,6 @@
-mod api;
 mod cli;
 mod commands;
-mod config;
-mod http;
+mod common;
 mod output;
 
 use std::io::Read;
@@ -12,7 +10,8 @@ use clap::Parser;
 
 use cli::{Cli, Command};
 use commands::TokioSleeper;
-use http::HttpDiscordApi;
+use common::config;
+use common::http::HttpDiscordApi;
 use output::{AppError, Payload, Sink};
 
 #[tokio::main]

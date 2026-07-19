@@ -1,6 +1,6 @@
 use super::*;
-use crate::api::{Attachment, SentMessage};
 use crate::commands::testutil::*;
+use crate::common::api::{Attachment, SentMessage};
 
 // ---- resolve_send_content ----
 

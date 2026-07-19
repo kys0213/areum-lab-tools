@@ -1,4 +1,4 @@
-use crate::api::Message;
+use crate::common::api::Message;
 use crate::output::{AppError, ErrorKind};
 
 /// Discord caps `limit` at 100; pushing the bound down to a usage error keeps

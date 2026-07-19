@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::output::AppError;
+use crate::common::error::AppError;
 
 /// Abstraction over the Discord REST calls the CLI needs.
 ///

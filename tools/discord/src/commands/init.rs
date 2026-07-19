@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use crate::config::Config;
+use crate::common::config::Config;
 use crate::output::{AppError, ErrorKind, InitData, Payload};
 
 use super::send::read_stdin_to_string;

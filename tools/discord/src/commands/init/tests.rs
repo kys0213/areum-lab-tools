@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use super::*;
 use crate::commands::testutil::*;
-use crate::config;
+use crate::common::config;
 use crate::output::ErrorKind;
 
 /// Unique, not-yet-existing directory under the OS temp dir so each test

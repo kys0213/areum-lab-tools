@@ -2,8 +2,8 @@ use std::time::Duration;
 
 use serde::de::DeserializeOwned;
 
-use crate::api::{DiscordApi, FilePart, Message, SendRequest, SentMessage};
-use crate::output::{AppError, ErrorKind};
+use crate::common::api::{DiscordApi, FilePart, Message, SendRequest, SentMessage};
+use crate::common::error::{AppError, ErrorKind};
 
 const API_BASE: &str = "https://discord.com/api/v10";
 const USER_AGENT: &str = "DiscordBot (https://github.com/kys0213/areum-lab-tools, 0.0.0)";
