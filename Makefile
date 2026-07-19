@@ -7,7 +7,7 @@
 
 INSTALL_ROOT ?= $(HOME)/.local
 
-.PHONY: help build release test lint fmt fmt-check check install install-all new clean dist-build dist-tag
+.PHONY: help build release test lint fmt fmt-check check install install-all install-release new clean dist-build dist-tag
 
 help: ## Show this help message
 	@echo "Available targets:"
@@ -46,6 +46,13 @@ install-all: ## Install every tool under tools/
 		echo "==> installing $$name"; \
 		cargo install --path "$$dir" --root $(INSTALL_ROOT) || exit 1; \
 	done
+
+install-release: ## Install a tool from GitHub Release: make install-release TOOL=<name> [VERSION=x.y.z]
+	@if [ -z "$(TOOL)" ]; then \
+		echo "error: TOOL is required. usage: make install-release TOOL=<name>" >&2; \
+		exit 1; \
+	fi
+	INSTALL_ROOT=$(INSTALL_ROOT) ./scripts/install.sh $(TOOL) $(VERSION)
 
 new: ## Scaffold a new tool from templates/: make new NAME=<name>
 	@if [ -z "$(NAME)" ]; then \
