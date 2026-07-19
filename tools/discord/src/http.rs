@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use serde::de::DeserializeOwned;
 
-use crate::api::{DiscordApi, Message, SentMessage};
+use crate::api::{DiscordApi, FilePart, Message, SendRequest, SentMessage};
 use crate::output::{AppError, ErrorKind};
 
 const API_BASE: &str = "https://discord.com/api/v10";
@@ -83,15 +83,76 @@ impl HttpDiscordApi {
             return Err(status_error(status.as_u16(), &body));
         }
     }
+
+    /// Same retry/classification semantics as [`Self::execute`], but rebuilds
+    /// the request from `factory` on each attempt instead of `try_clone`-ing
+    /// it. `reqwest`'s `try_clone()` returns `None` for a multipart body, so a
+    /// multipart send cannot reuse [`Self::execute`]; the retry loop is
+    /// duplicated here deliberately rather than refactoring the JSON path,
+    /// whose behaviour is already verified.
+    async fn execute_with_factory<T, F>(&self, factory: F) -> Result<T, AppError>
+    where
+        T: DeserializeOwned,
+        F: Fn() -> reqwest::RequestBuilder,
+    {
+        let mut retries = 0;
+        loop {
+            let response = factory().send().await.map_err(network_error)?;
+            let status = response.status();
+
+            if status.is_success() {
+                let bytes = response.bytes().await.map_err(network_error)?;
+                return serde_json::from_slice(&bytes)
+                    .map_err(|err| deserialize_error(&bytes, &err));
+            }
+
+            if status.as_u16() == 429 {
+                let header = response
+                    .headers()
+                    .get(reqwest::header::RETRY_AFTER)
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::to_owned);
+                let body_bytes = response.bytes().await.unwrap_or_default();
+                let body_json: Option<serde_json::Value> = serde_json::from_slice(&body_bytes).ok();
+                let retry_after_ms = parse_retry_after(header.as_deref(), body_json.as_ref());
+
+                match retry_after_ms {
+                    Some(ms) if should_retry_after(ms) && retries < MAX_RATE_LIMIT_RETRIES => {
+                        retries += 1;
+                        tokio::time::sleep(Duration::from_millis(ms)).await;
+                        continue;
+                    }
+                    _ => return Err(rate_limit_error(retry_after_ms)),
+                }
+            }
+
+            let body = response.text().await.unwrap_or_default();
+            return Err(status_error(status.as_u16(), &body));
+        }
+    }
 }
 
 impl DiscordApi for HttpDiscordApi {
-    async fn send_message(&self, channel_id: &str, content: &str) -> Result<SentMessage, AppError> {
-        let url = format!("{}/channels/{channel_id}/messages", self.base_url);
-        let request = self
-            .authorized(self.client.post(url))
-            .json(&serde_json::json!({ "content": content }));
-        self.execute(request).await
+    async fn send_message(&self, req: &SendRequest) -> Result<SentMessage, AppError> {
+        let url = format!("{}/channels/{}/messages", self.base_url, req.channel_id);
+        // No files: a plain JSON body is cloneable, so use the verified
+        // try_clone-based retry path. With files, the body is multipart (not
+        // cloneable) and must be rebuilt per attempt via a factory.
+        if req.files.is_empty() {
+            let request = self
+                .authorized(self.client.post(url))
+                .json(&build_send_payload(req));
+            self.execute(request).await
+        } else {
+            let payload_json = serde_json::to_string(&build_send_payload(req))
+                .expect("send payload is plain data; serialization is infallible");
+            let factory = || {
+                let form = build_multipart_form(&payload_json, &req.files);
+                self.authorized(self.client.post(url.as_str()))
+                    .multipart(form)
+            };
+            self.execute_with_factory(factory).await
+        }
     }
 
     async fn get_messages(
@@ -104,6 +165,47 @@ impl DiscordApi for HttpDiscordApi {
         let request = self.authorized(self.client.get(url));
         self.execute(request).await
     }
+}
+
+/// Pure JSON body assembly for `send_message`, testable without a network
+/// round trip. `reply_to: None` omits the `message_reference` key entirely
+/// rather than sending it as `null` — Discord's own default for a present
+/// `message_reference` is `fail_if_not_exists=true`, so replying to a
+/// deleted message surfaces as a plain 400 (`classify_status` -> `Api`).
+///
+/// When files are present this doubles as the multipart `payload_json` part
+/// and gains an `attachments` descriptor array (`[{"id":0,"filename":...}]`)
+/// binding each `files[N]` part to a name; the key is omitted with no files.
+fn build_send_payload(req: &SendRequest) -> serde_json::Value {
+    let mut payload = serde_json::json!({ "content": req.content });
+    if let Some(message_id) = &req.reply_to {
+        payload["message_reference"] = serde_json::json!({ "message_id": message_id });
+    }
+    if !req.files.is_empty() {
+        let descriptors: Vec<serde_json::Value> = req
+            .files
+            .iter()
+            .enumerate()
+            .map(|(index, file)| serde_json::json!({ "id": index, "filename": file.filename }))
+            .collect();
+        payload["attachments"] = serde_json::Value::Array(descriptors);
+    }
+    payload
+}
+
+/// Builds the multipart body: a `payload_json` text part plus one `files[N]`
+/// part per attachment. Rebuilt on every retry — `bytes.clone()` bumps an
+/// `Arc` refcount rather than copying the buffer, so this stays cheap.
+fn build_multipart_form(payload_json: &str, files: &[FilePart]) -> reqwest::multipart::Form {
+    let mut form = reqwest::multipart::Form::new().text("payload_json", payload_json.to_owned());
+    for (index, file) in files.iter().enumerate() {
+        let part = reqwest::multipart::Part::stream(reqwest::Body::from(file.bytes.clone()))
+            .file_name(file.filename.clone())
+            .mime_str(&file.content_type)
+            .expect("content_type comes from mime_guess and is always a valid MIME string");
+        form = form.part(format!("files[{index}]"), part);
+    }
+    form
 }
 
 /// Pure URL+query assembly so the `after` Some/None branching is testable
@@ -297,6 +399,96 @@ mod tests {
         assert!(!should_retry_after(300_001));
     }
 
+    fn file_part(filename: &str) -> FilePart {
+        FilePart {
+            filename: filename.into(),
+            bytes: bytes::Bytes::from_static(b"data"),
+            content_type: "application/octet-stream".into(),
+        }
+    }
+
+    #[test]
+    fn build_send_payload_includes_message_reference_when_reply_to_is_some() {
+        let req = SendRequest {
+            channel_id: "c".into(),
+            content: "hi".into(),
+            reply_to: Some("42".into()),
+            files: vec![],
+        };
+        let payload = build_send_payload(&req);
+        assert_eq!(
+            payload,
+            serde_json::json!({
+                "content": "hi",
+                "message_reference": { "message_id": "42" }
+            })
+        );
+    }
+
+    #[test]
+    fn build_send_payload_omits_message_reference_key_when_reply_to_is_none() {
+        let req = SendRequest {
+            channel_id: "c".into(),
+            content: "hi".into(),
+            reply_to: None,
+            files: vec![],
+        };
+        let payload = build_send_payload(&req);
+        assert_eq!(payload, serde_json::json!({ "content": "hi" }));
+        assert!(payload.get("message_reference").is_none());
+    }
+
+    #[test]
+    fn build_send_payload_omits_attachments_key_when_no_files() {
+        let req = SendRequest {
+            channel_id: "c".into(),
+            content: "hi".into(),
+            reply_to: None,
+            files: vec![],
+        };
+        assert!(build_send_payload(&req).get("attachments").is_none());
+    }
+
+    #[test]
+    fn build_send_payload_includes_attachments_descriptor_when_files_present() {
+        let req = SendRequest {
+            channel_id: "c".into(),
+            content: "caption".into(),
+            reply_to: None,
+            files: vec![file_part("a.png"), file_part("b.txt")],
+        };
+        let payload = build_send_payload(&req);
+        assert_eq!(
+            payload,
+            serde_json::json!({
+                "content": "caption",
+                "attachments": [
+                    { "id": 0, "filename": "a.png" },
+                    { "id": 1, "filename": "b.txt" }
+                ]
+            })
+        );
+    }
+
+    #[test]
+    fn build_send_payload_files_and_reply_coexist() {
+        let req = SendRequest {
+            channel_id: "c".into(),
+            content: "caption".into(),
+            reply_to: Some("42".into()),
+            files: vec![file_part("a.png")],
+        };
+        let payload = build_send_payload(&req);
+        assert_eq!(
+            payload,
+            serde_json::json!({
+                "content": "caption",
+                "message_reference": { "message_id": "42" },
+                "attachments": [ { "id": 0, "filename": "a.png" } ]
+            })
+        );
+    }
+
     #[test]
     fn get_messages_url_includes_after_when_present() {
         let url = get_messages_url(API_BASE, "123", Some("456"), 50);
@@ -331,6 +523,7 @@ mod tests {
         assert_eq!(sent.id, "999");
         assert_eq!(sent.channel_id, "chan1");
         assert_eq!(sent.timestamp, "2024-01-01T00:00:00Z");
+        assert!(sent.attachments.is_empty());
     }
 
     #[test]
@@ -373,12 +566,29 @@ mod tests {
                 "author": {"id": "u1", "username": "alice", "bot": false},
                 "content": "",
                 "timestamp": "2024-01-01T00:00:00Z",
-                "attachments": [{"id": "a1", "filename": "x.png"}],
+                "attachments": [{"id": "a1", "filename": "x.png", "size": 10, "url": "https://cdn.discordapp.com/attachments/1/a1/x.png"}],
                 "embeds": []
             }
         ]"#;
         let messages: Vec<Message> = serde_json::from_str(json).unwrap();
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].content, "");
+        assert_eq!(messages[0].attachments.len(), 1);
+        assert_eq!(messages[0].attachments[0].filename, "x.png");
+    }
+
+    #[test]
+    fn messages_deserialize_with_attachments_key_absent_as_empty_vec() {
+        let json = r#"[
+            {
+                "id": "1",
+                "channel_id": "chan1",
+                "author": {"id": "u1", "username": "alice", "bot": false},
+                "content": "hi",
+                "timestamp": "2024-01-01T00:00:00Z"
+            }
+        ]"#;
+        let messages: Vec<Message> = serde_json::from_str(json).unwrap();
+        assert!(messages[0].attachments.is_empty());
     }
 }

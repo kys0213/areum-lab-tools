@@ -13,17 +13,20 @@ use clap::Parser;
 use cli::{Cli, Command};
 use command::TokioSleeper;
 use http::HttpDiscordApi;
-use output::{AppError, Payload};
+use output::{AppError, Payload, Sink};
 
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
     let command_name = cli.command.name();
-    let human = cli.human;
+    let json = cli.json;
 
     let result = run(cli).await;
-    let (line, code) = output::render(command_name, &result, human);
-    println!("{line}");
+    let (sink, line, code) = output::render(command_name, &result, json);
+    match sink {
+        Sink::Stdout => println!("{line}"),
+        Sink::Stderr => eprintln!("{line}"),
+    }
     std::process::exit(code);
 }
 
@@ -49,6 +52,8 @@ async fn run(cli: Cli) -> Result<Payload, AppError> {
             channel,
             body,
             text,
+            reply_to,
+            files,
         } => {
             let channel_id = config::resolve_channel(&channel, &cfg.channels);
             command::run_send(
@@ -56,7 +61,10 @@ async fn run(cli: Cli) -> Result<Payload, AppError> {
                 &channel_id,
                 body.as_deref(),
                 text.as_deref(),
+                reply_to.as_deref(),
+                &files,
                 read_stdin,
+                |p| std::fs::read(p),
             )
             .await
         }
