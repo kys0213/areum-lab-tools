@@ -38,7 +38,10 @@ if [ -z "$VERSION" ]; then
 	# release list (already newest-first) for the first tag with this
 	# tool's "<tool>-v" prefix.
 	RELEASES_JSON="$(curl -fsSL "$API_BASE/repos/kys0213/areum-lab-tools/releases?per_page=100")"
-	TAG="$(printf '%s\n' "$RELEASES_JSON" | grep -o "\"tag_name\": *\"${TOOL}-v[^\"]*\"" | head -n1 | sed -E "s/\"tag_name\": *\"${TOOL}-v(.*)\"/\1/")"
+	# Anchor on "-v<digit>" so a similarly-prefixed tool's tag (e.g. a
+	# "discord-vx-v9.9.9" release for tool "discord-vx") is never mistaken
+	# for this tool's release via plain substring matching.
+	TAG="$(printf '%s\n' "$RELEASES_JSON" | grep -o "\"tag_name\": *\"${TOOL}-v[0-9][^\"]*\"" | head -n1 | sed -E "s/\"tag_name\": *\"${TOOL}-v(.*)\"/\1/")"
 	if [ -z "$TAG" ]; then
 		echo "error: no release found for $TOOL" >&2
 		exit 1
