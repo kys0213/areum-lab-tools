@@ -15,6 +15,8 @@ pub(crate) trait DiscordApi {
         after: Option<&str>,
         limit: u8,
     ) -> Result<Vec<Message>, AppError>;
+
+    async fn create_thread(&self, req: &CreateThreadRequest) -> Result<CreatedThread, AppError>;
 }
 
 /// A file to upload as a message attachment. `bytes` is [`bytes::Bytes`] (an
@@ -84,6 +86,28 @@ pub struct SentMessage {
     pub timestamp: String,
     #[serde(default)]
     pub attachments: Vec<Attachment>,
+}
+
+/// Request for either `POST /channels/{channel_id}/threads` (no
+/// `from_message_id`) or `POST /channels/{channel_id}/messages/{message_id}/threads`
+/// (with it). Carries only the fields Discord requires — no optional
+/// archive-duration/type fields.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CreateThreadRequest {
+    pub channel_id: String,
+    pub name: String,
+    /// Message to attach the thread to; `None` creates a standalone channel
+    /// thread instead.
+    pub from_message_id: Option<String>,
+}
+
+/// Result of a successful thread creation. A message-derived thread's `id`
+/// equals the source message's id per Discord's spec; this struct just
+/// carries whatever Discord returns, it does not encode that equality.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CreatedThread {
+    pub id: String,
+    pub name: String,
 }
 
 #[cfg(test)]

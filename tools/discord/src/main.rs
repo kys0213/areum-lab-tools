@@ -8,7 +8,7 @@ use std::path::PathBuf;
 
 use clap::Parser;
 
-use cli::{Cli, Command};
+use cli::{Cli, Command, ThreadCommand};
 use commands::TokioSleeper;
 use common::config;
 use common::http::HttpDiscordApi;
@@ -101,6 +101,15 @@ async fn run(cli: Cli) -> Result<Payload, AppError> {
                 limit,
             )
             .await
+        }
+        Command::Thread(ThreadCommand::Create {
+            channel,
+            name,
+            from_message,
+        }) => {
+            let (api, channels) = authenticated_api(&config_path, cli.token.as_deref())?;
+            let channel_id = config::resolve_channel(&channel, &channels);
+            commands::run_thread_create(&api, &channel_id, &name, from_message.as_deref()).await
         }
     }
 }

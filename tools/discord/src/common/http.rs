@@ -2,7 +2,9 @@ use std::time::Duration;
 
 use serde::de::DeserializeOwned;
 
-use crate::common::api::{DiscordApi, FilePart, Message, SendRequest, SentMessage};
+use crate::common::api::{
+    CreateThreadRequest, CreatedThread, DiscordApi, FilePart, Message, SendRequest, SentMessage,
+};
 use crate::common::error::{AppError, ErrorKind};
 
 const API_BASE: &str = "https://discord.com/api/v10";
@@ -165,6 +167,14 @@ impl DiscordApi for HttpDiscordApi {
         let request = self.authorized(self.client.get(url));
         self.execute(request).await
     }
+
+    async fn create_thread(&self, req: &CreateThreadRequest) -> Result<CreatedThread, AppError> {
+        let url = create_thread_url(&self.base_url, req);
+        let request = self
+            .authorized(self.client.post(url))
+            .json(&build_create_thread_payload(req));
+        self.execute(request).await
+    }
 }
 
 /// Pure JSON body assembly for `send_message`, testable without a network
@@ -218,6 +228,24 @@ fn get_messages_url(base_url: &str, channel_id: &str, after: Option<&str>, limit
         url.push_str(after);
     }
     url
+}
+
+/// Picks the message-derived vs. channel thread endpoint based on
+/// `from_message_id`.
+fn create_thread_url(base_url: &str, req: &CreateThreadRequest) -> String {
+    match &req.from_message_id {
+        Some(message_id) => format!(
+            "{base_url}/channels/{}/messages/{message_id}/threads",
+            req.channel_id
+        ),
+        None => format!("{base_url}/channels/{}/threads", req.channel_id),
+    }
+}
+
+/// Body for either thread-creation endpoint: just `name`, the only field
+/// Discord requires — no optional archive-duration/type fields.
+fn build_create_thread_payload(req: &CreateThreadRequest) -> serde_json::Value {
+    serde_json::json!({ "name": req.name })
 }
 
 /// Maps an HTTP status (already known not to be 2xx/429) to an [`ErrorKind`].
@@ -335,6 +363,28 @@ mod tests {
         let err = status_error(401, "unauthorized");
         assert_eq!(err.kind, ErrorKind::Auth);
         assert_eq!(err.http_status, Some(401));
+    }
+
+    #[test]
+    fn status_error_maps_403_to_auth_kind_and_preserves_body() {
+        // Acceptance criterion: insufficient permissions on thread creation
+        // (Discord 403 "Missing Access"/"Missing Permissions") must classify
+        // as Auth, not a generic Api error.
+        let err = status_error(403, r#"{"message":"Missing Access","code":50001}"#);
+        assert_eq!(err.kind, ErrorKind::Auth);
+        assert_eq!(err.http_status, Some(403));
+        assert!(err.message.contains("Missing Access"));
+    }
+
+    #[test]
+    fn status_error_preserves_thread_already_created_body_verbatim() {
+        // The command-layer test (`api_error_propagates_as_is` in
+        // commands::thread) only checks the error already carries this text;
+        // this pins that `status_error` is where that text is captured
+        // verbatim from the Discord response body, not summarized/dropped.
+        let err = status_error(400, r#"{"message":"THREAD_ALREADY_CREATED","code":160004}"#);
+        assert_eq!(err.kind, ErrorKind::Api);
+        assert!(err.message.contains("THREAD_ALREADY_CREATED"));
     }
 
     #[test]
@@ -575,6 +625,58 @@ mod tests {
         assert_eq!(messages[0].content, "");
         assert_eq!(messages[0].attachments.len(), 1);
         assert_eq!(messages[0].attachments[0].filename, "x.png");
+    }
+
+    #[test]
+    fn create_thread_url_uses_channel_threads_endpoint_when_no_message_id() {
+        let req = CreateThreadRequest {
+            channel_id: "123".into(),
+            name: "topic".into(),
+            from_message_id: None,
+        };
+        assert_eq!(
+            create_thread_url(API_BASE, &req),
+            "https://discord.com/api/v10/channels/123/threads"
+        );
+    }
+
+    #[test]
+    fn create_thread_url_uses_message_threads_endpoint_when_message_id_present() {
+        let req = CreateThreadRequest {
+            channel_id: "123".into(),
+            name: "topic".into(),
+            from_message_id: Some("456".into()),
+        };
+        assert_eq!(
+            create_thread_url(API_BASE, &req),
+            "https://discord.com/api/v10/channels/123/messages/456/threads"
+        );
+    }
+
+    #[test]
+    fn build_create_thread_payload_contains_only_name() {
+        let req = CreateThreadRequest {
+            channel_id: "123".into(),
+            name: "topic".into(),
+            from_message_id: Some("456".into()),
+        };
+        let payload = build_create_thread_payload(&req);
+        assert_eq!(payload, serde_json::json!({ "name": "topic" }));
+    }
+
+    #[test]
+    fn created_thread_deserializes_with_required_fields_only() {
+        let json = r#"{"id": "111", "name": "discussion"}"#;
+        let thread: CreatedThread = serde_json::from_str(json).unwrap();
+        assert_eq!(thread.id, "111");
+        assert_eq!(thread.name, "discussion");
+    }
+
+    #[test]
+    fn created_thread_deserialize_fails_when_name_is_missing() {
+        let json = r#"{"id": "111"}"#;
+        let result: Result<CreatedThread, _> = serde_json::from_str(json);
+        assert!(result.is_err());
     }
 
     #[test]

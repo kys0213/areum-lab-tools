@@ -2,7 +2,7 @@ mod envelope;
 mod payload;
 
 pub(crate) use crate::common::error::{AppError, ErrorKind, exit_code};
-pub(crate) use payload::{InitData, Payload, ReadData, SendData, WaitData};
+pub(crate) use payload::{InitData, Payload, ReadData, SendData, ThreadData, WaitData};
 
 /// Which stream a rendered line belongs on. Human-mode errors are
 /// diagnostics and must not pollute stdout; every other case is a result
