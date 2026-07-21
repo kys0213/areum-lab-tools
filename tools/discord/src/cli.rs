@@ -98,6 +98,75 @@ pub enum Command {
     /// Thread operations on a channel (id or config alias).
     #[command(subcommand)]
     Thread(ThreadCommand),
+
+    /// Manage the resident gateway daemon that answers HITL interactions.
+    #[command(subcommand)]
+    Daemon(DaemonCommand),
+
+    /// Ask a human a question over Discord (buttons, optionally free text)
+    /// and read back the answer.
+    #[command(subcommand)]
+    Ask(AskCommand),
+}
+
+#[derive(Subcommand, Debug)]
+pub enum DaemonCommand {
+    /// Start the daemon. Detaches to the background by default; --foreground
+    /// runs the gateway loop in the current process.
+    Start {
+        /// Run in this process instead of detaching (used internally by the
+        /// background launcher, and for debugging).
+        #[arg(long)]
+        foreground: bool,
+    },
+    /// Stop the running daemon via the pidfile (SIGTERM).
+    Stop,
+    /// Report whether the daemon is running and the pending-ask count.
+    Status,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum AskCommand {
+    /// Send a question with choice buttons (and optionally a free-text
+    /// button) to a channel; returns the ask id immediately without waiting
+    /// for an answer. Fails fast if the daemon is not running (spec §4) — a
+    /// question nobody's listening for is never sent.
+    Create {
+        /// Channel id, or an alias defined in config.channels.
+        channel: String,
+        /// The question text, sent as the message body.
+        question: String,
+        /// Choice label; repeat 1-4 times (one action-row slot is reserved
+        /// for --allow-text's button).
+        #[arg(long = "option")]
+        options: Vec<String>,
+        /// Also accept a free-text answer via a modal.
+        #[arg(long = "allow-text")]
+        allow_text: bool,
+        /// Seconds until the ask expires unanswered (default 3600).
+        #[arg(long, default_value_t = 3600)]
+        timeout: u64,
+    },
+    /// Look up an ask's current state without blocking.
+    Result {
+        /// The ask id (the id of the question message).
+        ask_id: String,
+    },
+    /// Poll an ask until it leaves `pending` or the poll budget elapses.
+    ///
+    /// Exits 0 on poll timeout with data.timed_out = true (a timeout is
+    /// normal) — distinct from the ask's own `status: "timed_out"`, which
+    /// means the ask's `--timeout` deadline passed unanswered.
+    Wait {
+        /// The ask id (the id of the question message).
+        ask_id: String,
+        /// Total seconds to poll before giving up (default 600).
+        #[arg(long, default_value_t = 600)]
+        timeout: u64,
+        /// Seconds between polls (default 5).
+        #[arg(long, default_value_t = 5)]
+        interval: u64,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -126,6 +195,8 @@ impl Command {
             Command::Read { .. } => "read",
             Command::Wait { .. } => "wait",
             Command::Thread(_) => "thread",
+            Command::Daemon(_) => "daemon",
+            Command::Ask(_) => "ask",
         }
     }
 }
@@ -472,6 +543,179 @@ mod tests {
         .unwrap();
         assert!(cli.json);
         assert_eq!(cli.command.name(), "thread");
+    }
+
+    #[test]
+    fn daemon_start_defaults_to_background() {
+        let cli = Cli::try_parse_from(["discord", "daemon", "start"]).unwrap();
+        match cli.command {
+            Command::Daemon(DaemonCommand::Start { foreground }) => assert!(!foreground),
+            other => panic!("expected Daemon(Start), got {other:?}"),
+        }
+        assert_eq!(
+            Cli::try_parse_from(["discord", "daemon", "start"])
+                .unwrap()
+                .command
+                .name(),
+            "daemon"
+        );
+    }
+
+    #[test]
+    fn daemon_start_parses_foreground_flag() {
+        let cli = Cli::try_parse_from(["discord", "daemon", "start", "--foreground"]).unwrap();
+        match cli.command {
+            Command::Daemon(DaemonCommand::Start { foreground }) => assert!(foreground),
+            other => panic!("expected Daemon(Start), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn daemon_stop_and_status_parse() {
+        assert!(matches!(
+            Cli::try_parse_from(["discord", "daemon", "stop"])
+                .unwrap()
+                .command,
+            Command::Daemon(DaemonCommand::Stop)
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["discord", "daemon", "status"])
+                .unwrap()
+                .command,
+            Command::Daemon(DaemonCommand::Status)
+        ));
+    }
+
+    #[test]
+    fn daemon_requires_a_subcommand() {
+        assert!(Cli::try_parse_from(["discord", "daemon"]).is_err());
+    }
+
+    #[test]
+    fn foreground_flag_is_rejected_on_daemon_stop() {
+        // --foreground is start-only; clap must reject it on stop.
+        assert!(Cli::try_parse_from(["discord", "daemon", "stop", "--foreground"]).is_err());
+    }
+
+    #[test]
+    fn ask_create_parses_options_and_defaults() {
+        let cli = Cli::try_parse_from([
+            "discord", "ask", "create", "123", "proceed?", "--option", "yes", "--option", "no",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Ask(AskCommand::Create {
+                channel,
+                question,
+                options,
+                allow_text,
+                timeout,
+            }) => {
+                assert_eq!(channel, "123");
+                assert_eq!(question, "proceed?");
+                assert_eq!(options, vec!["yes".to_owned(), "no".to_owned()]);
+                assert!(!allow_text);
+                assert_eq!(timeout, 3600);
+            }
+            other => panic!("expected Ask(Create), got {other:?}"),
+        }
+        assert_eq!(
+            Cli::try_parse_from([
+                "discord", "ask", "create", "123", "proceed?", "--option", "yes",
+            ])
+            .unwrap()
+            .command
+            .name(),
+            "ask"
+        );
+    }
+
+    #[test]
+    fn ask_create_parses_allow_text_and_timeout_overrides() {
+        let cli = Cli::try_parse_from([
+            "discord",
+            "ask",
+            "create",
+            "123",
+            "proceed?",
+            "--option",
+            "yes",
+            "--allow-text",
+            "--timeout",
+            "30",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Ask(AskCommand::Create {
+                allow_text,
+                timeout,
+                ..
+            }) => {
+                assert!(allow_text);
+                assert_eq!(timeout, 30);
+            }
+            other => panic!("expected Ask(Create), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ask_result_parses_ask_id() {
+        let cli = Cli::try_parse_from(["discord", "ask", "result", "555"]).unwrap();
+        match cli.command {
+            Command::Ask(AskCommand::Result { ask_id }) => assert_eq!(ask_id, "555"),
+            other => panic!("expected Ask(Result), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ask_wait_uses_default_timeout_and_interval_when_omitted() {
+        let cli = Cli::try_parse_from(["discord", "ask", "wait", "555"]).unwrap();
+        match cli.command {
+            Command::Ask(AskCommand::Wait {
+                ask_id,
+                timeout,
+                interval,
+            }) => {
+                assert_eq!(ask_id, "555");
+                assert_eq!(timeout, 600);
+                assert_eq!(interval, 5);
+            }
+            other => panic!("expected Ask(Wait), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ask_wait_parses_timeout_and_interval_overrides() {
+        let cli = Cli::try_parse_from([
+            "discord",
+            "ask",
+            "wait",
+            "555",
+            "--timeout",
+            "60",
+            "--interval",
+            "2",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Ask(AskCommand::Wait {
+                timeout, interval, ..
+            }) => {
+                assert_eq!(timeout, 60);
+                assert_eq!(interval, 2);
+            }
+            other => panic!("expected Ask(Wait), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ask_requires_a_subcommand() {
+        assert!(Cli::try_parse_from(["discord", "ask"]).is_err());
+    }
+
+    #[test]
+    fn ask_create_requires_channel_and_question() {
+        assert!(Cli::try_parse_from(["discord", "ask", "create"]).is_err());
     }
 
     #[test]

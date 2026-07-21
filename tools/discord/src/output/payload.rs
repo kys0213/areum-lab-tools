@@ -46,6 +46,76 @@ pub struct ThreadData {
     pub name: String,
 }
 
+/// `daemon start` result. `foreground` distinguishes a background launch
+/// (reports the detached child's pid) from a foreground run (reports this
+/// process's pid, emitted on graceful shutdown).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DaemonStartData {
+    pub pid: u32,
+    pub foreground: bool,
+}
+
+/// `daemon stop` result — the pid that was signalled and confirmed exited.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DaemonStopData {
+    pub pid: u32,
+    pub stopped: bool,
+}
+
+/// `daemon status` result. `pid` is present only when a live daemon is
+/// recorded; `pending` is the outstanding-ask backlog either way.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DaemonStatusData {
+    pub running: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pid: Option<u32>,
+    pub pending: usize,
+}
+
+/// `ask create` result. `status` is always `"pending"` — a freshly created
+/// ask cannot be anything else — but is carried as a field (rather than
+/// omitted) so the shape matches `ask result`'s status-bearing envelope.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AskCreateData {
+    pub ask_id: String,
+    pub status: String,
+    pub channel_id: String,
+}
+
+/// An ask's current state, shared by `ask result` and (embedded in)
+/// `ask wait`. Internally tagged on `status` so each lifecycle state
+/// serializes with exactly the fields the spec promises for it — a pending
+/// ask carries no answer fields, one that never got one carries none either.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum AskResultData {
+    Pending {
+        ask_id: String,
+    },
+    Answered {
+        ask_id: String,
+        kind: String,
+        value: String,
+        answered_by: String,
+        answered_at: String,
+    },
+    TimedOut {
+        ask_id: String,
+    },
+}
+
+/// `ask wait` result: the ask's state plus a *separate* `timed_out` flag for
+/// the wait's own poll budget. Deliberately distinct from
+/// `AskResultData::TimedOut`'s `status` — that one means the ask's own
+/// deadline passed; this one means `wait` gave up polling while the ask was
+/// (and still is) `pending`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AskWaitData {
+    #[serde(flatten)]
+    pub result: AskResultData,
+    pub timed_out: bool,
+}
+
 /// Command result payload. `untagged` so each variant serializes as its inner
 /// object directly under the envelope `data` key.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -56,6 +126,12 @@ pub enum Payload {
     Read(ReadData),
     Wait(WaitData),
     Thread(ThreadData),
+    DaemonStart(DaemonStartData),
+    DaemonStop(DaemonStopData),
+    DaemonStatus(DaemonStatusData),
+    AskCreate(AskCreateData),
+    AskResult(AskResultData),
+    AskWait(AskWaitData),
 }
 
 impl Payload {
@@ -92,7 +168,45 @@ impl Payload {
                 format_messages(&d.messages)
             ),
             Payload::Thread(d) => format!("created thread {} \"{}\"", d.thread_id, d.name),
+            Payload::DaemonStart(d) if d.foreground => {
+                format!("daemon exited (pid {})", d.pid)
+            }
+            Payload::DaemonStart(d) => {
+                format!("daemon started in background (pid {})", d.pid)
+            }
+            Payload::DaemonStop(d) => format!("daemon stopped (pid {})", d.pid),
+            Payload::DaemonStatus(d) if d.running => format!(
+                "daemon running (pid {}), {} pending ask(s)",
+                d.pid.unwrap_or(0),
+                d.pending
+            ),
+            Payload::DaemonStatus(d) => {
+                format!("daemon not running, {} pending ask(s)", d.pending)
+            }
+            Payload::AskCreate(d) => format!(
+                "ask {} created in channel {} ({})",
+                d.ask_id, d.channel_id, d.status
+            ),
+            Payload::AskResult(d) => format_ask_result(d),
+            Payload::AskWait(d) if d.timed_out => {
+                format!("{} (wait poll timed out)", format_ask_result(&d.result))
+            }
+            Payload::AskWait(d) => format_ask_result(&d.result),
         }
+    }
+}
+
+fn format_ask_result(result: &AskResultData) -> String {
+    match result {
+        AskResultData::Pending { ask_id } => format!("ask {ask_id}: pending"),
+        AskResultData::Answered {
+            ask_id,
+            kind,
+            value,
+            answered_by,
+            answered_at,
+        } => format!("ask {ask_id}: answered by {answered_by} ({kind}): {value} at {answered_at}"),
+        AskResultData::TimedOut { ask_id } => format!("ask {ask_id}: timed out, no answer"),
     }
 }
 
@@ -317,6 +431,77 @@ mod tests {
         assert_eq!(sink, Sink::Stdout);
         assert_eq!(code, 0);
         assert_eq!(text, "channel c: timed out, no new messages");
+    }
+
+    #[test]
+    fn human_ask_create_renders_readable_text() {
+        let payload = Payload::AskCreate(AskCreateData {
+            ask_id: "111".into(),
+            status: "pending".into(),
+            channel_id: "222".into(),
+        });
+        let (sink, text, code) = render("ask", &Ok(payload), false);
+        assert_eq!(sink, Sink::Stdout);
+        assert_eq!(code, 0);
+        assert_eq!(text, "ask 111 created in channel 222 (pending)");
+    }
+
+    #[test]
+    fn human_ask_result_pending_renders_readable_text() {
+        let payload = Payload::AskResult(AskResultData::Pending {
+            ask_id: "111".into(),
+        });
+        let (_, text, _) = render("ask", &Ok(payload), false);
+        assert_eq!(text, "ask 111: pending");
+    }
+
+    #[test]
+    fn human_ask_result_answered_renders_readable_text() {
+        let payload = Payload::AskResult(AskResultData::Answered {
+            ask_id: "111".into(),
+            kind: "choice".into(),
+            value: "yes".into(),
+            answered_by: "u1".into(),
+            answered_at: "2024-01-01T00:00:00Z".into(),
+        });
+        let (_, text, _) = render("ask", &Ok(payload), false);
+        assert_eq!(
+            text,
+            "ask 111: answered by u1 (choice): yes at 2024-01-01T00:00:00Z"
+        );
+    }
+
+    #[test]
+    fn human_ask_result_timed_out_renders_readable_text() {
+        let payload = Payload::AskResult(AskResultData::TimedOut {
+            ask_id: "111".into(),
+        });
+        let (_, text, _) = render("ask", &Ok(payload), false);
+        assert_eq!(text, "ask 111: timed out, no answer");
+    }
+
+    #[test]
+    fn human_ask_wait_poll_timeout_is_distinct_from_ask_timed_out_status() {
+        // The wait poll giving up (`timed_out: true`) while the ask is still
+        // pending must read differently from the ask's own terminal
+        // `timed_out` status — this pins that distinction in human output.
+        let poll_gave_up = Payload::AskWait(AskWaitData {
+            result: AskResultData::Pending {
+                ask_id: "111".into(),
+            },
+            timed_out: true,
+        });
+        let (_, text, _) = render("ask", &Ok(poll_gave_up), false);
+        assert_eq!(text, "ask 111: pending (wait poll timed out)");
+
+        let ask_expired = Payload::AskWait(AskWaitData {
+            result: AskResultData::TimedOut {
+                ask_id: "111".into(),
+            },
+            timed_out: false,
+        });
+        let (_, text, _) = render("ask", &Ok(ask_expired), false);
+        assert_eq!(text, "ask 111: timed out, no answer");
     }
 
     #[test]

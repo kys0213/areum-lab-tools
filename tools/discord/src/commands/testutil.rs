@@ -19,6 +19,10 @@ pub(crate) fn unreachable_stdin() -> std::io::Result<String> {
 
 pub(crate) type GetCall = (String, Option<String>, u8);
 
+/// A recorded interaction-response / message-edit call: the ids involved plus
+/// the JSON payload the daemon built, so tests assert the exact callback shape.
+pub(crate) type InteractionCall = (String, String, serde_json::Value);
+
 /// Scripted [`DiscordApi`]: each call pops the next queued response and
 /// records the arguments it was invoked with.
 pub(crate) struct MockDiscordApi {
@@ -28,6 +32,12 @@ pub(crate) struct MockDiscordApi {
     pub(crate) get_calls: RefCell<Vec<GetCall>>,
     pub(crate) thread_responses: RefCell<VecDeque<Result<CreatedThread, AppError>>>,
     pub(crate) thread_calls: RefCell<Vec<CreateThreadRequest>>,
+    pub(crate) interaction_responses: RefCell<VecDeque<Result<(), AppError>>>,
+    /// `(interaction_id, token, payload)` per `create_interaction_response`.
+    pub(crate) interaction_calls: RefCell<Vec<InteractionCall>>,
+    pub(crate) edit_components_responses: RefCell<VecDeque<Result<(), AppError>>>,
+    /// `(channel_id, message_id, components)` per `edit_message_components`.
+    pub(crate) edit_components_calls: RefCell<Vec<InteractionCall>>,
 }
 
 impl MockDiscordApi {
@@ -39,6 +49,10 @@ impl MockDiscordApi {
             get_calls: RefCell::new(Vec::new()),
             thread_responses: RefCell::new(VecDeque::new()),
             thread_calls: RefCell::new(Vec::new()),
+            interaction_responses: RefCell::new(VecDeque::new()),
+            interaction_calls: RefCell::new(Vec::new()),
+            edit_components_responses: RefCell::new(VecDeque::new()),
+            edit_components_calls: RefCell::new(Vec::new()),
         }
     }
 
@@ -85,6 +99,42 @@ impl DiscordApi for MockDiscordApi {
             .borrow_mut()
             .pop_front()
             .expect("test must queue a thread response before calling create_thread")
+    }
+
+    async fn create_interaction_response(
+        &self,
+        interaction_id: &str,
+        token: &str,
+        payload: &serde_json::Value,
+    ) -> Result<(), AppError> {
+        self.interaction_calls.borrow_mut().push((
+            interaction_id.to_owned(),
+            token.to_owned(),
+            payload.clone(),
+        ));
+        // Fire-and-forget callback: default to success so tests asserting only
+        // the payload shape need not script an outcome for every call.
+        self.interaction_responses
+            .borrow_mut()
+            .pop_front()
+            .unwrap_or(Ok(()))
+    }
+
+    async fn edit_message_components(
+        &self,
+        channel_id: &str,
+        message_id: &str,
+        components: &serde_json::Value,
+    ) -> Result<(), AppError> {
+        self.edit_components_calls.borrow_mut().push((
+            channel_id.to_owned(),
+            message_id.to_owned(),
+            components.clone(),
+        ));
+        self.edit_components_responses
+            .borrow_mut()
+            .pop_front()
+            .unwrap_or(Ok(()))
     }
 }
 
