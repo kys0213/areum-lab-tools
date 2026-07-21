@@ -435,29 +435,65 @@ fn cleanup_preserves_pending_rows_regardless_of_age() {
     assert!(store.get_ask("old-pending").unwrap().is_some());
 }
 
+/// The schema itself must reject an unknown status at write time — the
+/// CHECK constraint is the DB-level guarantee that no writer (this module
+/// or any future raw-SQL path) can store a status outside the contract.
 #[test]
-fn get_ask_errors_on_unknown_status_instead_of_defaulting() {
+fn schema_check_rejects_unknown_status_at_write_time() {
     let store = AskStore::open_in_memory().unwrap();
     store
-        .insert_ask(sample_ask("bad-status", "2024-01-01T01:00:00Z"))
-        .unwrap();
-    // Bypass insert_ask/try_answer/try_timeout (which only ever write the
-    // three known statuses) to simulate a schema contract violation.
-    store
-        .conn
-        .execute(
-            "UPDATE asks SET status = 'bogus' WHERE ask_id = ?1",
-            params!["bad-status"],
-        )
+        .insert_ask(sample_ask("guarded", "2024-01-01T01:00:00Z"))
         .unwrap();
 
     let err = store
-        .get_ask("bad-status")
-        .expect_err("unknown status must surface as an error, not a silently-defaulted record");
+        .conn
+        .execute(
+            "UPDATE asks SET status = 'bogus' WHERE ask_id = ?1",
+            params!["guarded"],
+        )
+        .expect_err("CHECK constraint must reject an out-of-contract status");
     assert!(
-        err.message.contains("unknown ask status"),
-        "expected fail-fast status error, got: {}",
-        err.message
+        err.to_string().contains("CHECK"),
+        "expected CHECK constraint violation, got: {err}"
+    );
+
+    // The row is untouched by the rejected write.
+    let record = store.get_ask("guarded").unwrap().unwrap();
+    assert_eq!(record.status, AskStatus::Pending);
+}
+
+#[test]
+fn schema_check_rejects_invalid_options_json_at_write_time() {
+    let store = AskStore::open_in_memory().unwrap();
+
+    let err = store
+        .conn
+        .execute(
+            "INSERT INTO asks (
+                ask_id, channel_id, question, options, allow_text,
+                status, created_at, timeout_at
+             ) VALUES ('bad-json', 'c', 'q', 'not json', 1,
+                'pending', '2024-01-01T00:00:00Z', '2024-01-01T01:00:00Z')",
+            [],
+        )
+        .expect_err("CHECK constraint must reject non-JSON options");
+    assert!(
+        err.to_string().contains("CHECK"),
+        "expected CHECK constraint violation, got: {err}"
+    );
+}
+
+/// The Rust-side read defense stays even though the CHECK constraint now
+/// blocks SQL-level injection of a bad status: a DB file written by a
+/// different (older/foreign) binary bypasses this process's schema
+/// expectations, so decoding still fails fast instead of defaulting.
+#[test]
+fn ask_status_from_sql_errors_on_unknown_status_instead_of_defaulting() {
+    let result = AskStatus::column_result(ValueRef::Text(b"bogus"));
+    let err = result.expect_err("unknown status must fail decoding, not default");
+    assert!(
+        err.to_string().contains("unknown ask status"),
+        "expected fail-fast status error, got: {err}"
     );
 }
 
