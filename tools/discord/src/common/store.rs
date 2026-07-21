@@ -66,8 +66,9 @@ pub(crate) struct NewAsk {
     pub(crate) timeout_at: String,
 }
 
-/// A persisted `asks` row. Timestamps are RFC3339 strings, matching the rest
-/// of the crate's timestamp convention (see `output::payload`).
+/// A persisted `asks` row. Timestamps are RFC3339 strings normalized to
+/// canonical UTC at the write boundary (see [`normalize_utc`]), matching the
+/// rest of the crate's timestamp convention (see `output::payload`).
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct AskRecord {
     pub(crate) ask_id: String,
@@ -123,7 +124,8 @@ impl AskStore {
         Ok(AskStore { conn })
     }
 
-    /// Inserts a new `pending` ask. `options` is stored as a JSON array.
+    /// Inserts a new `pending` ask. `options` is stored as a JSON array;
+    /// timestamps are normalized to canonical UTC (see [`normalize_utc`]).
     pub(crate) fn insert_ask(&self, ask: NewAsk) -> Result<(), AppError> {
         let options_json = serde_json::to_string(&ask.options).map_err(|e| {
             AppError::new(
@@ -131,6 +133,8 @@ impl AskStore {
                 format!("failed to serialize ask options: {e}"),
             )
         })?;
+        let created_at = normalize_utc(&self.conn, &ask.created_at)?;
+        let timeout_at = normalize_utc(&self.conn, &ask.timeout_at)?;
         self.conn
             .execute(
                 "INSERT INTO asks (
@@ -143,8 +147,8 @@ impl AskStore {
                     ask.question,
                     options_json,
                     ask.allow_text,
-                    ask.created_at,
-                    ask.timeout_at,
+                    created_at,
+                    timeout_at,
                 ],
             )
             .map_err(map_sqlite_err)?;
@@ -175,6 +179,7 @@ impl AskStore {
         answered_by: &str,
         answered_at: &str,
     ) -> Result<bool, AppError> {
+        let answered_at = normalize_utc(&self.conn, answered_at)?;
         let changed = self
             .conn
             .execute(
@@ -205,7 +210,10 @@ impl AskStore {
     /// to disable their buttons). A single conditional UPDATE with
     /// RETURNING keeps the same `status = 'pending'` race guard as
     /// `try_answer`/`try_timeout` while avoiding a per-row query loop.
+    /// `now` is normalized first so the plain string comparison against the
+    /// (normalized-at-write) `timeout_at` column agrees with time order.
     pub(crate) fn expire_due(&self, now: &str) -> Result<Vec<AskRecord>, AppError> {
+        let now = normalize_utc(&self.conn, now)?;
         let mut stmt = self
             .conn
             .prepare(&format!(
@@ -224,17 +232,30 @@ impl AskStore {
     /// older than `retention_days` before `now`, returning the count
     /// removed. Pending rows are never deleted regardless of age — an
     /// unresolved question silently vanishing would be data loss. The
-    /// day-arithmetic cutoff is computed by SQLite's own `datetime()`
-    /// modifiers rather than a date library, on the invariant that
-    /// `created_at`/`now` are well-formed RFC3339 UTC strings (the
-    /// convention this whole crate stores timestamps in).
+    /// cutoff is precomputed once (SQLite's own `datetime()` modifiers do
+    /// the day arithmetic, failing fast on a malformed `now`), so the
+    /// DELETE compares the indexed-friendly bare column instead of wrapping
+    /// every row's `created_at` in a function call.
     pub(crate) fn cleanup(&self, retention_days: u32, now: &str) -> Result<usize, AppError> {
-        let cutoff_modifier = format!("-{retention_days} days");
+        let cutoff: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT strftime('%Y-%m-%dT%H:%M:%SZ', datetime(?1, ?2))",
+                params![now, format!("-{retention_days} days")],
+                |row| row.get(0),
+            )
+            .map_err(map_sqlite_err)?;
+        let cutoff = cutoff.ok_or_else(|| {
+            AppError::new(
+                ErrorKind::Internal,
+                format!("invalid timestamp for cleanup cutoff: {now}"),
+            )
+        })?;
+
         self.conn
             .execute(
-                "DELETE FROM asks
-                 WHERE status != 'pending' AND datetime(created_at) < datetime(?1, ?2)",
-                params![now, cutoff_modifier],
+                "DELETE FROM asks WHERE status != 'pending' AND created_at < ?1",
+                params![cutoff],
             )
             .map_err(map_sqlite_err)
     }
@@ -316,6 +337,28 @@ const CREATE_ASKS_SQL: &str = "CREATE TABLE IF NOT EXISTS asks (
     timeout_at TEXT NOT NULL,
     answered_at TEXT
 )";
+
+/// Normalizes a timestamp to canonical UTC (`YYYY-MM-DDTHH:MM:SSZ`, fixed
+/// width) via SQLite's own datetime parsing — offset forms like `+09:00`
+/// are converted to UTC, so the plain lexicographic comparisons used by
+/// `expire_due`/`cleanup` agree with time order. An unparseable input
+/// (SQLite yields NULL) fails fast instead of being stored raw, where it
+/// would silently corrupt every later comparison.
+fn normalize_utc(conn: &Connection, raw: &str) -> Result<String, AppError> {
+    let normalized: Option<String> = conn
+        .query_row(
+            "SELECT strftime('%Y-%m-%dT%H:%M:%SZ', datetime(?1))",
+            params![raw],
+            |row| row.get(0),
+        )
+        .map_err(map_sqlite_err)?;
+    normalized.ok_or_else(|| {
+        AppError::new(
+            ErrorKind::Internal,
+            format!("invalid RFC3339 timestamp: {raw}"),
+        )
+    })
+}
 
 fn map_sqlite_err(err: rusqlite::Error) -> AppError {
     AppError::new(ErrorKind::Internal, format!("sqlite error: {err}"))

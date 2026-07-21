@@ -544,3 +544,102 @@ fn concurrent_first_open_of_same_file_both_succeed() {
 
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// Reviewer-demonstrated miss: timeout_at "2024-01-01T10:00:00+09:00" is
+/// 01:00:00Z — already past now=05:00:00Z — but the raw string compares
+/// lexicographically greater than now, so an unnormalized store never
+/// expires it. Write-boundary normalization makes the string comparison
+/// agree with time order.
+#[test]
+fn expire_due_expires_offset_timeout_that_is_past_in_utc() {
+    let store = AskStore::open_in_memory().unwrap();
+    store
+        .insert_ask(sample_ask("offset-ask", "2024-01-01T10:00:00+09:00"))
+        .unwrap();
+
+    let expired = store.expire_due("2024-01-01T05:00:00Z").unwrap();
+
+    assert_eq!(expired.len(), 1);
+    assert_eq!(expired[0].ask_id, "offset-ask");
+    assert_eq!(expired[0].status, AskStatus::TimedOut);
+}
+
+#[test]
+fn insert_ask_normalizes_offset_timestamps_to_utc() {
+    let store = AskStore::open_in_memory().unwrap();
+    let mut ask = sample_ask("normalize-me", "2024-01-01T10:00:00+09:00");
+    ask.created_at = "2024-01-01T09:30:00+09:00".to_owned();
+    store.insert_ask(ask).unwrap();
+
+    let record = store.get_ask("normalize-me").unwrap().unwrap();
+    assert_eq!(record.created_at, "2024-01-01T00:30:00Z");
+    assert_eq!(record.timeout_at, "2024-01-01T01:00:00Z");
+}
+
+#[test]
+fn insert_ask_rejects_malformed_timestamp() {
+    let store = AskStore::open_in_memory().unwrap();
+
+    let err = store
+        .insert_ask(sample_ask("bad-ts", "not-a-timestamp"))
+        .expect_err("malformed timeout_at must fail fast, not be stored raw");
+    assert_eq!(err.kind, ErrorKind::Internal);
+    assert!(store.get_ask("bad-ts").unwrap().is_none());
+}
+
+#[test]
+fn try_answer_normalizes_offset_answered_at() {
+    let store = AskStore::open_in_memory().unwrap();
+    store
+        .insert_ask(sample_ask("offset-answer", "2024-01-01T01:00:00Z"))
+        .unwrap();
+
+    let accepted = store
+        .try_answer(
+            "offset-answer",
+            "choice",
+            "yes",
+            "user-1",
+            "2024-01-01T09:30:00+09:00",
+        )
+        .unwrap();
+    assert!(accepted);
+
+    let record = store.get_ask("offset-answer").unwrap().unwrap();
+    assert_eq!(record.answered_at.as_deref(), Some("2024-01-01T00:30:00Z"));
+}
+
+#[test]
+fn try_answer_rejects_malformed_answered_at() {
+    let store = AskStore::open_in_memory().unwrap();
+    store
+        .insert_ask(sample_ask("bad-answer-ts", "2024-01-01T01:00:00Z"))
+        .unwrap();
+
+    let err = store
+        .try_answer("bad-answer-ts", "choice", "yes", "user-1", "garbage")
+        .expect_err("malformed answered_at must fail fast");
+    assert_eq!(err.kind, ErrorKind::Internal);
+
+    // The failed answer must not consume the pending state.
+    let record = store.get_ask("bad-answer-ts").unwrap().unwrap();
+    assert_eq!(record.status, AskStatus::Pending);
+}
+
+#[test]
+fn expire_due_rejects_malformed_now() {
+    let store = AskStore::open_in_memory().unwrap();
+    let err = store
+        .expire_due("garbage")
+        .expect_err("malformed now must fail fast, not silently expire nothing");
+    assert_eq!(err.kind, ErrorKind::Internal);
+}
+
+#[test]
+fn cleanup_rejects_malformed_now() {
+    let store = AskStore::open_in_memory().unwrap();
+    let err = store
+        .cleanup(30, "garbage")
+        .expect_err("malformed now must fail fast, not silently delete nothing");
+    assert_eq!(err.kind, ErrorKind::Internal);
+}
