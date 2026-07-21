@@ -184,6 +184,35 @@ async fn text_button_opens_modal_with_label_wrapped_text_input() {
     );
 }
 
+/// P2-4: Discord caps a modal title at 45 characters; a longer question must
+/// be truncated to fit rather than sent verbatim and rejected by Discord.
+#[tokio::test]
+async fn text_button_opens_modal_with_title_truncated_to_45_chars() {
+    let long_question = "a".repeat(60);
+    let store = AskStore::open_in_memory().unwrap();
+    store
+        .insert_ask(NewAsk {
+            ask_id: "msg1".to_owned(),
+            channel_id: "chan1".to_owned(),
+            question: long_question.clone(),
+            options: vec!["Yes".to_owned()],
+            allow_text: true,
+            created_at: "2024-01-01T00:00:00Z".to_owned(),
+            timeout_at: "2024-01-01T01:00:00Z".to_owned(),
+        })
+        .unwrap();
+    let api = MockDiscordApi::new();
+
+    handle_interaction(&api, &store, &text_button_payload("msg1"), NOW)
+        .await
+        .unwrap();
+
+    let calls = api.interaction_calls.borrow();
+    let title = calls[0].2["data"]["title"].as_str().unwrap();
+    assert_eq!(title.chars().count(), 45);
+    assert_eq!(title, &long_question[..45]);
+}
+
 // --- (d) modal submit win / loss ---------------------------------------------
 
 #[tokio::test]

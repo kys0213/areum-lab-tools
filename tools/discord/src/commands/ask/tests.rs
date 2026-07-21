@@ -213,6 +213,21 @@ async fn create_orphans_message_when_insert_fails_after_components_patch_succeed
 }
 
 #[test]
+fn create_rejects_option_label_over_80_chars() {
+    let mut req = sample_request();
+    req.options = vec!["a".repeat(81)];
+    let err = validate_ask_create(&req).unwrap_err();
+    assert_eq!(err.kind, ErrorKind::Usage);
+}
+
+#[test]
+fn create_accepts_option_label_at_80_char_limit() {
+    let mut req = sample_request();
+    req.options = vec!["a".repeat(80)];
+    assert!(validate_ask_create(&req).is_ok());
+}
+
+#[test]
 fn create_rejects_timeout_over_30_days() {
     let mut req = sample_request();
     req.timeout_secs = 30 * 24 * 60 * 60 + 1;

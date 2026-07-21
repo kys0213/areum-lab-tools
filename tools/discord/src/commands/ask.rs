@@ -17,6 +17,10 @@ use super::wait::Sleeper;
 /// optional free-text button, so choices are capped at 4.
 const MIN_OPTIONS: usize = 1;
 const MAX_OPTIONS: usize = 4;
+/// Discord's action-row button label cap (spec §7) — enforced here so a
+/// too-long label fails fast in validation rather than surfacing as a 400
+/// from Discord after the message is already sent.
+const MAX_OPTION_LABEL_CHARS: usize = 80;
 /// Upper bound on `--timeout`: 30 days. Not just a sanity limit — a
 /// `timeout_at` past year 9999 fails `normalize_utc`'s SQLite `datetime()`
 /// parse (returns NULL), which `insert_pending_ask` surfaces as an opaque
@@ -155,6 +159,19 @@ fn validate_ask_create(req: &AskCreateRequest) -> Result<(), AppError> {
         return Err(AppError::new(
             ErrorKind::Usage,
             "--option labels must not be empty",
+        ));
+    }
+    if let Some(too_long) = req
+        .options
+        .iter()
+        .find(|opt| opt.chars().count() > MAX_OPTION_LABEL_CHARS)
+    {
+        return Err(AppError::new(
+            ErrorKind::Usage,
+            format!(
+                "--option label must be at most {MAX_OPTION_LABEL_CHARS} characters (got {}: {too_long:?})",
+                too_long.chars().count()
+            ),
         ));
     }
     if req.timeout_secs == 0 {
