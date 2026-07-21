@@ -84,9 +84,9 @@ dist-build: ## Package a release tarball into dist/: make dist-build TOOL=<name>
 		echo "error: could not read version from tools/$(TOOL)/Cargo.toml" >&2; \
 		exit 1; \
 	fi; \
-	cargo build --release -p $(TOOL) --target aarch64-apple-darwin; \
-	mkdir -p dist; \
-	tar czf "dist/$(TOOL)-$$VERSION-aarch64-apple-darwin.tar.gz" -C target/aarch64-apple-darwin/release $(TOOL); \
+	cargo build --release -p $(TOOL) --target aarch64-apple-darwin && \
+	mkdir -p dist && \
+	tar czf "dist/$(TOOL)-$$VERSION-aarch64-apple-darwin.tar.gz" -C target/aarch64-apple-darwin/release $(TOOL) && \
 	echo "created dist/$(TOOL)-$$VERSION-aarch64-apple-darwin.tar.gz"
 
 dist-tag: ## Tag + push a release: make dist-tag TOOL=<name> (needs clean tree on main)
@@ -109,6 +109,6 @@ dist-tag: ## Tag + push a release: make dist-tag TOOL=<name> (needs clean tree o
 		exit 1; \
 	fi; \
 	TAG="$(TOOL)-v$$VERSION"; \
-	git tag "$$TAG"; \
-	git push origin "$$TAG"; \
+	git tag "$$TAG" && \
+	git push origin "$$TAG" && \
 	echo "tagged and pushed $$TAG"
