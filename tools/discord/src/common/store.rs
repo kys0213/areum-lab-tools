@@ -1,14 +1,11 @@
-//! Shared SQLite-backed storage for HITL `ask` state. Both the CLI's future
-//! `ask` command and the daemon's interaction handler open the same
-//! `~/.areum/discord/discord.db` file through this module — it owns the
-//! schema and the conditional updates that resolve concurrent responses.
-//! Connection is not `Sync`; async callers (the daemon) are responsible for
-//! their own spawn_blocking/dedicated-thread pattern around an `AskStore`.
-//!
-//! Not yet wired into `commands/` — the `ask` command and daemon that consume
-//! this module land in follow-up units, so `dead_code` is allowed here until
-//! then rather than reporting the whole module unused.
-#![allow(dead_code)]
+//! Shared SQLite-backed storage for HITL `ask` state. Both the CLI's `ask`
+//! command (`commands/ask.rs`) and the daemon's interaction handler
+//! (`daemon/interactions.rs`) open the same `~/.areum/discord/discord.db`
+//! file through this module — it owns the schema and the conditional updates
+//! that resolve concurrent responses.
+//! Connection is not `Sync`; the daemon holds a single `AskStore` on one task
+//! across `.await` points rather than sharing it across tasks (see
+//! `daemon/gateway.rs::run`), so no spawn_blocking/locking wrapper is needed.
 
 use std::path::Path;
 
@@ -117,7 +114,10 @@ impl AskStore {
     }
 
     /// Opens an in-memory store for tests. WAL mode is meaningless for
-    /// `:memory:` databases, so it's skipped here.
+    /// `:memory:` databases, so it's skipped here. `cfg(test)`-only: every
+    /// caller is a test, so it would otherwise report as dead code in a
+    /// non-test build.
+    #[cfg(test)]
     pub(crate) fn open_in_memory() -> Result<AskStore, AppError> {
         let mut conn = Connection::open_in_memory().map_err(map_sqlite_err)?;
         migrate(&mut conn)?;
