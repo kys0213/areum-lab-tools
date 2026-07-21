@@ -2,10 +2,20 @@
 //! process. The CLI and daemon never talk directly; this module only manages
 //! the OS process (spawn/detach, SIGTERM) and the pidfile that records it.
 //!
+//! Pidfile ownership: only the foreground runtime ([`run_foreground`]) ever
+//! writes the pidfile, via the atomic [`acquire_pidfile`] guard — whether it
+//! is running because the user passed `--foreground` directly, or because
+//! [`start_background`] spawned it as a detached child. The background
+//! spawner itself never writes the pidfile; its pre-spawn liveness check is
+//! a fast, best-effort UX rejection only. This makes `acquire_pidfile` the
+//! single defense against two daemons running at once, closing the
+//! read-check-then-write race a spawner-side write would have.
+//!
 //! Unix-only: liveness and shutdown use `kill(2)` (`libc`). The heavy I/O
 //! (spawn, signal, gateway loop) is exercised end-to-end rather than
 //! unit-tested; the pure seams (pid parsing, pidfile round-trip, liveness of a
-//! known pid) are tested inline.
+//! known pid, and the `acquire_pidfile`/`release_own_pidfile` guard) are
+//! tested inline.
 
 use std::path::Path;
 use std::process::Stdio;
@@ -35,23 +45,47 @@ pub(crate) async fn run_daemon_start(
     foreground: bool,
 ) -> Result<Payload, AppError> {
     if foreground {
-        run_foreground(db_path, token).await
+        run_foreground(db_path, pid_path, token).await
     } else {
         start_background(pid_path, config_flag, &token)
     }
 }
 
-async fn run_foreground(db_path: &Path, token: String) -> Result<Payload, AppError> {
+/// The daemon runtime's single entry point regardless of how it was launched
+/// (`--foreground` directly, or as [`start_background`]'s detached child).
+/// Atomically claims the pidfile before touching the store or gateway, so a
+/// second instance is rejected here rather than racing a spawner-side check.
+async fn run_foreground(
+    db_path: &Path,
+    pid_path: &Path,
+    token: String,
+) -> Result<Payload, AppError> {
+    acquire_pidfile(pid_path)?;
     let api = HttpDiscordApi::new(token.clone());
-    let store = AskStore::open(db_path)?;
-    // Blocks until SIGTERM (graceful) or a fatal gateway close (Err).
-    crate::daemon::run(&api, &store, token).await?;
+    let store = match AskStore::open(db_path) {
+        Ok(store) => store,
+        Err(err) => {
+            release_own_pidfile(pid_path);
+            return Err(err);
+        }
+    };
+    // Blocks until SIGTERM (graceful) or a fatal gateway close (Err). Either
+    // way this process is the pidfile's sole owner until now, so release it
+    // on both outcomes before propagating.
+    let run_result = crate::daemon::run(&api, &store, token).await;
+    release_own_pidfile(pid_path);
+    run_result?;
     Ok(Payload::DaemonStart(DaemonStartData {
         pid: std::process::id(),
         foreground: true,
     }))
 }
 
+/// Spawns the detached child and returns immediately; it never writes the
+/// pidfile itself (see module doc). The liveness check here is a fast,
+/// best-effort rejection for obvious duplicate calls — not the real guard,
+/// which is the child's own [`acquire_pidfile`] once it reaches
+/// [`run_foreground`].
 fn start_background(
     pid_path: &Path,
     config_flag: Option<&str>,
@@ -66,11 +100,89 @@ fn start_background(
         ));
     }
     let child_pid = spawn_detached(config_flag, token)?;
-    write_pidfile(pid_path, child_pid as i32)?;
     Ok(Payload::DaemonStart(DaemonStartData {
         pid: child_pid,
         foreground: false,
     }))
+}
+
+/// Atomically claims the pidfile for this process via `O_CREAT|O_EXCL`, so at
+/// most one process can win the create. If the file already exists, its
+/// recorded pid decides the outcome: alive means a real duplicate (usage
+/// error); dead/unparsable means a stale leftover, which is removed before
+/// retrying the create exactly once. A second failure after clearing a stale
+/// entry means we lost a genuine race to another acquirer and is treated as
+/// an internal error rather than looped on.
+fn acquire_pidfile(path: &Path) -> Result<(), AppError> {
+    match try_create_pidfile(path) {
+        Ok(()) => Ok(()),
+        Err(PidfileCreateError::AlreadyExists) => match read_pidfile(path)? {
+            Some(pid) if pid_is_alive(pid) => Err(AppError::new(
+                ErrorKind::Usage,
+                format!("daemon is already running (pid {pid})"),
+            )),
+            _ => {
+                remove_pidfile(path)?;
+                try_create_pidfile(path).map_err(|_| {
+                    AppError::new(
+                        ErrorKind::Internal,
+                        format!(
+                            "failed to acquire pidfile {} after clearing a stale entry",
+                            path.display()
+                        ),
+                    )
+                })
+            }
+        },
+        Err(PidfileCreateError::Io(e)) => Err(AppError::new(
+            ErrorKind::Internal,
+            format!("failed to create pidfile {}: {e}", path.display()),
+        )),
+    }
+}
+
+enum PidfileCreateError {
+    AlreadyExists,
+    Io(std::io::Error),
+}
+
+/// The `O_CREAT|O_EXCL` primitive `acquire_pidfile` builds its retry-once
+/// policy on: a bare create-and-write with no read-then-write window.
+fn try_create_pidfile(path: &Path) -> Result<(), PidfileCreateError> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(PidfileCreateError::Io)?;
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(|e| {
+            if e.kind() == std::io::ErrorKind::AlreadyExists {
+                PidfileCreateError::AlreadyExists
+            } else {
+                PidfileCreateError::Io(e)
+            }
+        })?;
+    use std::io::Write;
+    write!(file, "{}", std::process::id()).map_err(PidfileCreateError::Io)
+}
+
+/// Removes the pidfile only if it currently records *this* process's pid.
+/// Never deletes another instance's entry — the acquire/release pair must
+/// stay symmetric per-owner, not "whoever exits last wins".
+fn release_own_pidfile(path: &Path) {
+    let own_pid = std::process::id() as i32;
+    match read_pidfile(path) {
+        Ok(Some(pid)) if pid == own_pid => {
+            if let Err(err) = remove_pidfile(path) {
+                eprintln!(
+                    "daemon: failed to remove pidfile on exit: {}",
+                    err.to_human()
+                );
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Re-execs this binary as `daemon start --foreground`, detached: null stdio
@@ -196,6 +308,10 @@ fn parse_pid(contents: &str) -> Option<i32> {
     contents.trim().parse::<i32>().ok().filter(|&p| p > 0)
 }
 
+/// Test-only fixture writer: production code only ever writes the pidfile
+/// through the atomic [`try_create_pidfile`] inside [`acquire_pidfile`]; this
+/// unconditional write lets tests set up pre-existing pidfile states.
+#[cfg(test)]
 fn write_pidfile(path: &Path, pid: i32) -> Result<(), AppError> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| {
