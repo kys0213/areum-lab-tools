@@ -567,6 +567,167 @@ fn concurrent_first_open_of_same_file_both_succeed() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// The click's connection commits first: a subsequent expire sweep (its own
+/// connection, after the timeout has passed) must not touch an ask the click
+/// already resolved — `expire_due`'s `WHERE status = 'pending'` guard is the
+/// same one `try_answer` relies on, so a resolved row is simply excluded.
+#[test]
+fn click_win_leaves_ask_untouched_by_later_expire_sweep() {
+    let dir = unique_store_dir("click-then-expire");
+    let db_path = dir.join("discord.db");
+
+    let setup = AskStore::open(&db_path).unwrap();
+    setup
+        .insert_ask(sample_ask("race-click-first", "2024-01-01T00:00:00Z"))
+        .unwrap();
+    drop(setup);
+
+    let clicker = AskStore::open(&db_path).unwrap();
+    assert!(
+        clicker
+            .try_answer(
+                "race-click-first",
+                "choice",
+                "yes",
+                "user-a",
+                "2024-01-01T00:00:01Z",
+            )
+            .unwrap()
+    );
+    drop(clicker);
+
+    let sweeper = AskStore::open(&db_path).unwrap();
+    let expired = sweeper.expire_due("2024-01-01T01:00:00Z").unwrap();
+    assert!(
+        expired.is_empty(),
+        "expire sweep must not report an ask the click already resolved"
+    );
+
+    let record = sweeper.get_ask("race-click-first").unwrap().unwrap();
+    assert_eq!(record.status, AskStatus::Answered);
+    assert_eq!(record.answered_by.as_deref(), Some("user-a"));
+
+    drop(sweeper);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// The expire sweep commits first, on its own connection: a click arriving
+/// late on a separate connection must lose — `try_answer` sees a row that is
+/// no longer `pending` and returns `false` rather than clobbering the
+/// timed-out state.
+#[test]
+fn expire_win_rejects_later_click_on_separate_connection() {
+    let dir = unique_store_dir("expire-then-click");
+    let db_path = dir.join("discord.db");
+
+    let setup = AskStore::open(&db_path).unwrap();
+    setup
+        .insert_ask(sample_ask("race-expire-first", "2024-01-01T00:00:00Z"))
+        .unwrap();
+    drop(setup);
+
+    let sweeper = AskStore::open(&db_path).unwrap();
+    let expired = sweeper.expire_due("2024-01-01T01:00:00Z").unwrap();
+    assert_eq!(expired.len(), 1);
+    drop(sweeper);
+
+    let clicker = AskStore::open(&db_path).unwrap();
+    let won = clicker
+        .try_answer(
+            "race-expire-first",
+            "choice",
+            "yes",
+            "user-a",
+            "2024-01-01T01:00:01Z",
+        )
+        .unwrap();
+    assert!(!won, "a click arriving after the expire sweep must lose");
+
+    let record = clicker.get_ask("race-expire-first").unwrap().unwrap();
+    assert_eq!(record.status, AskStatus::TimedOut);
+    assert_eq!(record.answered_by, None);
+
+    drop(clicker);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// True concurrent race between a click and the expire sweep on independent
+/// connections (not sequenced by the test) — the real shape of the daemon's
+/// gateway-callback thread racing its own periodic expire task. Mirrors
+/// `two_connections_racing_try_answer_exactly_one_wins`'s pattern for the
+/// click-vs-click race, but for click-vs-expire.
+#[test]
+fn two_connections_racing_click_and_expire_exactly_one_wins() {
+    let dir = unique_store_dir("two-conn-click-vs-expire");
+    let db_path = dir.join("discord.db");
+
+    let setup = AskStore::open(&db_path).unwrap();
+    setup
+        .insert_ask(sample_ask("race-concurrent", "2024-01-01T00:00:00Z"))
+        .unwrap();
+    drop(setup);
+
+    let path_click = db_path.clone();
+    let path_expire = db_path.clone();
+
+    let click_handle = std::thread::spawn(move || {
+        let store = AskStore::open(&path_click).unwrap();
+        store
+            .try_answer(
+                "race-concurrent",
+                "choice",
+                "yes",
+                "user-a",
+                "2024-01-01T01:00:00Z",
+            )
+            .unwrap()
+    });
+    let expire_handle = std::thread::spawn(move || {
+        let store = AskStore::open(&path_expire).unwrap();
+        store.expire_due("2024-01-01T01:00:00Z").unwrap().len()
+    });
+
+    let click_won = click_handle.join().unwrap();
+    let expired_count = expire_handle.join().unwrap();
+
+    // Exactly one side must have transitioned the row — never both, never
+    // neither.
+    assert_ne!(
+        click_won,
+        expired_count == 1,
+        "exactly one of the click and the expire sweep must win the race"
+    );
+
+    let verify = AskStore::open(&db_path).unwrap();
+    let record = verify.get_ask("race-concurrent").unwrap().unwrap();
+    if click_won {
+        assert_eq!(record.status, AskStatus::Answered);
+    } else {
+        assert_eq!(record.status, AskStatus::TimedOut);
+    }
+
+    drop(verify);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Cross-module contract: `now_rfc3339()`'s output must be a shape
+/// `normalize_utc` accepts unchanged. The two are tested independently
+/// elsewhere (`common::time`'s format tests, this module's offset-normalizing
+/// tests); this pins the boundary between them so a format drift in either
+/// one is caught here even if each unit's own tests still pass.
+#[test]
+fn now_rfc3339_roundtrips_unchanged_through_insert_ask() {
+    let store = AskStore::open_in_memory().unwrap();
+    let now = crate::common::time::now_rfc3339();
+    let mut ask = sample_ask("now-roundtrip", &now);
+    ask.created_at = now.clone();
+    store.insert_ask(ask).unwrap();
+
+    let record = store.get_ask("now-roundtrip").unwrap().unwrap();
+    assert_eq!(record.created_at, now);
+    assert_eq!(record.timeout_at, now);
+}
+
 /// Reviewer-demonstrated miss: timeout_at "2024-01-01T10:00:00+09:00" is
 /// 01:00:00Z — already past now=05:00:00Z — but the raw string compares
 /// lexicographically greater than now, so an unnormalized store never
