@@ -99,6 +99,36 @@ async fn choice_win_adopts_answer_and_updates_message() {
     assert!(payload["data"]["content"].as_str().unwrap().contains("Yes"));
 }
 
+/// P2-2: documents the intended (not accidental) behavior when the callback
+/// itself fails after the answer was already adopted. `try_answer` commits
+/// before the callback (module doc's 3-second rule), so a callback failure
+/// (expired token here) must not undo that adoption — it only propagates for
+/// the gateway loop to log, per `respond`'s doc comment.
+#[tokio::test]
+async fn choice_win_persists_the_answer_even_when_the_callback_fails() {
+    let store = store_with_pending("msg1", &["Yes", "No"], "2024-01-01T01:00:00Z");
+    let api = MockDiscordApi::new();
+    api.interaction_responses
+        .borrow_mut()
+        .push_back(Err(crate::common::error::AppError::new(
+            crate::common::error::ErrorKind::Api,
+            "interaction token expired",
+        )));
+
+    let err = handle_interaction(&api, &store, &choice_payload("msg1", 0), NOW)
+        .await
+        .expect_err("a failed callback must propagate for the gateway to log");
+    assert_eq!(err.kind, crate::common::error::ErrorKind::Api);
+
+    // The answer was adopted before the callback ran, so it stands despite
+    // the callback's own failure — the user's Discord client may show no
+    // confirmation, but `ask result`/`ask wait` read the correct outcome.
+    let record = store.get_ask("msg1").unwrap().unwrap();
+    assert_eq!(record.status, crate::common::store::AskStatus::Answered);
+    assert_eq!(record.value.as_deref(), Some("Yes"));
+    assert_eq!(record.answered_by.as_deref(), Some("user1"));
+}
+
 // --- (b) choice button loses (already resolved) ------------------------------
 
 #[tokio::test]

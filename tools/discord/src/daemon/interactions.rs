@@ -324,6 +324,14 @@ async fn handle_modal_submit(
     respond(api, ctx, &response).await
 }
 
+/// Sends the interaction-response callback. By design this runs *after* any
+/// `try_answer`/`try_timeout` write above it (module doc: the 3-second rule),
+/// so a failure here (expired token, network error) is reported to the
+/// caller for logging but never rolls back an already-adopted answer — the
+/// store's decision is final once `try_answer` commits. The practical effect
+/// is that the human's click may render as a failure in their Discord client
+/// (no confirmation UI) even though the answer was accepted; `ask result`/
+/// `ask wait` still report it correctly since they read the store directly.
 async fn respond(
     api: &impl DiscordApi,
     ctx: &Ctx<'_>,
