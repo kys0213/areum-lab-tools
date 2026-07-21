@@ -12,7 +12,8 @@
 
 use std::path::Path;
 
-use rusqlite::{Connection, OptionalExtension};
+use rusqlite::types::Type;
+use rusqlite::{Connection, OptionalExtension, Row, params};
 
 use crate::common::error::{AppError, ErrorKind};
 
@@ -111,36 +112,152 @@ impl AskStore {
         Ok(AskStore { conn })
     }
 
-    pub(crate) fn insert_ask(&self, _ask: NewAsk) -> Result<(), AppError> {
-        todo!("INSERT a pending ask row")
+    /// Inserts a new `pending` ask. `options` is stored as a JSON array.
+    pub(crate) fn insert_ask(&self, ask: NewAsk) -> Result<(), AppError> {
+        let options_json = serde_json::to_string(&ask.options).map_err(|e| {
+            AppError::new(
+                ErrorKind::Internal,
+                format!("failed to serialize ask options: {e}"),
+            )
+        })?;
+        self.conn
+            .execute(
+                "INSERT INTO asks (
+                    ask_id, channel_id, question, options, allow_text,
+                    status, created_at, timeout_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, 'pending', ?6, ?7)",
+                params![
+                    ask.ask_id,
+                    ask.channel_id,
+                    ask.question,
+                    options_json,
+                    ask.allow_text,
+                    ask.created_at,
+                    ask.timeout_at,
+                ],
+            )
+            .map_err(map_sqlite_err)?;
+        Ok(())
     }
 
-    pub(crate) fn get_ask(&self, _ask_id: &str) -> Result<Option<AskRecord>, AppError> {
-        todo!("SELECT a single ask row by id")
+    pub(crate) fn get_ask(&self, ask_id: &str) -> Result<Option<AskRecord>, AppError> {
+        self.conn
+            .query_row(SELECT_ASK_SQL, params![ask_id], row_to_record)
+            .optional()
+            .map_err(map_sqlite_err)
     }
 
+    /// Adopts `(kind, value, answered_by, answered_at)` as the ask's answer
+    /// iff it is still `pending` — the `WHERE status = 'pending'` guard is
+    /// the sole concurrency-resolution point: whichever caller's UPDATE
+    /// commits first flips the row and wins the race, so a losing caller
+    /// simply gets `false` back rather than corrupting the winner's answer.
     pub(crate) fn try_answer(
         &self,
-        _ask_id: &str,
-        _kind: &str,
-        _value: &str,
-        _answered_by: &str,
-        _answered_at: &str,
+        ask_id: &str,
+        kind: &str,
+        value: &str,
+        answered_by: &str,
+        answered_at: &str,
     ) -> Result<bool, AppError> {
-        todo!("conditional UPDATE ... WHERE status = 'pending'; return whether it won the race")
+        let changed = self
+            .conn
+            .execute(
+                "UPDATE asks SET status = 'answered', kind = ?1, value = ?2,
+                    answered_by = ?3, answered_at = ?4
+                 WHERE ask_id = ?5 AND status = 'pending'",
+                params![kind, value, answered_by, answered_at, ask_id],
+            )
+            .map_err(map_sqlite_err)?;
+        Ok(changed == 1)
     }
 
-    pub(crate) fn try_timeout(&self, _ask_id: &str) -> Result<bool, AppError> {
-        todo!("conditional UPDATE ... WHERE status = 'pending' to timed_out")
+    /// Same conditional-update pattern as `try_answer`, transitioning to
+    /// `timed_out` instead. Returns `false` if the ask was no longer pending.
+    pub(crate) fn try_timeout(&self, ask_id: &str) -> Result<bool, AppError> {
+        let changed = self
+            .conn
+            .execute(
+                "UPDATE asks SET status = 'timed_out' WHERE ask_id = ?1 AND status = 'pending'",
+                params![ask_id],
+            )
+            .map_err(map_sqlite_err)?;
+        Ok(changed == 1)
     }
 
-    pub(crate) fn expire_due(&self, _now: &str) -> Result<Vec<AskRecord>, AppError> {
-        todo!("transition overdue pending asks to timed_out and return them")
+    /// Transitions every `pending` ask whose `timeout_at` has passed `now`
+    /// to `timed_out` and returns the transitioned records (for the daemon
+    /// to disable their buttons). Each transition reuses the same
+    /// conditional UPDATE as `try_timeout`, so a `try_answer` that lands
+    /// concurrently on one of the candidate rows still wins cleanly.
+    pub(crate) fn expire_due(&self, now: &str) -> Result<Vec<AskRecord>, AppError> {
+        let due_ids: Vec<String> = {
+            let mut stmt = self
+                .conn
+                .prepare("SELECT ask_id FROM asks WHERE status = 'pending' AND timeout_at <= ?1")
+                .map_err(map_sqlite_err)?;
+            stmt.query_map(params![now], |row| row.get(0))
+                .map_err(map_sqlite_err)?
+                .collect::<rusqlite::Result<Vec<String>>>()
+                .map_err(map_sqlite_err)?
+        };
+
+        let mut expired = Vec::with_capacity(due_ids.len());
+        for ask_id in &due_ids {
+            if self.try_timeout(ask_id)?
+                && let Some(record) = self.get_ask(ask_id)?
+            {
+                expired.push(record);
+            }
+        }
+        Ok(expired)
     }
 
-    pub(crate) fn cleanup(&self, _retention_days: u32, _now: &str) -> Result<usize, AppError> {
-        todo!("delete asks older than retention_days, return the count removed")
+    /// Deletes asks whose `created_at` is older than `retention_days` before
+    /// `now`, returning the count removed. The day-arithmetic cutoff is
+    /// computed by SQLite's own `datetime()` modifiers rather than a date
+    /// library, on the invariant that `created_at`/`now` are well-formed
+    /// RFC3339 UTC strings (the convention this whole crate stores
+    /// timestamps in).
+    pub(crate) fn cleanup(&self, retention_days: u32, now: &str) -> Result<usize, AppError> {
+        let cutoff_modifier = format!("-{retention_days} days");
+        self.conn
+            .execute(
+                "DELETE FROM asks WHERE datetime(created_at) < datetime(?1, ?2)",
+                params![now, cutoff_modifier],
+            )
+            .map_err(map_sqlite_err)
     }
+}
+
+const SELECT_ASK_SQL: &str = "SELECT
+    ask_id, channel_id, question, options, allow_text, status,
+    kind, value, answered_by, created_at, timeout_at, answered_at
+    FROM asks WHERE ask_id = ?1";
+
+fn row_to_record(row: &Row<'_>) -> rusqlite::Result<AskRecord> {
+    let options_json: String = row.get(3)?;
+    let options: Vec<String> = serde_json::from_str(&options_json)
+        .map_err(|e| rusqlite::Error::FromSqlConversionFailure(3, Type::Text, Box::new(e)))?;
+
+    let status_raw: String = row.get(5)?;
+    let status = AskStatus::parse(&status_raw)
+        .map_err(|msg| rusqlite::Error::FromSqlConversionFailure(5, Type::Text, msg.into()))?;
+
+    Ok(AskRecord {
+        ask_id: row.get(0)?,
+        channel_id: row.get(1)?,
+        question: row.get(2)?,
+        options,
+        allow_text: row.get(4)?,
+        status,
+        kind: row.get(6)?,
+        value: row.get(7)?,
+        answered_by: row.get(8)?,
+        created_at: row.get(9)?,
+        timeout_at: row.get(10)?,
+        answered_at: row.get(11)?,
+    })
 }
 
 /// Applies pending schema migrations, tracked via a single-row
