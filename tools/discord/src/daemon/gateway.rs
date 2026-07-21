@@ -23,7 +23,7 @@ use crate::common::error::{AppError, ErrorKind};
 use crate::common::store::AskStore;
 use crate::common::time::now_rfc3339;
 
-use super::interactions::{expire_and_disable, handle_interaction};
+use super::interactions::{ExpireRetryQueue, expire_and_disable, handle_interaction};
 
 /// How often to scan for asks whose `timeout_at` has passed. A few seconds is
 /// timely enough for a human-in-the-loop deadline without busy-polling.
@@ -54,6 +54,9 @@ pub(crate) async fn run(
     })?;
     let mut expire_tick = tokio::time::interval(EXPIRE_POLL_INTERVAL);
     let mut cleanup_tick = tokio::time::interval(CLEANUP_INTERVAL);
+    // Lives across ticks (not re-created per tick) so a transient edit
+    // failure queued on one tick is retried on the next.
+    let mut expire_retry_queue = ExpireRetryQueue::new();
 
     loop {
         tokio::select! {
@@ -64,7 +67,7 @@ pub(crate) async fn run(
                 return Ok(());
             }
             _ = expire_tick.tick() => {
-                if let Err(err) = expire_and_disable(api, store, &now_rfc3339()).await {
+                if let Err(err) = expire_and_disable(api, store, &now_rfc3339(), &mut expire_retry_queue).await {
                     eprintln!("daemon: expire pass failed: {}", err.to_human());
                 }
             }

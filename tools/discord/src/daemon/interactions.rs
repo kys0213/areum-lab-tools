@@ -119,23 +119,117 @@ pub(crate) async fn handle_interaction(
     }
 }
 
+/// Bounded budget for [`ExpireRetryQueue`] — an edit that still fails after
+/// this many attempts (across ticks) is abandoned rather than retried
+/// forever.
+const MAX_EDIT_ATTEMPTS: u32 = 3;
+
+/// One message whose button-disable edit failed and is due to be retried on
+/// a later `expire_and_disable` tick.
+struct PendingEdit {
+    channel_id: String,
+    ask_id: String,
+    /// Attempts already made (including the one that just failed).
+    attempts: u32,
+}
+
+/// Carries button-disable edits that failed transiently (rate limit, network,
+/// 5xx) across `expire_and_disable` ticks, so one failure no longer strands
+/// the row's buttons forever — the ask itself already transitioned to
+/// `timed_out` in `expire_due` regardless of edit outcome; this queue only
+/// affects the best-effort follow-up REST edit.
+///
+/// In-memory only: the daemon owns one instance for its process lifetime (see
+/// `daemon::gateway::run`). A restart drops any queued retries, which is
+/// acceptable — the row is already `timed_out`, so a lost retry only means a
+/// stale button lingers on a message rather than a data-correctness issue.
+#[derive(Default)]
+pub(crate) struct ExpireRetryQueue {
+    pending: Vec<PendingEdit>,
+}
+
+impl ExpireRetryQueue {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+}
+
 /// Expires every due ask and disables its message's buttons with the bot token.
 /// The interaction token is unusable here (a timed-out ask was never clicked,
 /// so no token exists / it has expired), so this edits the message via REST.
 /// `ask_id` is the Discord message id (data model), so it doubles as the
 /// message to edit.
+///
+/// Each record's edit is handled independently — one message's edit failing
+/// (deleted message, rate limit, transient API error) must not stop the rest
+/// of the batch from being disabled, and must not cost the row its one shot at
+/// `expire_due`'s `WHERE status = 'pending'` guard (it already flipped to
+/// `timed_out` before any edit runs). A transient failure is queued in
+/// `retry_queue` for the next tick (bounded by [`MAX_EDIT_ATTEMPTS`]); a 404
+/// (message deleted) is a permanent failure and is never queued.
+///
+/// Returns the count of asks newly transitioned to `timed_out` this tick —
+/// retry-queue bookkeeping does not affect this count.
 pub(crate) async fn expire_and_disable(
     api: &impl DiscordApi,
     store: &AskStore,
     now: &str,
+    retry_queue: &mut ExpireRetryQueue,
 ) -> Result<usize, AppError> {
     let expired = store.expire_due(now)?;
+    let newly_expired = expired.len();
     let disabled_components = serde_json::json!([]);
-    for record in &expired {
-        api.edit_message_components(&record.channel_id, &record.ask_id, &disabled_components)
-            .await?;
+
+    let mut targets: Vec<PendingEdit> = expired
+        .into_iter()
+        .map(|record| PendingEdit {
+            channel_id: record.channel_id,
+            ask_id: record.ask_id,
+            attempts: 0,
+        })
+        .collect();
+    targets.append(&mut retry_queue.pending);
+
+    let mut still_pending = Vec::new();
+    for mut target in targets {
+        let outcome = api
+            .edit_message_components(&target.channel_id, &target.ask_id, &disabled_components)
+            .await;
+        match outcome {
+            Ok(()) => {}
+            Err(err) if err.http_status == Some(404) => {
+                // The message is gone; no amount of retrying fixes that.
+                eprintln!(
+                    "daemon: dropping button-disable for ask {} (message deleted): {}",
+                    target.ask_id,
+                    err.to_human()
+                );
+            }
+            Err(err) => {
+                target.attempts += 1;
+                if target.attempts >= MAX_EDIT_ATTEMPTS {
+                    eprintln!(
+                        "daemon: giving up on button-disable for ask {} after {} attempts: {}",
+                        target.ask_id,
+                        target.attempts,
+                        err.to_human()
+                    );
+                } else {
+                    eprintln!(
+                        "daemon: button-disable for ask {} failed (attempt {}/{}), retrying next tick: {}",
+                        target.ask_id,
+                        target.attempts,
+                        MAX_EDIT_ATTEMPTS,
+                        err.to_human()
+                    );
+                    still_pending.push(target);
+                }
+            }
+        }
     }
-    Ok(expired.len())
+    retry_queue.pending = still_pending;
+
+    Ok(newly_expired)
 }
 
 async fn handle_choice(

@@ -8,4 +8,4 @@ pub(crate) use gateway::run;
 // `gateway.rs` (the only production caller) reaches these via
 // `super::interactions` directly, so this path is test-only.
 #[cfg(test)]
-pub(crate) use interactions::{expire_and_disable, handle_interaction};
+pub(crate) use interactions::{ExpireRetryQueue, expire_and_disable, handle_interaction};

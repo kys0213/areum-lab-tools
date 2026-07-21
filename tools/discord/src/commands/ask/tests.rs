@@ -642,7 +642,14 @@ async fn wait_local_expiry_and_daemon_sweep_race_without_diverging() {
         tokio::runtime::Runtime::new().unwrap().block_on(async {
             let store = AskStore::open(&expire_db_path).unwrap();
             let api = MockDiscordApi::new();
-            crate::daemon::expire_and_disable(&api, &store, "2024-01-01T00:00:10Z").await
+            let mut retry_queue = crate::daemon::ExpireRetryQueue::new();
+            crate::daemon::expire_and_disable(
+                &api,
+                &store,
+                "2024-01-01T00:00:10Z",
+                &mut retry_queue,
+            )
+            .await
         })
     });
 

@@ -461,8 +461,11 @@ async fn expire_and_disable_transitions_due_asks_and_edits_messages() {
         })
         .unwrap();
     let api = MockDiscordApi::new();
+    let mut retry_queue = ExpireRetryQueue::new();
 
-    let count = expire_and_disable(&api, &store, NOW).await.unwrap();
+    let count = expire_and_disable(&api, &store, NOW, &mut retry_queue)
+        .await
+        .unwrap();
 
     assert_eq!(count, 1);
     assert_eq!(
@@ -481,11 +484,156 @@ async fn expire_and_disable_transitions_due_asks_and_edits_messages() {
 async fn expire_and_disable_noop_when_nothing_due() {
     let store = store_with_pending("msg1", &["Yes"], "2024-01-01T09:00:00Z");
     let api = MockDiscordApi::new();
+    let mut retry_queue = ExpireRetryQueue::new();
 
-    let count = expire_and_disable(&api, &store, NOW).await.unwrap();
+    let count = expire_and_disable(&api, &store, NOW, &mut retry_queue)
+        .await
+        .unwrap();
 
     assert_eq!(count, 0);
     assert!(api.edit_components_calls.borrow().is_empty());
+}
+
+/// P1 regression: a single failing edit in the middle of a batch must not
+/// stop the rest of the batch from being disabled, and each outcome must be
+/// classified correctly — a permanent 404 is dropped, a transient failure
+/// (429 here) is queued and retried on the next tick until it succeeds.
+#[tokio::test]
+async fn expire_and_disable_isolates_failures_and_retries_transient_ones_next_tick() {
+    let store = AskStore::open_in_memory().unwrap();
+    for id in ["a1", "a2", "a3", "a4"] {
+        store
+            .insert_ask(NewAsk {
+                ask_id: id.to_owned(),
+                channel_id: "chan1".to_owned(),
+                question: "q".to_owned(),
+                options: vec!["Yes".to_owned()],
+                allow_text: false,
+                created_at: "2024-01-01T00:00:00Z".to_owned(),
+                timeout_at: "2024-01-01T00:00:05Z".to_owned(),
+            })
+            .unwrap();
+    }
+    let api = MockDiscordApi::new();
+    api.edit_components_responses.borrow_mut().extend([
+        Ok(()),
+        Err(AppError {
+            kind: ErrorKind::Api,
+            message: "message deleted".to_owned(),
+            http_status: Some(404),
+            retry_after_ms: None,
+        }),
+        Err(AppError {
+            kind: ErrorKind::RateLimit,
+            message: "rate limited".to_owned(),
+            http_status: Some(429),
+            retry_after_ms: Some(500),
+        }),
+        Ok(()),
+    ]);
+    let mut retry_queue = ExpireRetryQueue::new();
+
+    // --- tick 1: all four transition; four edits attempted this tick -------
+    let count = expire_and_disable(&api, &store, NOW, &mut retry_queue)
+        .await
+        .unwrap();
+    assert_eq!(count, 4, "all four overdue asks must transition this tick");
+    for id in ["a1", "a2", "a3", "a4"] {
+        assert_eq!(
+            store.get_ask(id).unwrap().unwrap().status,
+            crate::common::store::AskStatus::TimedOut,
+            "{id} must transition regardless of its edit outcome"
+        );
+    }
+    let calls_after_tick1 = api.edit_components_calls.borrow().len();
+    assert_eq!(
+        calls_after_tick1, 4,
+        "one edit attempt per due ask this tick"
+    );
+    // Calls are recorded in the same order responses were popped (single
+    // sequential loop, no concurrency), so index 1 is the 404 call and index
+    // 2 is the 429 call regardless of which ask_id landed there.
+    let ask_that_got_404 = api.edit_components_calls.borrow()[1].1.clone();
+    let ask_that_got_429 = api.edit_components_calls.borrow()[2].1.clone();
+
+    // --- tick 2: nothing newly due; only the queued 429 retry fires --------
+    let count = expire_and_disable(&api, &store, NOW, &mut retry_queue)
+        .await
+        .unwrap();
+    assert_eq!(count, 0, "no ask newly transitions on this tick");
+    let calls_after_tick2_len = api.edit_components_calls.borrow().len();
+    let last_call_ask_id = api.edit_components_calls.borrow().last().unwrap().1.clone();
+    assert_eq!(
+        calls_after_tick2_len,
+        calls_after_tick1 + 1,
+        "exactly one retried edit (the 429 case) — the 404 case must not be retried"
+    );
+    assert_eq!(
+        last_call_ask_id, ask_that_got_429,
+        "the retried edit must be for the ask that got the transient (429) failure"
+    );
+    assert_ne!(
+        last_call_ask_id, ask_that_got_404,
+        "the permanently-failed (404) ask must never be retried"
+    );
+
+    // --- tick 3: the successful retry must not be retried again -------------
+    let count = expire_and_disable(&api, &store, NOW, &mut retry_queue)
+        .await
+        .unwrap();
+    assert_eq!(count, 0);
+    assert_eq!(
+        api.edit_components_calls.borrow().len(),
+        calls_after_tick1 + 1,
+        "the retry queue must be empty after the 429 case's successful retry"
+    );
+}
+
+/// A transient failure that keeps failing must eventually be abandoned
+/// (bounded retry budget) rather than retried on every tick forever.
+#[tokio::test]
+async fn expire_and_disable_gives_up_after_max_attempts() {
+    let store = store_with_pending("msg1", &["Yes"], "2024-01-01T00:00:05Z");
+    let api = MockDiscordApi::new();
+    let always_fails = || {
+        Err(AppError {
+            kind: ErrorKind::Api,
+            message: "server error".to_owned(),
+            http_status: Some(500),
+            retry_after_ms: None,
+        })
+    };
+    api.edit_components_responses.borrow_mut().extend([
+        always_fails(),
+        always_fails(),
+        always_fails(),
+    ]);
+    let mut retry_queue = ExpireRetryQueue::new();
+
+    // Ticks 1-3: each attempt fails and is retried up to MAX_EDIT_ATTEMPTS.
+    for _ in 0..3 {
+        expire_and_disable(&api, &store, NOW, &mut retry_queue)
+            .await
+            .unwrap();
+    }
+    assert_eq!(api.edit_components_calls.borrow().len(), 3);
+
+    // Tick 4: the budget is exhausted, so no further attempt is made even
+    // though no response is queued (a queued response would be required if
+    // the mock were actually invoked again).
+    expire_and_disable(&api, &store, NOW, &mut retry_queue)
+        .await
+        .unwrap();
+    assert_eq!(
+        api.edit_components_calls.borrow().len(),
+        3,
+        "must stop retrying once MAX_EDIT_ATTEMPTS is reached"
+    );
+    assert_eq!(
+        store.get_ask("msg1").unwrap().unwrap().status,
+        crate::common::store::AskStatus::TimedOut,
+        "the ask itself stays timed_out regardless of the abandoned edit"
+    );
 }
 
 /// The click-vs-expire race, from the full `handle_interaction` side: once
@@ -496,8 +644,11 @@ async fn expire_and_disable_noop_when_nothing_due() {
 async fn choice_after_expire_receives_ephemeral_and_leaves_timed_out_record() {
     let store = store_with_pending("msg1", &["Yes"], "2024-01-01T00:00:05Z");
     let api = MockDiscordApi::new();
+    let mut retry_queue = ExpireRetryQueue::new();
 
-    let expired = expire_and_disable(&api, &store, NOW).await.unwrap();
+    let expired = expire_and_disable(&api, &store, NOW, &mut retry_queue)
+        .await
+        .unwrap();
     assert_eq!(expired, 1);
     api.edit_components_calls.borrow_mut().clear();
 
