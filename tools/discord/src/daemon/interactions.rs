@@ -178,7 +178,12 @@ async fn handle_open_modal(
     // that disallows it is rejected here, the same as any other not-adopted
     // outcome.
     if !record.allow_text {
-        return respond(api, ctx, &ephemeral("텍스트 응답이 허용되지 않는 질문입니다.")).await;
+        return respond(
+            api,
+            ctx,
+            &ephemeral("텍스트 응답이 허용되지 않는 질문입니다."),
+        )
+        .await;
     }
     // Opening the modal adopts no answer; the MODAL_SUBMIT `try_answer` is the
     // authoritative concurrency point, so a race that resolves the ask between
@@ -199,7 +204,12 @@ async fn handle_modal_submit(
     // ask that disallows free text must not adopt an answer regardless of how
     // the client got to a MODAL_SUBMIT.
     if !record.allow_text {
-        return respond(api, ctx, &ephemeral("텍스트 응답이 허용되지 않는 질문입니다.")).await;
+        return respond(
+            api,
+            ctx,
+            &ephemeral("텍스트 응답이 허용되지 않는 질문입니다."),
+        )
+        .await;
     }
     let value = extract_modal_text(ctx.payload.get("data")).ok_or_else(|| {
         AppError::new(

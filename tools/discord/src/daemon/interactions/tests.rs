@@ -309,6 +309,28 @@ async fn out_of_range_option_sends_ephemeral() {
     );
 }
 
+/// `create` doesn't reject duplicate `--option` labels, and resolution is
+/// index-based (`ask:<id>:opt:<index>`), so two options sharing a label must
+/// still resolve unambiguously by index rather than by (possibly duplicate)
+/// text.
+#[tokio::test]
+async fn duplicate_option_labels_resolve_by_index_not_by_text() {
+    let store = store_with_pending("msg1", &["yes", "yes"], "2024-01-01T01:00:00Z");
+    let api = MockDiscordApi::new();
+
+    handle_interaction(&api, &store, &choice_payload("msg1", 1), NOW)
+        .await
+        .unwrap();
+
+    let record = store.get_ask("msg1").unwrap().unwrap();
+    assert_eq!(record.status, crate::common::store::AskStatus::Answered);
+    assert_eq!(record.value.as_deref(), Some("yes"));
+    assert_eq!(record.answered_by.as_deref(), Some("user1"));
+
+    let calls = api.interaction_calls.borrow();
+    assert_eq!(calls[0].2["type"], 7);
+}
+
 // --- modal submit payload variants -------------------------------------------
 
 /// A submit whose text input carries no `value` at all (e.g. an optional

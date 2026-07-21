@@ -492,3 +492,184 @@ async fn wait_errors_for_unknown_ask_id() {
 
     std::fs::remove_dir_all(db_path.parent().unwrap()).ok();
 }
+
+// --- CLI <-> daemon contract round trip -------------------------------------
+//
+// Every test above (and every test in `daemon::interactions::tests`) exercises
+// one side of the HITL contract against a fixture it wrote itself: `ask
+// create`'s tests assert the `custom_id`/DB shape it produces, the daemon's
+// tests hand-build an INTERACTION_CREATE payload with a matching id. Neither
+// catches the two sides drifting apart from each other. These tests run both
+// real functions back to back against the same on-disk store, so the
+// `custom_id` the daemon parses is the exact one `ask create` emitted.
+
+#[tokio::test]
+async fn create_to_choice_click_to_result_round_trips_through_the_real_contract() {
+    let db_path = unique_db_path("e2e-choice");
+    let api = MockDiscordApi::new();
+    api.send_responses
+        .borrow_mut()
+        .push_back(Ok(sent_message("900", "chan-1")));
+
+    let create_payload = run_ask_create(&api, &db_path, daemon_up, &sample_request())
+        .await
+        .unwrap();
+    let ask_id = match create_payload {
+        Payload::AskCreate(d) => d.ask_id,
+        other => panic!("expected AskCreate, got {other:?}"),
+    };
+
+    // Pulled from the actual PATCH `ask create` sent — not a hand-rolled
+    // fixture string — so a drift in the custom_id convention on either side
+    // fails this test instead of silently passing.
+    let custom_id = {
+        let edits = api.edit_components_calls.borrow();
+        edits[0].2[0]["components"][1]["custom_id"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    };
+    assert_eq!(custom_id, format!("ask:{ask_id}:opt:1"));
+
+    let click_payload = serde_json::json!({
+        "id": "int1",
+        "token": "tok1",
+        "type": 3,
+        "data": { "custom_id": custom_id, "component_type": 2 },
+        "member": { "user": { "id": "clicker-1" } }
+    });
+    let store = AskStore::open(&db_path).unwrap();
+    crate::daemon::handle_interaction(&api, &store, &click_payload, "2024-01-01T00:00:05Z")
+        .await
+        .unwrap();
+    drop(store);
+
+    let result = run_ask_result(&db_path, &ask_id).unwrap();
+    assert_eq!(
+        result,
+        Payload::AskResult(AskResultData::Answered {
+            ask_id: ask_id.clone(),
+            kind: "choice".into(),
+            value: "no".into(),
+            answered_by: "clicker-1".into(),
+            answered_at: "2024-01-01T00:00:05Z".into(),
+        })
+    );
+
+    std::fs::remove_dir_all(db_path.parent().unwrap()).ok();
+}
+
+#[tokio::test]
+async fn create_to_modal_submit_to_result_round_trips_through_the_real_contract() {
+    let db_path = unique_db_path("e2e-text");
+    let api = MockDiscordApi::new();
+    api.send_responses
+        .borrow_mut()
+        .push_back(Ok(sent_message("901", "chan-1")));
+
+    let create_payload = run_ask_create(&api, &db_path, daemon_up, &sample_request())
+        .await
+        .unwrap();
+    let ask_id = match create_payload {
+        Payload::AskCreate(d) => d.ask_id,
+        other => panic!("expected AskCreate, got {other:?}"),
+    };
+
+    let modal_submit_payload = serde_json::json!({
+        "id": "int2",
+        "token": "tok2",
+        "type": 5,
+        "data": {
+            "custom_id": format!("ask:{ask_id}:text"),
+            "components": [{
+                "type": 18,
+                "component": { "type": 4, "custom_id": "answer", "value": "ship it" }
+            }]
+        },
+        "member": { "user": { "id": "clicker-2" } }
+    });
+    let store = AskStore::open(&db_path).unwrap();
+    crate::daemon::handle_interaction(&api, &store, &modal_submit_payload, "2024-01-01T00:00:05Z")
+        .await
+        .unwrap();
+    drop(store);
+
+    let result = run_ask_result(&db_path, &ask_id).unwrap();
+    assert_eq!(
+        result,
+        Payload::AskResult(AskResultData::Answered {
+            ask_id: ask_id.clone(),
+            kind: "text".into(),
+            value: "ship it".into(),
+            answered_by: "clicker-2".into(),
+            answered_at: "2024-01-01T00:00:05Z".into(),
+        })
+    );
+
+    std::fs::remove_dir_all(db_path.parent().unwrap()).ok();
+}
+
+// --- wait's local expiry fallback vs. the daemon's periodic sweep -----------
+
+/// Real 2-connection race between `ask wait`'s local `try_timeout` fallback
+/// (spec §4 step 5's "daemon down/slow" escape hatch) and the daemon's own
+/// periodic `expire_and_disable` sweep, both acting on the same overdue ask
+/// from independent connections/threads (mirrors
+/// `common::store::tests::two_connections_racing_click_and_expire_exactly_one_wins`,
+/// but for the two paths that both resolve to the *same* terminal status).
+/// Unlike a click-vs-expire race there is no "wrong winner" to assert against
+/// — both write `timed_out` — so the invariant under test is that the ask
+/// converges to `timed_out` and `ask wait` reports it consistently however the
+/// two interleave, with neither side erroring on the other's write.
+#[tokio::test]
+async fn wait_local_expiry_and_daemon_sweep_race_without_diverging() {
+    let db_path = unique_db_path("wait-vs-daemon-expire-race");
+    let setup = AskStore::open(&db_path).unwrap();
+    setup
+        .insert_ask(sample_ask("race-ask", "2024-01-01T00:00:00Z")) // already overdue
+        .unwrap();
+    drop(setup);
+
+    let wait_db_path = db_path.clone();
+    let wait_handle = std::thread::spawn(move || {
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            run_ask_wait(&wait_db_path, &FakeSleeper::new(), "race-ask", 5, 5).await
+        })
+    });
+
+    let expire_db_path = db_path.clone();
+    let expire_handle = std::thread::spawn(move || {
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let store = AskStore::open(&expire_db_path).unwrap();
+            let api = MockDiscordApi::new();
+            crate::daemon::expire_and_disable(&api, &store, "2024-01-01T00:00:10Z").await
+        })
+    });
+
+    let wait_result = wait_handle.join().unwrap().unwrap();
+    expire_handle.join().unwrap().unwrap();
+
+    match wait_result {
+        Payload::AskWait(d) => {
+            assert!(
+                !d.timed_out,
+                "resolved via the ask's own overdue deadline, not the poll budget"
+            );
+            assert_eq!(
+                d.result,
+                AskResultData::TimedOut {
+                    ask_id: "race-ask".into()
+                }
+            );
+        }
+        other => panic!("expected AskWait, got {other:?}"),
+    }
+
+    let verify = AskStore::open(&db_path).unwrap();
+    assert_eq!(
+        verify.get_ask("race-ask").unwrap().unwrap().status,
+        AskStatus::TimedOut
+    );
+
+    std::fs::remove_dir_all(db_path.parent().unwrap()).ok();
+}
