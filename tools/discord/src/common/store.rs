@@ -12,15 +12,10 @@
 
 use std::path::Path;
 
-use rusqlite::types::Type;
+use rusqlite::types::{FromSql, FromSqlError, FromSqlResult, ValueRef};
 use rusqlite::{Connection, OptionalExtension, Row, params};
 
 use crate::common::error::{AppError, ErrorKind};
-
-/// Current schema_version. Bump when adding a migration and extend
-/// `apply_migrations` — SP3/SP4 (message cache, event subscription) grow the
-/// same DB file by adding tables here rather than introducing a new store.
-const SCHEMA_VERSION: i64 = 1;
 
 /// Lifecycle status of an ask, mirrored 1:1 with the `asks.status` TEXT column.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -30,14 +25,30 @@ pub(crate) enum AskStatus {
     TimedOut,
 }
 
-impl AskStatus {
-    fn parse(raw: &str) -> Result<Self, String> {
-        match raw {
+/// Fail-fast column decoding: an unknown status string in the DB is a schema
+/// contract violation, surfaced as a conversion error rather than defaulted.
+impl FromSql for AskStatus {
+    fn column_result(value: ValueRef<'_>) -> FromSqlResult<Self> {
+        match value.as_str()? {
             "pending" => Ok(AskStatus::Pending),
             "answered" => Ok(AskStatus::Answered),
             "timed_out" => Ok(AskStatus::TimedOut),
-            other => Err(format!("unknown ask status in store: {other}")),
+            other => Err(FromSqlError::Other(
+                format!("unknown ask status in store: {other}").into(),
+            )),
         }
+    }
+}
+
+/// Decodes the `options` TEXT column (JSON array) straight from the row,
+/// with the same fail-fast contract as [`AskStatus`]'s `FromSql`.
+struct OptionsJson(Vec<String>);
+
+impl FromSql for OptionsJson {
+    fn column_result(value: ValueRef<'_>) -> FromSqlResult<Self> {
+        serde_json::from_str(value.as_str()?)
+            .map(OptionsJson)
+            .map_err(|e| FromSqlError::Other(Box::new(e)))
     }
 }
 
@@ -142,7 +153,11 @@ impl AskStore {
 
     pub(crate) fn get_ask(&self, ask_id: &str) -> Result<Option<AskRecord>, AppError> {
         self.conn
-            .query_row(SELECT_ASK_SQL, params![ask_id], row_to_record)
+            .query_row(
+                &format!("SELECT {ASK_COLUMNS} FROM asks WHERE ask_id = ?1"),
+                params![ask_id],
+                row_to_record,
+            )
             .optional()
             .map_err(map_sqlite_err)
     }
@@ -187,30 +202,22 @@ impl AskStore {
 
     /// Transitions every `pending` ask whose `timeout_at` has passed `now`
     /// to `timed_out` and returns the transitioned records (for the daemon
-    /// to disable their buttons). Each transition reuses the same
-    /// conditional UPDATE as `try_timeout`, so a `try_answer` that lands
-    /// concurrently on one of the candidate rows still wins cleanly.
+    /// to disable their buttons). A single conditional UPDATE with
+    /// RETURNING keeps the same `status = 'pending'` race guard as
+    /// `try_answer`/`try_timeout` while avoiding a per-row query loop.
     pub(crate) fn expire_due(&self, now: &str) -> Result<Vec<AskRecord>, AppError> {
-        let due_ids: Vec<String> = {
-            let mut stmt = self
-                .conn
-                .prepare("SELECT ask_id FROM asks WHERE status = 'pending' AND timeout_at <= ?1")
-                .map_err(map_sqlite_err)?;
-            stmt.query_map(params![now], |row| row.get(0))
-                .map_err(map_sqlite_err)?
-                .collect::<rusqlite::Result<Vec<String>>>()
-                .map_err(map_sqlite_err)?
-        };
-
-        let mut expired = Vec::with_capacity(due_ids.len());
-        for ask_id in &due_ids {
-            if self.try_timeout(ask_id)?
-                && let Some(record) = self.get_ask(ask_id)?
-            {
-                expired.push(record);
-            }
-        }
-        Ok(expired)
+        let mut stmt = self
+            .conn
+            .prepare(&format!(
+                "UPDATE asks SET status = 'timed_out'
+                 WHERE status = 'pending' AND timeout_at <= ?1
+                 RETURNING {ASK_COLUMNS}"
+            ))
+            .map_err(map_sqlite_err)?;
+        stmt.query_map(params![now], row_to_record)
+            .map_err(map_sqlite_err)?
+            .collect::<rusqlite::Result<Vec<AskRecord>>>()
+            .map_err(map_sqlite_err)
     }
 
     /// Deletes asks whose `created_at` is older than `retention_days` before
@@ -230,39 +237,34 @@ impl AskStore {
     }
 }
 
-const SELECT_ASK_SQL: &str = "SELECT
-    ask_id, channel_id, question, options, allow_text, status,
-    kind, value, answered_by, created_at, timeout_at, answered_at
-    FROM asks WHERE ask_id = ?1";
+/// Single source of the `asks` column list shared by every statement that
+/// yields full records (`get_ask` SELECT, `expire_due` RETURNING), so
+/// `row_to_record`'s named lookups always have every column available.
+const ASK_COLUMNS: &str = "ask_id, channel_id, question, options, allow_text, status, \
+    kind, value, answered_by, created_at, timeout_at, answered_at";
 
 fn row_to_record(row: &Row<'_>) -> rusqlite::Result<AskRecord> {
-    let options_json: String = row.get(3)?;
-    let options: Vec<String> = serde_json::from_str(&options_json)
-        .map_err(|e| rusqlite::Error::FromSqlConversionFailure(3, Type::Text, Box::new(e)))?;
-
-    let status_raw: String = row.get(5)?;
-    let status = AskStatus::parse(&status_raw)
-        .map_err(|msg| rusqlite::Error::FromSqlConversionFailure(5, Type::Text, msg.into()))?;
-
     Ok(AskRecord {
-        ask_id: row.get(0)?,
-        channel_id: row.get(1)?,
-        question: row.get(2)?,
-        options,
-        allow_text: row.get(4)?,
-        status,
-        kind: row.get(6)?,
-        value: row.get(7)?,
-        answered_by: row.get(8)?,
-        created_at: row.get(9)?,
-        timeout_at: row.get(10)?,
-        answered_at: row.get(11)?,
+        ask_id: row.get("ask_id")?,
+        channel_id: row.get("channel_id")?,
+        question: row.get("question")?,
+        options: row.get::<_, OptionsJson>("options")?.0,
+        allow_text: row.get("allow_text")?,
+        status: row.get("status")?,
+        kind: row.get("kind")?,
+        value: row.get("value")?,
+        answered_by: row.get("answered_by")?,
+        created_at: row.get("created_at")?,
+        timeout_at: row.get("timeout_at")?,
+        answered_at: row.get("answered_at")?,
     })
 }
 
 /// Applies pending schema migrations, tracked via a single-row
 /// `schema_version` table. Safe to call on every `open` — a database already
-/// at `SCHEMA_VERSION` is a no-op.
+/// at the latest version is a no-op. SP3/SP4 (message cache, event
+/// subscription) grow the same DB file by appending `if current < N`
+/// migration blocks here rather than introducing a new store.
 fn migrate(conn: &Connection) -> Result<(), AppError> {
     conn.execute_batch("CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL)")
         .map_err(map_sqlite_err)?;
@@ -275,14 +277,7 @@ fn migrate(conn: &Connection) -> Result<(), AppError> {
         .map_err(map_sqlite_err)?
         .unwrap_or(0);
 
-    if current < SCHEMA_VERSION {
-        apply_migrations(conn, current)?;
-    }
-    Ok(())
-}
-
-fn apply_migrations(conn: &Connection, from_version: i64) -> Result<(), AppError> {
-    if from_version < 1 {
+    if current < 1 {
         conn.execute_batch(
             "CREATE TABLE asks (
                 ask_id TEXT PRIMARY KEY,
