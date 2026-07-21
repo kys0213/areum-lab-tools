@@ -165,6 +165,68 @@ async fn create_marks_message_and_propagates_error_when_components_patch_fails()
     std::fs::remove_dir_all(db_path.parent().unwrap()).ok();
 }
 
+/// P2-1: a components PATCH that succeeds but a subsequent `insert_ask`
+/// failure must leave the message in the same "clearly not answerable" state
+/// as the PATCH-failure branch — stripped buttons plus the orphan marker —
+/// rather than a silent orphan with live buttons nobody can resolve.
+/// `insert_pending_ask` fails here because `AskStore::open`'s
+/// `create_dir_all(parent)` cannot create a directory where a plain file of
+/// the same name already exists — a black-box way to force the insert step
+/// to fail without touching `insert_ask` itself.
+#[tokio::test]
+async fn create_orphans_message_when_insert_fails_after_components_patch_succeeds() {
+    let db_path = unique_db_path("create-insert-fails");
+    std::fs::write(db_path.parent().unwrap(), b"not a directory").unwrap();
+    let api = MockDiscordApi::new();
+    api.send_responses
+        .borrow_mut()
+        .push_back(Ok(sent_message("600", "chan-1")));
+    api.edit_components_responses.borrow_mut().push_back(Ok(()));
+    api.send_responses
+        .borrow_mut()
+        .push_back(Ok(sent_message("601", "chan-1")));
+
+    let err = run_ask_create(&api, &db_path, daemon_up, &sample_request())
+        .await
+        .unwrap_err();
+
+    assert_eq!(err.kind, ErrorKind::Internal);
+
+    let edits = api.edit_components_calls.borrow();
+    assert_eq!(
+        edits.len(),
+        2,
+        "the attach PATCH plus the orphan button-strip PATCH"
+    );
+    assert_eq!(
+        edits[1].2,
+        serde_json::json!([]),
+        "the second PATCH must strip the buttons"
+    );
+
+    let sends = api.send_calls.borrow();
+    assert_eq!(sends.len(), 2, "the question send plus the orphan marker");
+    assert_eq!(sends[1].reply_to.as_deref(), Some("600"));
+    assert!(sends[1].content.contains("질문 등록 실패"));
+
+    std::fs::remove_file(db_path.parent().unwrap()).ok();
+}
+
+#[test]
+fn create_rejects_timeout_over_30_days() {
+    let mut req = sample_request();
+    req.timeout_secs = 30 * 24 * 60 * 60 + 1;
+    let err = validate_ask_create(&req).unwrap_err();
+    assert_eq!(err.kind, ErrorKind::Usage);
+}
+
+#[test]
+fn create_accepts_timeout_at_30_day_upper_bound() {
+    let mut req = sample_request();
+    req.timeout_secs = 30 * 24 * 60 * 60;
+    assert!(validate_ask_create(&req).is_ok());
+}
+
 #[test]
 fn create_rejects_zero_options() {
     let mut req = sample_request();
