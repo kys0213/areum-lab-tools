@@ -267,4 +267,90 @@ mod tests {
 
         std::fs::remove_dir_all(&dir).ok();
     }
+
+    fn unique_daemon_dir(label: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "areum-discord-daemon-stoptest-{}-{label}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
+    /// Graceful stop end-to-end against a *real* OS process standing in for
+    /// the daemon (no Discord/gateway dependency needed for this path): a
+    /// live pid in the pidfile must receive SIGTERM, the pidfile must be
+    /// removed once it exits, and the reported pid must match.
+    ///
+    /// The child is reaped on a background thread rather than left a zombie:
+    /// in production the immediate parent (the `daemon start` invocation)
+    /// exits right after spawning, so init reparents and reaps the detached
+    /// child. This in-process test still owns the child, and `kill(pid, 0)`
+    /// reports a zombie as alive — so without an explicit reaper, `stop`'s
+    /// poll loop would spin for the full `STOP_TIMEOUT` instead of the exit
+    /// it actually observed.
+    #[tokio::test]
+    async fn stop_sends_sigterm_waits_for_exit_and_removes_pidfile() {
+        let dir = unique_daemon_dir("graceful");
+        let pid_path = dir.join("daemon.pid");
+
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn a real child process to stand in for the daemon");
+        let child_pid = child.id();
+        write_pidfile(&pid_path, child_pid as i32).unwrap();
+        let reaper = std::thread::spawn(move || {
+            let _ = child.wait();
+        });
+
+        let result = run_daemon_stop(&pid_path).await.unwrap();
+        match result {
+            crate::output::Payload::DaemonStop(data) => {
+                assert_eq!(data.pid, child_pid);
+                assert!(data.stopped);
+            }
+            other => panic!("expected DaemonStop, got {other:?}"),
+        }
+
+        reaper.join().unwrap();
+        assert_eq!(
+            read_pidfile(&pid_path).unwrap(),
+            None,
+            "pidfile must be removed after a graceful stop"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A pidfile pointing at a pid that has already exited (e.g. the daemon
+    /// crashed without cleaning up, or the machine's pid counter recycled)
+    /// must not be treated as a live daemon: `stop` reports "not running"
+    /// rather than signalling an unrelated/nonexistent process, and leaves
+    /// the stale pidfile in place for `start` to overwrite.
+    #[tokio::test]
+    async fn stop_errors_when_pidfile_pid_already_exited() {
+        let dir = unique_daemon_dir("stale");
+        let pid_path = dir.join("daemon.pid");
+
+        // A pid guaranteed dead: spawned, waited on, and reaped.
+        let mut child = std::process::Command::new("true")
+            .spawn()
+            .expect("spawn a short-lived child to obtain a guaranteed-dead pid");
+        let dead_pid = child.id();
+        child.wait().unwrap();
+        write_pidfile(&pid_path, dead_pid as i32).unwrap();
+
+        let err = run_daemon_stop(&pid_path)
+            .await
+            .expect_err("a pidfile recording an already-exited pid must not report success");
+        assert_eq!(err.kind, crate::output::ErrorKind::Usage);
+        assert_eq!(
+            read_pidfile(&pid_path).unwrap(),
+            Some(dead_pid as i32),
+            "a failed stop must leave the stale pidfile for `start` to overwrite"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }
