@@ -82,6 +82,11 @@ pub(crate) struct AskRecord {
     pub(crate) answered_at: Option<String>,
 }
 
+/// How long any statement waits on a lock held by the other process (the CLI
+/// vs. the daemon) before giving up. Also the retry budget for the WAL
+/// transition in [`enable_wal`], which cannot rely on the busy handler.
+const BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(5_000);
+
 /// Synchronous rusqlite wrapper. A single connection is not `Sync` — this
 /// type is deliberately a thin owner of that connection and the SQL that
 /// runs against it, nothing more (async usage patterns are a later unit's
@@ -105,10 +110,10 @@ impl AskStore {
         }
 
         let mut conn = Connection::open(path).map_err(map_sqlite_err)?;
-        conn.pragma_update(None, "journal_mode", "WAL")
-            .map_err(map_sqlite_err)?;
-        conn.busy_timeout(std::time::Duration::from_millis(5_000))
-            .map_err(map_sqlite_err)?;
+        // busy_timeout comes before anything that can take a lock so every
+        // later statement waits its turn instead of failing immediately.
+        conn.busy_timeout(BUSY_TIMEOUT).map_err(map_sqlite_err)?;
+        enable_wal(&conn)?;
         migrate(&mut conn)?;
         Ok(AskStore { conn })
     }
@@ -295,6 +300,36 @@ fn row_to_record(row: &Row<'_>) -> rusqlite::Result<AskRecord> {
         timeout_at: row.get("timeout_at")?,
         answered_at: row.get("answered_at")?,
     })
+}
+
+/// Switches the connection's journal mode to WAL, retrying on SQLITE_BUSY.
+/// The retry loop (rather than trusting busy_timeout) is deliberate: the WAL
+/// transition needs brief exclusive locks and SQLite skips the busy handler
+/// for parts of that lock dance, so two connections racing the first open of
+/// a fresh database see an immediate "database is locked" despite the
+/// timeout. Once the racing winner completes the switch, WAL is persistent in
+/// the file and the loser's retry is a cheap no-op that reports "wal".
+fn enable_wal(conn: &Connection) -> Result<(), AppError> {
+    const RETRY_SLEEP: std::time::Duration = std::time::Duration::from_millis(10);
+    let deadline = std::time::Instant::now() + BUSY_TIMEOUT;
+    loop {
+        match conn.pragma_update(None, "journal_mode", "WAL") {
+            Ok(()) => return Ok(()),
+            Err(err) if is_busy(&err) && std::time::Instant::now() < deadline => {
+                std::thread::sleep(RETRY_SLEEP);
+            }
+            Err(err) => return Err(map_sqlite_err(err)),
+        }
+    }
+}
+
+/// SQLITE_BUSY ("database is locked") and SQLITE_LOCKED — the transient
+/// lock-contention outcomes worth retrying, as opposed to real errors.
+fn is_busy(err: &rusqlite::Error) -> bool {
+    matches!(
+        err.sqlite_error_code(),
+        Some(rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked)
+    )
 }
 
 /// Applies pending schema migrations, tracked via a single-row
