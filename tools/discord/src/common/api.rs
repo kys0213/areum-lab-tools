@@ -17,6 +17,29 @@ pub(crate) trait DiscordApi {
     ) -> Result<Vec<Message>, AppError>;
 
     async fn create_thread(&self, req: &CreateThreadRequest) -> Result<CreatedThread, AppError>;
+
+    /// Answers a gateway interaction within Discord's 3-second callback window
+    /// via `POST /interactions/{id}/{token}/callback`. `payload` is the full
+    /// interaction-response object (`{"type": N, "data": {...}}`); the daemon
+    /// builds it (UPDATE_MESSAGE / MODAL / ephemeral) so this stays a thin
+    /// transport. Success returns no body.
+    async fn create_interaction_response(
+        &self,
+        interaction_id: &str,
+        token: &str,
+        payload: &serde_json::Value,
+    ) -> Result<(), AppError>;
+
+    /// Replaces a message's components via `PATCH /channels/{ch}/messages/{mid}`
+    /// with the bot token — used to disable buttons on timeout, where the
+    /// interaction token is unavailable (a timed-out ask was never clicked) or
+    /// expired. `components` is the replacement components array.
+    async fn edit_message_components(
+        &self,
+        channel_id: &str,
+        message_id: &str,
+        components: &serde_json::Value,
+    ) -> Result<(), AppError>;
 }
 
 /// A file to upload as a message attachment. `bytes` is [`bytes::Bytes`] (an

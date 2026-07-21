@@ -40,12 +40,14 @@ impl HttpDiscordApi {
     }
 
     /// Sends `request`, retrying on 429 up to [`MAX_RATE_LIMIT_RETRIES`] times,
-    /// and deserializes a 2xx body into `T`. Every other outcome maps to a
-    /// classified [`AppError`] — no fallback/default substitution on mismatch.
-    async fn execute<T: DeserializeOwned>(
+    /// and returns the successful response for the caller to consume. Every
+    /// non-2xx/429 outcome maps to a classified [`AppError`] — no
+    /// fallback/default substitution on mismatch. Shared by [`Self::execute`]
+    /// (parse a JSON body) and [`Self::execute_unit`] (discard the body).
+    async fn send_retrying(
         &self,
         request: reqwest::RequestBuilder,
-    ) -> Result<T, AppError> {
+    ) -> Result<reqwest::Response, AppError> {
         let mut retries = 0;
         loop {
             // Cloned per attempt: the same builder is resent on 429 retries.
@@ -56,9 +58,7 @@ impl HttpDiscordApi {
             let status = response.status();
 
             if status.is_success() {
-                let bytes = response.bytes().await.map_err(network_error)?;
-                return serde_json::from_slice(&bytes)
-                    .map_err(|err| deserialize_error(&bytes, &err));
+                return Ok(response);
             }
 
             if status.as_u16() == 429 {
@@ -84,6 +84,25 @@ impl HttpDiscordApi {
             let body = response.text().await.unwrap_or_default();
             return Err(status_error(status.as_u16(), &body));
         }
+    }
+
+    /// Sends `request` and deserializes a 2xx body into `T`. A malformed body
+    /// on success surfaces as an `Api` error rather than a default value.
+    async fn execute<T: DeserializeOwned>(
+        &self,
+        request: reqwest::RequestBuilder,
+    ) -> Result<T, AppError> {
+        let response = self.send_retrying(request).await?;
+        let bytes = response.bytes().await.map_err(network_error)?;
+        serde_json::from_slice(&bytes).map_err(|err| deserialize_error(&bytes, &err))
+    }
+
+    /// Sends `request` and discards the success body. For endpoints whose 2xx
+    /// response the caller does not read (interaction callback's 204, message
+    /// edit's echoed object) — only the same success/error classification as
+    /// [`Self::execute`] matters.
+    async fn execute_unit(&self, request: reqwest::RequestBuilder) -> Result<(), AppError> {
+        self.send_retrying(request).await.map(|_| ())
     }
 
     /// Same retry/classification semantics as [`Self::execute`], but rebuilds
@@ -175,6 +194,41 @@ impl DiscordApi for HttpDiscordApi {
             .json(&build_create_thread_payload(req));
         self.execute(request).await
     }
+
+    async fn create_interaction_response(
+        &self,
+        interaction_id: &str,
+        token: &str,
+        payload: &serde_json::Value,
+    ) -> Result<(), AppError> {
+        // Interaction callbacks authenticate by the interaction token in the
+        // URL, not the bot token — but authorizing anyway is harmless and keeps
+        // one request-building path.
+        let url = interaction_callback_url(&self.base_url, interaction_id, token);
+        let request = self.authorized(self.client.post(url)).json(payload);
+        self.execute_unit(request).await
+    }
+
+    async fn edit_message_components(
+        &self,
+        channel_id: &str,
+        message_id: &str,
+        components: &serde_json::Value,
+    ) -> Result<(), AppError> {
+        let url = edit_message_url(&self.base_url, channel_id, message_id);
+        let request = self
+            .authorized(self.client.patch(url))
+            .json(&serde_json::json!({ "components": components }));
+        self.execute_unit(request).await
+    }
+}
+
+fn interaction_callback_url(base_url: &str, interaction_id: &str, token: &str) -> String {
+    format!("{base_url}/interactions/{interaction_id}/{token}/callback")
+}
+
+fn edit_message_url(base_url: &str, channel_id: &str, message_id: &str) -> String {
+    format!("{base_url}/channels/{channel_id}/messages/{message_id}")
 }
 
 /// Pure JSON body assembly for `send_message`, testable without a network
@@ -650,6 +704,24 @@ mod tests {
         assert_eq!(
             create_thread_url(API_BASE, &req),
             "https://discord.com/api/v10/channels/123/messages/456/threads"
+        );
+    }
+
+    #[test]
+    fn interaction_callback_url_targets_callback_endpoint() {
+        let url = interaction_callback_url(API_BASE, "int1", "tok1");
+        assert_eq!(
+            url,
+            "https://discord.com/api/v10/interactions/int1/tok1/callback"
+        );
+    }
+
+    #[test]
+    fn edit_message_url_targets_message_endpoint() {
+        let url = edit_message_url(API_BASE, "chan1", "msg1");
+        assert_eq!(
+            url,
+            "https://discord.com/api/v10/channels/chan1/messages/msg1"
         );
     }
 
