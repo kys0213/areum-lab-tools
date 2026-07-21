@@ -30,6 +30,22 @@ fn choice_payload(ask_id: &str, index: usize) -> serde_json::Value {
     })
 }
 
+fn store_with_pending_no_text(ask_id: &str, options: &[&str], timeout_at: &str) -> AskStore {
+    let store = AskStore::open_in_memory().unwrap();
+    store
+        .insert_ask(NewAsk {
+            ask_id: ask_id.to_owned(),
+            channel_id: "chan1".to_owned(),
+            question: "Proceed?".to_owned(),
+            options: options.iter().map(|s| (*s).to_owned()).collect(),
+            allow_text: false,
+            created_at: "2024-01-01T00:00:00Z".to_owned(),
+            timeout_at: timeout_at.to_owned(),
+        })
+        .unwrap();
+    store
+}
+
 fn text_button_payload(ask_id: &str) -> serde_json::Value {
     serde_json::json!({
         "id": "int2",
@@ -177,6 +193,54 @@ async fn modal_submit_loss_sends_ephemeral() {
     let payload = &calls[0].2;
     assert_eq!(payload["type"], 4);
     assert_eq!(payload["data"]["flags"], 64);
+}
+
+// --- allow_text=false rejects a forged text interaction ----------------------
+
+/// `ask create` never attaches a text button when `allow_text` is false, so a
+/// real Discord client can't produce this click — but the daemon must not
+/// trust the client's component set. A payload carrying `ask:<id>:text` for
+/// such an ask is a path the ask's own record disallows, so it must be
+/// rejected (ephemeral, no modal opened, ask stays pending) rather than
+/// honored just because the custom_id parses.
+#[tokio::test]
+async fn text_button_click_rejected_when_allow_text_is_false() {
+    let store = store_with_pending_no_text("msg1", &["Yes"], "2024-01-01T01:00:00Z");
+    let api = MockDiscordApi::new();
+
+    handle_interaction(&api, &store, &text_button_payload("msg1"), NOW)
+        .await
+        .unwrap();
+
+    let calls = api.interaction_calls.borrow();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].2["type"], 4, "must not open a modal (type 9)");
+    assert_eq!(calls[0].2["data"]["flags"], 64);
+    assert_eq!(
+        store.get_ask("msg1").unwrap().unwrap().status,
+        crate::common::store::AskStatus::Pending
+    );
+}
+
+/// Same forged-path rejection, but for the `MODAL_SUBMIT` itself — a client
+/// that opened a modal some other way (or replayed a stale one) must not be
+/// able to adopt a text answer against an ask that disallows it.
+#[tokio::test]
+async fn modal_submit_rejected_when_allow_text_is_false() {
+    let store = store_with_pending_no_text("msg1", &["Yes"], "2024-01-01T01:00:00Z");
+    let api = MockDiscordApi::new();
+
+    handle_interaction(&api, &store, &modal_submit_payload("msg1", "sneaky"), NOW)
+        .await
+        .unwrap();
+
+    let calls = api.interaction_calls.borrow();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].2["type"], 4);
+    assert_eq!(calls[0].2["data"]["flags"], 64);
+    let record = store.get_ask("msg1").unwrap().unwrap();
+    assert_eq!(record.status, crate::common::store::AskStatus::Pending);
+    assert_eq!(record.value, None);
 }
 
 // --- (e) foreign custom_id ignored -------------------------------------------
