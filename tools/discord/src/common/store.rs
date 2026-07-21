@@ -220,17 +220,20 @@ impl AskStore {
             .map_err(map_sqlite_err)
     }
 
-    /// Deletes asks whose `created_at` is older than `retention_days` before
-    /// `now`, returning the count removed. The day-arithmetic cutoff is
-    /// computed by SQLite's own `datetime()` modifiers rather than a date
-    /// library, on the invariant that `created_at`/`now` are well-formed
-    /// RFC3339 UTC strings (the convention this whole crate stores
-    /// timestamps in).
+    /// Deletes resolved (answered/timed_out) asks whose `created_at` is
+    /// older than `retention_days` before `now`, returning the count
+    /// removed. Pending rows are never deleted regardless of age — an
+    /// unresolved question silently vanishing would be data loss. The
+    /// day-arithmetic cutoff is computed by SQLite's own `datetime()`
+    /// modifiers rather than a date library, on the invariant that
+    /// `created_at`/`now` are well-formed RFC3339 UTC strings (the
+    /// convention this whole crate stores timestamps in).
     pub(crate) fn cleanup(&self, retention_days: u32, now: &str) -> Result<usize, AppError> {
         let cutoff_modifier = format!("-{retention_days} days");
         self.conn
             .execute(
-                "DELETE FROM asks WHERE datetime(created_at) < datetime(?1, ?2)",
+                "DELETE FROM asks
+                 WHERE status != 'pending' AND datetime(created_at) < datetime(?1, ?2)",
                 params![now, cutoff_modifier],
             )
             .map_err(map_sqlite_err)

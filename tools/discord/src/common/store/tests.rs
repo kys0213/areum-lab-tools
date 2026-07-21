@@ -177,24 +177,48 @@ fn expire_due_transitions_only_overdue_pending_asks() {
 }
 
 #[test]
-fn cleanup_deletes_rows_past_retention_and_keeps_recent_ones() {
+fn cleanup_deletes_resolved_rows_past_retention_and_keeps_recent_ones() {
     let store = AskStore::open_in_memory().unwrap();
-    let mut old = sample_ask("old-ask", "2024-01-01T01:00:00Z");
-    old.created_at = "2024-01-01T00:00:00Z".to_owned();
-    store.insert_ask(old).unwrap();
+    let mut old_answered = sample_ask("old-answered", "2024-01-01T01:00:00Z");
+    old_answered.created_at = "2024-01-01T00:00:00Z".to_owned();
+    store.insert_ask(old_answered).unwrap();
+    store
+        .try_answer(
+            "old-answered",
+            "choice",
+            "yes",
+            "user-1",
+            "2024-01-01T00:30:00Z",
+        )
+        .unwrap();
 
-    let mut recent = sample_ask("recent-ask", "2024-01-30T01:00:00Z");
+    let mut old_timed_out = sample_ask("old-timed-out", "2024-01-01T01:00:00Z");
+    old_timed_out.created_at = "2024-01-01T00:00:00Z".to_owned();
+    store.insert_ask(old_timed_out).unwrap();
+    store.try_timeout("old-timed-out").unwrap();
+
+    let mut recent = sample_ask("recent-answered", "2024-01-30T01:00:00Z");
     recent.created_at = "2024-01-30T00:00:00Z".to_owned();
     store.insert_ask(recent).unwrap();
+    store
+        .try_answer(
+            "recent-answered",
+            "choice",
+            "yes",
+            "user-1",
+            "2024-01-30T00:30:00Z",
+        )
+        .unwrap();
 
     // retention_days=30, now=2024-02-01 -> cutoff=2024-01-02.
-    // old-ask (2024-01-01) is before the cutoff and gets deleted;
-    // recent-ask (2024-01-30) is after it and is kept.
+    // Both resolved rows created 2024-01-01 are past the cutoff and get
+    // deleted; the recent resolved row is kept.
     let deleted = store.cleanup(30, "2024-02-01T00:00:00Z").unwrap();
 
-    assert_eq!(deleted, 1);
-    assert!(store.get_ask("old-ask").unwrap().is_none());
-    assert!(store.get_ask("recent-ask").unwrap().is_some());
+    assert_eq!(deleted, 2);
+    assert!(store.get_ask("old-answered").unwrap().is_none());
+    assert!(store.get_ask("old-timed-out").unwrap().is_none());
+    assert!(store.get_ask("recent-answered").unwrap().is_some());
 }
 
 #[test]
@@ -374,6 +398,17 @@ fn cleanup_keeps_row_exactly_at_cutoff_boundary() {
     let mut boundary = sample_ask("boundary-ask", "2024-01-02T01:00:00Z");
     boundary.created_at = "2024-01-02T00:00:00Z".to_owned();
     store.insert_ask(boundary).unwrap();
+    // Resolve the row so the boundary check exercises the strict `<`
+    // comparison, not the pending-row guard.
+    store
+        .try_answer(
+            "boundary-ask",
+            "choice",
+            "yes",
+            "user-1",
+            "2024-01-02T00:30:00Z",
+        )
+        .unwrap();
 
     // retention_days=30, now=2024-02-01 -> cutoff=2024-01-02T00:00:00Z exactly.
     // cleanup's condition is strict `<`, so a row created exactly at the
@@ -384,12 +419,11 @@ fn cleanup_keeps_row_exactly_at_cutoff_boundary() {
     assert!(store.get_ask("boundary-ask").unwrap().is_some());
 }
 
-/// Locks in the current behavior: `cleanup` has no `status` filter, so a
-/// still-`pending` ask (e.g. the daemon never resolved it) is purged by
-/// retention exactly like an answered/timed_out one. This may or may not be
-/// intended — flagged for the QA verdict rather than changed here.
+/// Retention must never delete a question that is still awaiting its answer
+/// — an unresolved ask silently vanishing is data loss, however old it is.
+/// Only resolved (answered/timed_out) rows age out.
 #[test]
-fn cleanup_deletes_old_pending_rows_too() {
+fn cleanup_preserves_pending_rows_regardless_of_age() {
     let store = AskStore::open_in_memory().unwrap();
     let mut old_pending = sample_ask("old-pending", "2024-01-01T01:00:00Z");
     old_pending.created_at = "2024-01-01T00:00:00Z".to_owned();
@@ -397,8 +431,8 @@ fn cleanup_deletes_old_pending_rows_too() {
 
     let deleted = store.cleanup(30, "2024-02-01T00:00:00Z").unwrap();
 
-    assert_eq!(deleted, 1);
-    assert!(store.get_ask("old-pending").unwrap().is_none());
+    assert_eq!(deleted, 0);
+    assert!(store.get_ask("old-pending").unwrap().is_some());
 }
 
 #[test]
