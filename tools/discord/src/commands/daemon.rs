@@ -164,14 +164,14 @@ async fn confirm_child_started(
 /// Atomically claims the pidfile for this process via `O_CREAT|O_EXCL`, so at
 /// most one process can win the create. If the file already exists, its
 /// recorded pid decides the outcome: alive means a real duplicate (usage
-/// error); dead/unparsable means a stale leftover, which is removed before
-/// retrying the create exactly once. A second failure after clearing a stale
-/// entry means we lost a genuine race to another acquirer and is treated as
-/// an internal error rather than looped on.
+/// error); dead — or still unparsable after [`read_pid_settling`]'s wait —
+/// means a stale leftover, which is removed before retrying the create
+/// exactly once. A second failure after clearing a stale entry means we lost
+/// a genuine race to another acquirer (see [`second_create_failure_error`]).
 fn acquire_pidfile(path: &Path) -> Result<(), AppError> {
     match try_create_pidfile(path) {
         Ok(()) => Ok(()),
-        Err(PidfileCreateError::AlreadyExists) => match read_pidfile(path)? {
+        Err(PidfileCreateError::AlreadyExists) => match read_pid_settling(path)? {
             Some(pid) if pid_is_alive(pid) => Err(AppError::new(
                 ErrorKind::Usage,
                 format!("daemon is already running (pid {pid})"),
@@ -185,6 +185,47 @@ fn acquire_pidfile(path: &Path) -> Result<(), AppError> {
             ErrorKind::Internal,
             format!("failed to create pidfile {}: {e}", path.display()),
         )),
+    }
+}
+
+/// How long a losing acquirer waits for the winning acquirer to finish
+/// writing its pid before declaring the pidfile a stale leftover.
+const PID_SETTLE_BUDGET: std::time::Duration = std::time::Duration::from_millis(500);
+const PID_SETTLE_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(10);
+
+/// Reads the pid of an existing pidfile after losing the `O_CREAT|O_EXCL`
+/// race, tolerating the winner's create-then-write window: `try_create_pidfile`
+/// creates the file and *then* writes the pid, so a loser that reads
+/// immediately can observe an existing-but-empty file. Treating that as stale
+/// would delete the winner's claim and let both acquirers succeed (two
+/// daemons) — the exact TOCTOU this guard exists to close. So an
+/// existing-but-unparsable file is re-read on a short budget until a pid
+/// appears; only a file that *stays* unparsable past the budget is reported
+/// as `None` (a genuine crash leftover, safe to reclaim). A file that
+/// disappears mid-wait means the holder released — also `None`, immediately,
+/// so the caller retries the create without burning the budget.
+fn read_pid_settling(path: &Path) -> Result<Option<i32>, AppError> {
+    let deadline = std::time::Instant::now() + PID_SETTLE_BUDGET;
+    loop {
+        match std::fs::read_to_string(path) {
+            Ok(contents) => {
+                if let Some(pid) = parse_pid(&contents) {
+                    return Ok(Some(pid));
+                }
+                // Exists but no pid yet — likely the winner mid-write.
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => {
+                return Err(AppError::new(
+                    ErrorKind::Internal,
+                    format!("failed to read pidfile {}: {e}", path.display()),
+                ));
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            return Ok(None);
+        }
+        std::thread::sleep(PID_SETTLE_POLL_INTERVAL);
     }
 }
 
@@ -826,6 +867,63 @@ mod tests {
 
         child.kill().ok();
         child.wait().ok();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The empty-pidfile race window: `try_create_pidfile` creates the file
+    /// and then writes the pid, so a losing acquirer can observe an
+    /// existing-but-empty file. It must wait for the winner's pid to land
+    /// and then report "already running" — not misjudge the winner's claim
+    /// as stale, delete it, and acquire a second time (two daemons).
+    #[test]
+    fn acquire_pidfile_waits_out_the_winners_write_instead_of_stealing_an_empty_pidfile() {
+        let dir = unique_daemon_dir("acquire-empty-window");
+        let pid_path = dir.join("daemon.pid");
+        // An existing-but-empty pidfile: exactly what a loser sees when it
+        // reads inside the winner's create-then-write window.
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(&pid_path, "").unwrap();
+
+        // The "winner" finishes its write shortly after — well within the
+        // settle budget. Our own pid stands in for a live holder.
+        let writer_path = pid_path.clone();
+        let writer = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            std::fs::write(&writer_path, std::process::id().to_string()).unwrap();
+        });
+
+        let err = acquire_pidfile(&pid_path)
+            .expect_err("the loser must defer to the winner's claim, not steal it");
+        writer.join().unwrap();
+        assert_eq!(err.kind, ErrorKind::Usage);
+        assert!(err.message.contains("already running"));
+        assert_eq!(
+            read_pidfile(&pid_path).unwrap(),
+            Some(std::process::id() as i32),
+            "the winner's pidfile must survive the loser's attempt"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A pidfile that *stays* empty past the settle budget is a genuine
+    /// crash leftover (a process that died between create and write) and
+    /// must still be reclaimable — the settle wait must not turn real stale
+    /// recovery into a permanent lockout.
+    #[test]
+    fn acquire_pidfile_reclaims_a_pidfile_that_stays_empty_past_the_settle_budget() {
+        let dir = unique_daemon_dir("acquire-stays-empty");
+        let pid_path = dir.join("daemon.pid");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(&pid_path, "").unwrap();
+
+        acquire_pidfile(&pid_path)
+            .expect("a permanently-empty pidfile must be reclaimable as stale");
+        assert_eq!(
+            read_pidfile(&pid_path).unwrap(),
+            Some(std::process::id() as i32)
+        );
+
         std::fs::remove_dir_all(&dir).ok();
     }
 
