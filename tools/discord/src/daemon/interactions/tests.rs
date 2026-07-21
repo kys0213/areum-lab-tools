@@ -245,6 +245,119 @@ async fn out_of_range_option_sends_ephemeral() {
     );
 }
 
+// --- modal submit payload variants -------------------------------------------
+
+/// A submit whose text input carries no `value` at all (e.g. an optional
+/// field left empty in a client that omits rather than sends `""`) must fail
+/// fast rather than silently adopting an empty/absent answer — no response is
+/// sent and the ask stays pending for a legitimate retry.
+#[tokio::test]
+async fn modal_submit_missing_value_fails_fast() {
+    let store = store_with_pending("msg1", &["Yes"], "2024-01-01T01:00:00Z");
+    let api = MockDiscordApi::new();
+    let payload = serde_json::json!({
+        "id": "int3",
+        "token": "tok3",
+        "type": 5,
+        "data": {
+            "custom_id": "ask:msg1:text",
+            "components": [{
+                "type": 18,
+                "component": { "type": 4, "custom_id": "answer" }
+            }]
+        },
+        "member": { "user": { "id": "user1" } }
+    });
+
+    let err = handle_interaction(&api, &store, &payload, NOW)
+        .await
+        .expect_err("a modal submit with no text value must fail fast");
+    assert_eq!(err.kind, crate::common::error::ErrorKind::Internal);
+    assert!(api.interaction_calls.borrow().is_empty());
+    assert_eq!(
+        store.get_ask("msg1").unwrap().unwrap().status,
+        crate::common::store::AskStatus::Pending
+    );
+}
+
+/// A `MODAL_SUBMIT` carrying a choice-shaped (`opt:`) custom_id is not a
+/// shape this daemon ever produces (modals only ever reuse the `:text`
+/// custom_id) — it must be ignored like any other foreign id, not treated as
+/// an error or a choice answer.
+#[tokio::test]
+async fn modal_submit_with_choice_shaped_custom_id_is_ignored() {
+    let store = store_with_pending("msg1", &["Yes"], "2024-01-01T01:00:00Z");
+    let api = MockDiscordApi::new();
+    let payload = serde_json::json!({
+        "id": "int3",
+        "token": "tok3",
+        "type": 5,
+        "data": { "custom_id": "ask:msg1:opt:0" },
+        "member": { "user": { "id": "user1" } }
+    });
+
+    handle_interaction(&api, &store, &payload, NOW)
+        .await
+        .unwrap();
+
+    assert!(api.interaction_calls.borrow().is_empty());
+    assert_eq!(
+        store.get_ask("msg1").unwrap().unwrap().status,
+        crate::common::store::AskStatus::Pending
+    );
+}
+
+// --- interaction payload gaps -------------------------------------------------
+
+/// Neither `member.user.id` nor `user.id` is present — a contract violation
+/// per `interaction_user_id`'s doc comment. Must fail fast before any store
+/// write or response, not silently attribute the answer to an empty id.
+#[tokio::test]
+async fn choice_click_without_member_or_user_fails_fast() {
+    let store = store_with_pending("msg1", &["Yes"], "2024-01-01T01:00:00Z");
+    let api = MockDiscordApi::new();
+    let payload = serde_json::json!({
+        "id": "int1",
+        "token": "tok1",
+        "type": 3,
+        "data": { "custom_id": "ask:msg1:opt:0" }
+    });
+
+    let err = handle_interaction(&api, &store, &payload, NOW)
+        .await
+        .expect_err("a payload missing both member and user must fail fast");
+    assert_eq!(err.kind, crate::common::error::ErrorKind::Internal);
+    assert!(err.message.contains("user id"));
+    assert!(api.interaction_calls.borrow().is_empty());
+    assert_eq!(
+        store.get_ask("msg1").unwrap().unwrap().status,
+        crate::common::store::AskStatus::Pending
+    );
+}
+
+/// A DM interaction carries `user.id` directly (no `member` wrapper) —
+/// `interaction_user_id`'s fallback path, previously exercised only by its
+/// guild-shaped (`member.user.id`) branch.
+#[tokio::test]
+async fn choice_click_in_dm_uses_top_level_user_id() {
+    let store = store_with_pending("msg1", &["Yes", "No"], "2024-01-01T01:00:00Z");
+    let api = MockDiscordApi::new();
+    let payload = serde_json::json!({
+        "id": "int1",
+        "token": "tok1",
+        "type": 3,
+        "data": { "custom_id": "ask:msg1:opt:0" },
+        "user": { "id": "dm-user" }
+    });
+
+    handle_interaction(&api, &store, &payload, NOW)
+        .await
+        .unwrap();
+
+    let record = store.get_ask("msg1").unwrap().unwrap();
+    assert_eq!(record.answered_by.as_deref(), Some("dm-user"));
+}
+
 // --- (g) expire task disables buttons ----------------------------------------
 
 #[tokio::test]
@@ -287,6 +400,33 @@ async fn expire_and_disable_noop_when_nothing_due() {
 
     assert_eq!(count, 0);
     assert!(api.edit_components_calls.borrow().is_empty());
+}
+
+/// The click-vs-expire race, from the full `handle_interaction` side: once
+/// `expire_and_disable` has already resolved an ask, a stray click arriving
+/// after it must get the same "already closed" ephemeral as a click that
+/// loses to another click — the record stays `timed_out`, not re-adopted.
+#[tokio::test]
+async fn choice_after_expire_receives_ephemeral_and_leaves_timed_out_record() {
+    let store = store_with_pending("msg1", &["Yes"], "2024-01-01T00:00:05Z");
+    let api = MockDiscordApi::new();
+
+    let expired = expire_and_disable(&api, &store, NOW).await.unwrap();
+    assert_eq!(expired, 1);
+    api.edit_components_calls.borrow_mut().clear();
+
+    handle_interaction(&api, &store, &choice_payload("msg1", 0), NOW)
+        .await
+        .unwrap();
+
+    let calls = api.interaction_calls.borrow();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].2["type"], 4);
+    assert_eq!(calls[0].2["data"]["flags"], 64);
+
+    let record = store.get_ask("msg1").unwrap().unwrap();
+    assert_eq!(record.status, crate::common::store::AskStatus::TimedOut);
+    assert_eq!(record.answered_by, None);
 }
 
 // --- pure parsing units ------------------------------------------------------
