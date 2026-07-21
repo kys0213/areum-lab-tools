@@ -332,19 +332,31 @@ fn is_busy(err: &rusqlite::Error) -> bool {
     )
 }
 
+/// Version the migration blocks in [`migrate`] bring the schema up to.
+const LATEST_SCHEMA_VERSION: i64 = 1;
+
 /// Applies pending schema migrations, tracked via a single-row
 /// `schema_version` table. Safe to call on every `open` — a database already
-/// at the latest version is a no-op. SP3/SP4 (message cache, event
-/// subscription) grow the same DB file by appending `if current < N`
-/// migration blocks here rather than introducing a new store.
+/// at the latest version returns after one plain SELECT, without taking the
+/// writer lock: `ask wait` polling opens a connection per poll, and a
+/// `BEGIN IMMEDIATE` on each of those would contend with the daemon's
+/// 3-second interaction-response writes for no reason. SP3/SP4 (message
+/// cache, event subscription) grow the same DB file by appending
+/// `if current < N` migration blocks here rather than introducing a new
+/// store.
 ///
-/// The whole version-check + DDL + version-stamp runs inside one
-/// `BEGIN IMMEDIATE` transaction: a crash mid-migration rolls back to a
-/// clean slate, and two processes racing the first open serialize on the
-/// write lock (the loser waits within busy_timeout, then re-reads the
-/// version and skips). `IF NOT EXISTS` on the DDL is a second line of
-/// defense for a database left half-migrated by a pre-transaction binary.
+/// When migration is needed, the version re-check + DDL + version-stamp run
+/// inside one `BEGIN IMMEDIATE` transaction: a crash mid-migration rolls
+/// back to a clean slate, and two processes racing the first open serialize
+/// on the write lock (the loser waits within busy_timeout, then re-reads the
+/// version inside the transaction and skips). `IF NOT EXISTS` on the DDL is
+/// a second line of defense for a database left half-migrated by a
+/// pre-transaction binary.
 fn migrate(conn: &mut Connection) -> Result<(), AppError> {
+    if read_schema_version(conn)? >= LATEST_SCHEMA_VERSION {
+        return Ok(());
+    }
+
     let tx = conn
         .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
         .map_err(map_sqlite_err)?;
@@ -352,6 +364,8 @@ fn migrate(conn: &mut Connection) -> Result<(), AppError> {
     tx.execute_batch("CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL)")
         .map_err(map_sqlite_err)?;
 
+    // Re-read under the write lock: another process may have migrated between
+    // the unlocked fast-path read above and this transaction's start.
     let current: i64 = tx
         .query_row("SELECT version FROM schema_version LIMIT 1", [], |row| {
             row.get(0)
@@ -367,6 +381,29 @@ fn migrate(conn: &mut Connection) -> Result<(), AppError> {
     }
 
     tx.commit().map_err(map_sqlite_err)
+}
+
+/// Lock-free schema version probe for the `migrate` fast path. A database
+/// without a `schema_version` table (fresh file, or pre-migration crash
+/// before the table existed) reads as version 0 — checked via sqlite_master
+/// rather than by pattern-matching a "no such table" error.
+fn read_schema_version(conn: &Connection) -> Result<i64, AppError> {
+    let table_exists: bool = conn
+        .query_row(
+            "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'schema_version')",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(map_sqlite_err)?;
+    if !table_exists {
+        return Ok(0);
+    }
+    conn.query_row("SELECT version FROM schema_version LIMIT 1", [], |row| {
+        row.get(0)
+    })
+    .optional()
+    .map_err(map_sqlite_err)
+    .map(|version| version.unwrap_or(0))
 }
 
 /// v1 DDL. Shared with the partial-migration recovery test, which uses it to
