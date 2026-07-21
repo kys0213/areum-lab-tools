@@ -555,6 +555,87 @@ async fn wait_rejects_interval_zero() {
     assert_eq!(err.kind, ErrorKind::Usage);
 }
 
+/// P3: `--timeout 0` is deliberately *not* rejected — pinning the same
+/// convention `discord wait` already established (`commands/wait.rs`
+/// rejects `interval == 0` but not `timeout == 0`, via
+/// `max_polls = timeout.div_ceil(interval).max(1)`): a zero poll budget
+/// still runs exactly one immediate poll rather than erroring. `ask wait`
+/// mirrors that same expression, so this locks in the existing behavior
+/// rather than introducing a new rejection that would diverge from it.
+#[tokio::test]
+async fn wait_with_zero_timeout_polls_once_immediately_without_sleeping() {
+    let db_path = unique_db_path("wait-zero-timeout");
+    let store = AskStore::open(&db_path).unwrap();
+    store
+        .insert_ask(sample_ask("ask-9", "2999-01-01T00:00:00Z"))
+        .unwrap();
+    let sleeper = FakeSleeper::new();
+
+    let payload = run_ask_wait(&db_path, &sleeper, "ask-9", 0, 5)
+        .await
+        .unwrap();
+
+    match payload {
+        Payload::AskWait(d) => {
+            assert!(
+                d.timed_out,
+                "a zero poll budget must report poll_timed_out after the single poll"
+            );
+            assert_eq!(
+                d.result,
+                AskResultData::Pending {
+                    ask_id: "ask-9".into()
+                }
+            );
+        }
+        other => panic!("expected AskWait, got {other:?}"),
+    }
+    assert_eq!(
+        sleeper.calls.borrow().len(),
+        0,
+        "a single immediate poll needs no sleep"
+    );
+
+    std::fs::remove_dir_all(db_path.parent().unwrap()).ok();
+}
+
+/// P3: `--interval` exceeding `--timeout` still runs exactly one poll
+/// (`ceil(timeout / interval) == 1`) rather than erroring or looping —
+/// pinning the existing arithmetic's behavior at this edge.
+#[tokio::test]
+async fn wait_with_interval_greater_than_timeout_still_polls_exactly_once() {
+    let db_path = unique_db_path("wait-interval-gt-timeout");
+    let store = AskStore::open(&db_path).unwrap();
+    store
+        .insert_ask(sample_ask("ask-10", "2999-01-01T00:00:00Z"))
+        .unwrap();
+    let sleeper = FakeSleeper::new();
+
+    let payload = run_ask_wait(&db_path, &sleeper, "ask-10", 10, 100)
+        .await
+        .unwrap();
+
+    match payload {
+        Payload::AskWait(d) => {
+            assert!(d.timed_out);
+            assert_eq!(
+                d.result,
+                AskResultData::Pending {
+                    ask_id: "ask-10".into()
+                }
+            );
+        }
+        other => panic!("expected AskWait, got {other:?}"),
+    }
+    assert_eq!(
+        sleeper.calls.borrow().len(),
+        0,
+        "a single poll needs no sleep regardless of the interval value"
+    );
+
+    std::fs::remove_dir_all(db_path.parent().unwrap()).ok();
+}
+
 #[tokio::test]
 async fn wait_errors_for_unknown_ask_id() {
     let db_path = unique_db_path("wait-missing");

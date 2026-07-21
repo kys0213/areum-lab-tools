@@ -725,6 +725,45 @@ async fn choice_after_expire_receives_ephemeral_and_leaves_timed_out_record() {
     assert_eq!(record.answered_by, None);
 }
 
+/// P3: the modal-open-then-timeout race, but for the free-text path — a user
+/// who had the modal open before the ask's deadline passed and submits after
+/// must get the same "already closed" ephemeral as any other loss, with no
+/// text answer adopted (an existing loss branch in `handle_modal_submit`;
+/// this pins the timeout-specific scenario that reaches it).
+#[tokio::test]
+async fn modal_submit_after_expire_receives_ephemeral_and_does_not_adopt() {
+    let store = store_with_pending("msg1", &["Yes"], "2024-01-01T00:00:05Z");
+    let api = MockDiscordApi::new();
+    let mut retry_queue = ExpireRetryQueue::new();
+
+    let expired = expire_and_disable(&api, &store, NOW, &mut retry_queue)
+        .await
+        .unwrap();
+    assert_eq!(expired, 1);
+    api.interaction_calls.borrow_mut().clear();
+    api.edit_components_calls.borrow_mut().clear();
+
+    handle_interaction(&api, &store, &modal_submit_payload("msg1", "too late"), NOW)
+        .await
+        .unwrap();
+
+    let calls = api.interaction_calls.borrow();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(
+        calls[0].2["type"], 4,
+        "must be an ephemeral notice, not an UPDATE_MESSAGE adoption"
+    );
+    assert_eq!(calls[0].2["data"]["flags"], 64);
+
+    let record = store.get_ask("msg1").unwrap().unwrap();
+    assert_eq!(record.status, crate::common::store::AskStatus::TimedOut);
+    assert_eq!(
+        record.value, None,
+        "the late submission must not be adopted"
+    );
+    assert_eq!(record.answered_by, None);
+}
+
 // --- pure parsing units ------------------------------------------------------
 
 #[test]
