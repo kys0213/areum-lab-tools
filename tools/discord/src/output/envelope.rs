@@ -254,6 +254,90 @@ mod tests {
     }
 
     #[test]
+    fn ask_create_success_matches_contract() {
+        use crate::output::payload::AskCreateData;
+
+        let payload = Payload::AskCreate(AskCreateData {
+            ask_id: "111".into(),
+            status: "pending".into(),
+            channel_id: "222".into(),
+        });
+        let (sink, json, code) = render("ask", &Ok(payload), true);
+        assert_eq!(sink, Sink::Stdout);
+        assert_eq!(code, 0);
+        assert_eq!(
+            json,
+            r#"{"ok":true,"command":"ask","data":{"ask_id":"111","status":"pending","channel_id":"222"}}"#
+        );
+    }
+
+    #[test]
+    fn ask_result_pending_matches_contract() {
+        use crate::output::payload::AskResultData;
+
+        let payload = Payload::AskResult(AskResultData::Pending {
+            ask_id: "111".into(),
+        });
+        let (_, json, _) = render("ask", &Ok(payload), true);
+        assert_eq!(
+            json,
+            r#"{"ok":true,"command":"ask","data":{"status":"pending","ask_id":"111"}}"#
+        );
+    }
+
+    #[test]
+    fn ask_result_answered_matches_contract() {
+        use crate::output::payload::AskResultData;
+
+        let payload = Payload::AskResult(AskResultData::Answered {
+            ask_id: "111".into(),
+            kind: "choice".into(),
+            value: "yes".into(),
+            answered_by: "u1".into(),
+            answered_at: "2024-01-01T00:00:00Z".into(),
+        });
+        let (_, json, _) = render("ask", &Ok(payload), true);
+        assert_eq!(
+            json,
+            r#"{"ok":true,"command":"ask","data":{"status":"answered","ask_id":"111","kind":"choice","value":"yes","answered_by":"u1","answered_at":"2024-01-01T00:00:00Z"}}"#
+        );
+    }
+
+    #[test]
+    fn ask_result_timed_out_matches_contract() {
+        use crate::output::payload::AskResultData;
+
+        let payload = Payload::AskResult(AskResultData::TimedOut {
+            ask_id: "111".into(),
+        });
+        let (_, json, _) = render("ask", &Ok(payload), true);
+        assert_eq!(
+            json,
+            r#"{"ok":true,"command":"ask","data":{"status":"timed_out","ask_id":"111"}}"#
+        );
+    }
+
+    #[test]
+    fn ask_wait_flattens_result_alongside_its_own_timed_out_field() {
+        use crate::output::payload::{AskResultData, AskWaitData};
+
+        // The wait poll's own `timed_out` must appear as a top-level sibling
+        // of the flattened ask status fields, not nested or name-collided
+        // with `status: "timed_out"`.
+        let payload = Payload::AskWait(AskWaitData {
+            result: AskResultData::Pending {
+                ask_id: "111".into(),
+            },
+            timed_out: true,
+        });
+        let (_, json, _) = render("ask", &Ok(payload), true);
+        assert_eq!(
+            json,
+            r#"{"ok":true,"command":"ask","data":{"status":"pending","ask_id":"111","timed_out":true}}"#
+        );
+    }
+
+    #[test]
     fn thread_success_matches_contract() {
         let payload = Payload::Thread(ThreadData {
             thread_id: "111".into(),
