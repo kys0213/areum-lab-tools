@@ -61,9 +61,11 @@ DB 파일: `~/.areum/discord/discord.db` (WAL 모드).
 | `kind` | TEXT NOT NULL | `choice` \| `text` — 실제로 채택된 응답의 종류 |
 | `value` | TEXT NULL | 채택된 응답 값 (선택지 텍스트 또는 자유 텍스트) |
 | `answered_by` | TEXT NULL | 응답한 Discord 유저 id |
-| `created_at` | INTEGER NOT NULL | 생성 시각 (unix epoch) |
-| `timeout_at` | INTEGER NOT NULL | 마감 시각 (unix epoch) |
-| `answered_at` | INTEGER NULL | 응답 확정 시각 (unix epoch) |
+| `created_at` | TEXT NOT NULL | 생성 시각 (RFC3339) |
+| `timeout_at` | TEXT NOT NULL | 마감 시각 (RFC3339) |
+| `answered_at` | TEXT NULL | 응답 확정 시각 (RFC3339) |
+
+시각 필드는 크레이트 전체 관행(기존 CLI의 `timestamp` 표현)과 동일하게 RFC3339 문자열(TEXT)로 저장한다. 동일 포맷(UTC 고정)의 RFC3339 문자열은 사전순 비교가 시간순 비교와 일치하므로, 만료 스캔·보존 정책의 비교 연산도 TEXT 그대로 수행한다.
 
 `status`/`kind`/`value`/`answered_by`/`answered_at`는 생성 시 `status='pending'`, 나머지 NULL로 시작해 첫 응답 또는 타임아웃 시 채워진다.
 
