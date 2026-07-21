@@ -14,3 +14,6 @@ reqwest = { workspace = true }
 bytes = { workspace = true }
 mime_guess = { workspace = true }
 rusqlite = { workspace = true }
+twilight-gateway = { workspace = true }
+twilight-model = { workspace = true }
+libc = { workspace = true }
