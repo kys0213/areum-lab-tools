@@ -11,11 +11,19 @@ clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 anyhow = "1"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "signal"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "multipart", "rustls-tls"] }
 bytes = "1"
 mime_guess = "2"
 rusqlite = { version = "0.40", features = ["bundled"] }
+# Gateway websocket only: default features pull in twilight-http (we reuse our
+# own reqwest client for REST) and zstd (a C dependency), so both are dropped
+# via default-features=false. rustls-webpki-roots mirrors reqwest's rustls-tls
+# (bundled roots, no platform-native verifier dep).
+twilight-gateway = { version = "0.17", default-features = false, features = ["rustls-webpki-roots"] }
+twilight-model = "0.17"
+# Unix process signalling (kill(2) liveness probe + SIGTERM) for daemon stop/status.
+libc = "0.2"
 
 [profile.release]
 strip = true

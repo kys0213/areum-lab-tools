@@ -155,6 +155,19 @@ impl AskStore {
         Ok(())
     }
 
+    /// Counts asks still awaiting a response. Read-only, used by
+    /// `daemon status` to report the outstanding-question backlog.
+    pub(crate) fn count_pending(&self) -> Result<usize, AppError> {
+        self.conn
+            .query_row(
+                "SELECT COUNT(*) FROM asks WHERE status = 'pending'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .map(|count| count as usize)
+            .map_err(map_sqlite_err)
+    }
+
     pub(crate) fn get_ask(&self, ask_id: &str) -> Result<Option<AskRecord>, AppError> {
         self.conn
             .query_row(
