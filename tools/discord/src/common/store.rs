@@ -106,20 +106,20 @@ impl AskStore {
             })?;
         }
 
-        let conn = Connection::open(path).map_err(map_sqlite_err)?;
+        let mut conn = Connection::open(path).map_err(map_sqlite_err)?;
         conn.pragma_update(None, "journal_mode", "WAL")
             .map_err(map_sqlite_err)?;
         conn.busy_timeout(std::time::Duration::from_millis(5_000))
             .map_err(map_sqlite_err)?;
-        migrate(&conn)?;
+        migrate(&mut conn)?;
         Ok(AskStore { conn })
     }
 
     /// Opens an in-memory store for tests. WAL mode is meaningless for
     /// `:memory:` databases, so it's skipped here.
     pub(crate) fn open_in_memory() -> Result<AskStore, AppError> {
-        let conn = Connection::open_in_memory().map_err(map_sqlite_err)?;
-        migrate(&conn)?;
+        let mut conn = Connection::open_in_memory().map_err(map_sqlite_err)?;
+        migrate(&mut conn)?;
         Ok(AskStore { conn })
     }
 
@@ -265,11 +265,22 @@ fn row_to_record(row: &Row<'_>) -> rusqlite::Result<AskRecord> {
 /// at the latest version is a no-op. SP3/SP4 (message cache, event
 /// subscription) grow the same DB file by appending `if current < N`
 /// migration blocks here rather than introducing a new store.
-fn migrate(conn: &Connection) -> Result<(), AppError> {
-    conn.execute_batch("CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL)")
+///
+/// The whole version-check + DDL + version-stamp runs inside one
+/// `BEGIN IMMEDIATE` transaction: a crash mid-migration rolls back to a
+/// clean slate, and two processes racing the first open serialize on the
+/// write lock (the loser waits within busy_timeout, then re-reads the
+/// version and skips). `IF NOT EXISTS` on the DDL is a second line of
+/// defense for a database left half-migrated by a pre-transaction binary.
+fn migrate(conn: &mut Connection) -> Result<(), AppError> {
+    let tx = conn
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
         .map_err(map_sqlite_err)?;
 
-    let current: i64 = conn
+    tx.execute_batch("CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL)")
+        .map_err(map_sqlite_err)?;
+
+    let current: i64 = tx
         .query_row("SELECT version FROM schema_version LIMIT 1", [], |row| {
             row.get(0)
         })
@@ -278,27 +289,30 @@ fn migrate(conn: &Connection) -> Result<(), AppError> {
         .unwrap_or(0);
 
     if current < 1 {
-        conn.execute_batch(
-            "CREATE TABLE asks (
-                ask_id TEXT PRIMARY KEY,
-                channel_id TEXT NOT NULL,
-                question TEXT NOT NULL,
-                options TEXT NOT NULL,
-                allow_text INTEGER NOT NULL,
-                status TEXT NOT NULL,
-                kind TEXT,
-                value TEXT,
-                answered_by TEXT,
-                created_at TEXT NOT NULL,
-                timeout_at TEXT NOT NULL,
-                answered_at TEXT
-             );
-             INSERT INTO schema_version (version) VALUES (1);",
-        )
-        .map_err(map_sqlite_err)?;
+        tx.execute_batch(CREATE_ASKS_SQL).map_err(map_sqlite_err)?;
+        tx.execute_batch("INSERT INTO schema_version (version) VALUES (1)")
+            .map_err(map_sqlite_err)?;
     }
-    Ok(())
+
+    tx.commit().map_err(map_sqlite_err)
 }
+
+/// v1 DDL. Shared with the partial-migration recovery test, which uses it to
+/// reproduce a crash between table creation and the version stamp.
+const CREATE_ASKS_SQL: &str = "CREATE TABLE IF NOT EXISTS asks (
+    ask_id TEXT PRIMARY KEY,
+    channel_id TEXT NOT NULL,
+    question TEXT NOT NULL,
+    options TEXT NOT NULL,
+    allow_text INTEGER NOT NULL,
+    status TEXT NOT NULL,
+    kind TEXT,
+    value TEXT,
+    answered_by TEXT,
+    created_at TEXT NOT NULL,
+    timeout_at TEXT NOT NULL,
+    answered_at TEXT
+)";
 
 fn map_sqlite_err(err: rusqlite::Error) -> AppError {
     AppError::new(ErrorKind::Internal, format!("sqlite error: {err}"))

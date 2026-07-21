@@ -426,3 +426,51 @@ fn get_ask_errors_on_unknown_status_instead_of_defaulting() {
         err.message
     );
 }
+
+/// Reproduces a crash between the asks DDL and the schema_version stamp:
+/// the table exists but the version row was never written. open() must
+/// recover (treat the DDL as already applied and stamp the version), not
+/// fail forever on "table asks already exists".
+#[test]
+fn open_recovers_from_migration_crash_between_ddl_and_version_stamp() {
+    let dir = unique_store_dir("partial-migration");
+    let db_path = dir.join("discord.db");
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let conn = Connection::open(&db_path).unwrap();
+    conn.execute_batch("CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL)")
+        .unwrap();
+    conn.execute_batch(CREATE_ASKS_SQL).unwrap();
+    drop(conn);
+
+    let store = AskStore::open(&db_path).unwrap();
+    store
+        .insert_ask(sample_ask("recovered", "2024-01-01T01:00:00Z"))
+        .unwrap();
+    assert!(store.get_ask("recovered").unwrap().is_some());
+
+    drop(store);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Two processes racing the very first open of the same file: BEGIN
+/// IMMEDIATE serializes the migrations, so the loser waits (busy_timeout)
+/// and then skips the already-applied migration instead of erroring.
+#[test]
+fn concurrent_first_open_of_same_file_both_succeed() {
+    let dir = unique_store_dir("concurrent-open");
+    let db_path = dir.join("discord.db");
+
+    let path_a = db_path.clone();
+    let path_b = db_path.clone();
+    let handle_a = std::thread::spawn(move || AskStore::open(&path_a).map(|_| ()));
+    let handle_b = std::thread::spawn(move || AskStore::open(&path_b).map(|_| ()));
+
+    handle_a.join().unwrap().expect("first opener must succeed");
+    handle_b
+        .join()
+        .unwrap()
+        .expect("second opener must succeed");
+
+    std::fs::remove_dir_all(&dir).ok();
+}
