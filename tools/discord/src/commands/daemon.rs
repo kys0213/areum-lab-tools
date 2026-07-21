@@ -33,6 +33,11 @@ use crate::output::{
 const STOP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 const STOP_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
 
+/// How long [`start_background`] waits for its spawned child to reach
+/// [`run_foreground`]'s `acquire_pidfile` before reporting a startup failure.
+const START_CONFIRM_BUDGET: std::time::Duration = std::time::Duration::from_secs(3);
+const START_CONFIRM_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+
 /// Starts the daemon. With `foreground`, runs the gateway loop in this process
 /// until SIGTERM; otherwise detaches a child running `--foreground` and records
 /// its pid. `token` is already resolved (fail-fast happened in `main`) and is
@@ -47,7 +52,7 @@ pub(crate) async fn run_daemon_start(
     if foreground {
         run_foreground(db_path, pid_path, token).await
     } else {
-        start_background(pid_path, config_flag, &token)
+        start_background(pid_path, config_flag, &token).await
     }
 }
 
@@ -81,12 +86,13 @@ async fn run_foreground(
     }))
 }
 
-/// Spawns the detached child and returns immediately; it never writes the
-/// pidfile itself (see module doc). The liveness check here is a fast,
+/// Spawns the detached child and waits for it to confirm it actually reached
+/// a healthy state before reporting success; it never writes the pidfile
+/// itself (see module doc). The pre-spawn liveness check here is a fast,
 /// best-effort rejection for obvious duplicate calls — not the real guard,
 /// which is the child's own [`acquire_pidfile`] once it reaches
 /// [`run_foreground`].
-fn start_background(
+async fn start_background(
     pid_path: &Path,
     config_flag: Option<&str>,
     token: &str,
@@ -99,45 +105,160 @@ fn start_background(
             format!("daemon is already running (pid {pid})"),
         ));
     }
-    let child_pid = spawn_detached(config_flag, token)?;
+    let mut child = spawn_detached(config_flag, token)?;
+    let child_pid = child.id();
+    confirm_child_started(
+        pid_path,
+        &mut child,
+        child_pid,
+        START_CONFIRM_BUDGET,
+        START_CONFIRM_POLL_INTERVAL,
+    )
+    .await?;
     Ok(Payload::DaemonStart(DaemonStartData {
         pid: child_pid,
         foreground: false,
     }))
 }
 
+/// Waits up to `budget` (polled every `poll_interval`) for the spawned child
+/// to claim the pidfile via its own `acquire_pidfile` call in
+/// [`run_foreground`] — the spawner's only feedback that the child reached a
+/// healthy state rather than dying immediately (bad token, config error).
+/// Uses `child.try_wait()` (which reaps the child) rather than `kill(pid, 0)`
+/// to detect an early exit: a child we never `wait()` on stays a zombie and
+/// would otherwise still answer "alive" to a signal-0 probe.
+async fn confirm_child_started(
+    pid_path: &Path,
+    child: &mut std::process::Child,
+    child_pid: u32,
+    budget: std::time::Duration,
+    poll_interval: std::time::Duration,
+) -> Result<(), AppError> {
+    let deadline = std::time::Instant::now() + budget;
+    loop {
+        if read_pidfile(pid_path)?.is_some_and(|pid| pid == child_pid as i32) {
+            return Ok(());
+        }
+        if let Some(status) = child.try_wait().map_err(|e| {
+            AppError::new(
+                ErrorKind::Internal,
+                format!("failed to check daemon child status: {e}"),
+            )
+        })? {
+            return Err(AppError::new(
+                ErrorKind::Internal,
+                format!("daemon failed to start (child process exited early: {status})"),
+            ));
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(AppError::new(
+                ErrorKind::Internal,
+                format!("daemon did not confirm startup within {budget:?}"),
+            ));
+        }
+        tokio::time::sleep(poll_interval).await;
+    }
+}
+
 /// Atomically claims the pidfile for this process via `O_CREAT|O_EXCL`, so at
 /// most one process can win the create. If the file already exists, its
 /// recorded pid decides the outcome: alive means a real duplicate (usage
-/// error); dead/unparsable means a stale leftover, which is removed before
-/// retrying the create exactly once. A second failure after clearing a stale
-/// entry means we lost a genuine race to another acquirer and is treated as
-/// an internal error rather than looped on.
+/// error); dead — or still unparsable after [`read_pid_settling`]'s wait —
+/// means a stale leftover, which is removed before retrying the create
+/// exactly once. A second failure after clearing a stale entry means we lost
+/// a genuine race to another acquirer (see [`second_create_failure_error`]).
 fn acquire_pidfile(path: &Path) -> Result<(), AppError> {
     match try_create_pidfile(path) {
         Ok(()) => Ok(()),
-        Err(PidfileCreateError::AlreadyExists) => match read_pidfile(path)? {
+        Err(PidfileCreateError::AlreadyExists) => match read_pid_settling(path)? {
             Some(pid) if pid_is_alive(pid) => Err(AppError::new(
                 ErrorKind::Usage,
                 format!("daemon is already running (pid {pid})"),
             )),
             _ => {
                 remove_pidfile(path)?;
-                try_create_pidfile(path).map_err(|_| {
-                    AppError::new(
-                        ErrorKind::Internal,
-                        format!(
-                            "failed to acquire pidfile {} after clearing a stale entry",
-                            path.display()
-                        ),
-                    )
-                })
+                try_create_pidfile(path).map_err(|e| second_create_failure_error(path, e))
             }
         },
         Err(PidfileCreateError::Io(e)) => Err(AppError::new(
             ErrorKind::Internal,
             format!("failed to create pidfile {}: {e}", path.display()),
         )),
+    }
+}
+
+/// How long a losing acquirer waits for the winning acquirer to finish
+/// writing its pid before declaring the pidfile a stale leftover.
+const PID_SETTLE_BUDGET: std::time::Duration = std::time::Duration::from_millis(500);
+const PID_SETTLE_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(10);
+
+/// Reads the pid of an existing pidfile after losing the `O_CREAT|O_EXCL`
+/// race, tolerating the winner's create-then-write window: `try_create_pidfile`
+/// creates the file and *then* writes the pid, so a loser that reads
+/// immediately can observe an existing-but-empty file. Treating that as stale
+/// would delete the winner's claim and let both acquirers succeed (two
+/// daemons) — the exact TOCTOU this guard exists to close. So an
+/// existing-but-unparsable file is re-read on a short budget until a pid
+/// appears; only a file that *stays* unparsable past the budget is reported
+/// as `None` (a genuine crash leftover, safe to reclaim). A file that
+/// disappears mid-wait means the holder released — also `None`, immediately,
+/// so the caller retries the create without burning the budget.
+fn read_pid_settling(path: &Path) -> Result<Option<i32>, AppError> {
+    let deadline = std::time::Instant::now() + PID_SETTLE_BUDGET;
+    loop {
+        match std::fs::read_to_string(path) {
+            Ok(contents) => {
+                if let Some(pid) = parse_pid(&contents) {
+                    return Ok(Some(pid));
+                }
+                // Exists but no pid yet — likely the winner mid-write.
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => {
+                return Err(AppError::new(
+                    ErrorKind::Internal,
+                    format!("failed to read pidfile {}: {e}", path.display()),
+                ));
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            return Ok(None);
+        }
+        std::thread::sleep(PID_SETTLE_POLL_INTERVAL);
+    }
+}
+
+/// Classifies a failure on the second (post-stale-clear) `try_create_pidfile`
+/// attempt. A second `AlreadyExists` means another acquirer won a genuine
+/// race in the gap between our `remove_pidfile` and retry — if its pid is
+/// alive, that is the ordinary "already running" outcome, not our fault, so
+/// it gets the same usage error as the first-attempt live-holder case rather
+/// than a generic internal one. Everything else (unreadable/dead pid despite
+/// losing the create, or a real I/O error) has no such benign explanation and
+/// stays `Internal`.
+fn second_create_failure_error(path: &Path, err: PidfileCreateError) -> AppError {
+    match err {
+        PidfileCreateError::AlreadyExists => match read_pidfile(path) {
+            Ok(Some(pid)) if pid_is_alive(pid) => AppError::new(
+                ErrorKind::Usage,
+                format!("daemon is already running (pid {pid})"),
+            ),
+            _ => AppError::new(
+                ErrorKind::Internal,
+                format!(
+                    "failed to acquire pidfile {} after clearing a stale entry",
+                    path.display()
+                ),
+            ),
+        },
+        PidfileCreateError::Io(e) => AppError::new(
+            ErrorKind::Internal,
+            format!(
+                "failed to acquire pidfile {} after clearing a stale entry: {e}",
+                path.display()
+            ),
+        ),
     }
 }
 
@@ -189,7 +310,12 @@ fn release_own_pidfile(path: &Path) {
 /// and its own process group so it outlives the launching shell and its job
 /// control. `--config` is forwarded; the token rides in the environment to keep
 /// it out of the process table / shell history.
-fn spawn_detached(config_flag: Option<&str>, token: &str) -> Result<u32, AppError> {
+///
+/// Returns the live [`std::process::Child`] handle (not just its pid) so the
+/// caller can `try_wait()` on it — [`confirm_child_started`] needs that to
+/// reliably detect an early exit rather than a zombie still answering
+/// "alive" to a signal-0 probe.
+fn spawn_detached(config_flag: Option<&str>, token: &str) -> Result<std::process::Child, AppError> {
     let exe = std::env::current_exe().map_err(|e| {
         AppError::new(
             ErrorKind::Internal,
@@ -208,13 +334,12 @@ fn spawn_detached(config_flag: Option<&str>, token: &str) -> Result<u32, AppErro
     // pgid 0 => the child leads a fresh process group, detaching it from the
     // launcher's terminal job control.
     cmd.process_group(0);
-    let child = cmd.spawn().map_err(|e| {
+    cmd.spawn().map_err(|e| {
         AppError::new(
             ErrorKind::Internal,
             format!("failed to spawn background daemon: {e}"),
         )
-    })?;
-    Ok(child.id())
+    })
 }
 
 /// Stops the running daemon: SIGTERM, wait for exit, then remove the pidfile.
@@ -650,6 +775,201 @@ mod tests {
 
         child.kill().ok();
         child.wait().ok();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `confirm_child_started` must succeed as soon as the pidfile appears
+    /// recording the expected child pid, even while the (still-alive) child
+    /// process keeps running — this is the normal, healthy startup path.
+    #[tokio::test]
+    async fn confirm_child_started_succeeds_when_pidfile_appears_before_child_exits() {
+        let dir = unique_daemon_dir("confirm-success");
+        let pid_path = dir.join("daemon.pid");
+        let mut child = std::process::Command::new("sleep")
+            .arg("5")
+            .spawn()
+            .expect("spawn a real child process to stand in for the daemon");
+        let child_pid = child.id();
+
+        // Simulates the child reaching `acquire_pidfile` shortly after spawn.
+        let write_pid_path = pid_path.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(30));
+            write_pidfile(&write_pid_path, child_pid as i32).unwrap();
+        });
+
+        confirm_child_started(
+            &pid_path,
+            &mut child,
+            child_pid,
+            std::time::Duration::from_millis(500),
+            std::time::Duration::from_millis(10),
+        )
+        .await
+        .expect("must succeed once the pidfile records the child's pid");
+
+        child.kill().ok();
+        child.wait().ok();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A child that exits (e.g. a bad token / config error) before ever
+    /// reaching `acquire_pidfile` must be reported as a startup failure
+    /// rather than silently reported as a successful background start.
+    #[tokio::test]
+    async fn confirm_child_started_errors_when_child_exits_before_claiming_pidfile() {
+        let dir = unique_daemon_dir("confirm-early-exit");
+        let pid_path = dir.join("daemon.pid");
+        let mut child = std::process::Command::new("false")
+            .spawn()
+            .expect("spawn a real child process that exits immediately");
+        let child_pid = child.id();
+
+        let err = confirm_child_started(
+            &pid_path,
+            &mut child,
+            child_pid,
+            std::time::Duration::from_millis(500),
+            std::time::Duration::from_millis(10),
+        )
+        .await
+        .expect_err("an early-exiting child must not be reported as a successful start");
+        assert_eq!(err.kind, ErrorKind::Internal);
+        assert!(err.message.contains("failed to start"));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A child that neither claims the pidfile nor exits within the budget
+    /// (e.g. hung on a slow gateway handshake) must fail with a distinct
+    /// "did not confirm" error rather than hanging the CLI invocation.
+    #[tokio::test]
+    async fn confirm_child_started_errors_when_budget_is_exhausted_with_child_still_alive() {
+        let dir = unique_daemon_dir("confirm-budget-exhausted");
+        let pid_path = dir.join("daemon.pid");
+        let mut child = std::process::Command::new("sleep")
+            .arg("5")
+            .spawn()
+            .expect("spawn a real child process to stand in for a hung daemon");
+        let child_pid = child.id();
+
+        let err = confirm_child_started(
+            &pid_path,
+            &mut child,
+            child_pid,
+            std::time::Duration::from_millis(50),
+            std::time::Duration::from_millis(10),
+        )
+        .await
+        .expect_err("exhausting the confirm budget must be reported, not hang forever");
+        assert_eq!(err.kind, ErrorKind::Internal);
+        assert!(err.message.contains("did not confirm startup"));
+
+        child.kill().ok();
+        child.wait().ok();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The empty-pidfile race window: `try_create_pidfile` creates the file
+    /// and then writes the pid, so a losing acquirer can observe an
+    /// existing-but-empty file. It must wait for the winner's pid to land
+    /// and then report "already running" — not misjudge the winner's claim
+    /// as stale, delete it, and acquire a second time (two daemons).
+    #[test]
+    fn acquire_pidfile_waits_out_the_winners_write_instead_of_stealing_an_empty_pidfile() {
+        let dir = unique_daemon_dir("acquire-empty-window");
+        let pid_path = dir.join("daemon.pid");
+        // An existing-but-empty pidfile: exactly what a loser sees when it
+        // reads inside the winner's create-then-write window.
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(&pid_path, "").unwrap();
+
+        // The "winner" finishes its write shortly after — well within the
+        // settle budget. Our own pid stands in for a live holder.
+        let writer_path = pid_path.clone();
+        let writer = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            std::fs::write(&writer_path, std::process::id().to_string()).unwrap();
+        });
+
+        let err = acquire_pidfile(&pid_path)
+            .expect_err("the loser must defer to the winner's claim, not steal it");
+        writer.join().unwrap();
+        assert_eq!(err.kind, ErrorKind::Usage);
+        assert!(err.message.contains("already running"));
+        assert_eq!(
+            read_pidfile(&pid_path).unwrap(),
+            Some(std::process::id() as i32),
+            "the winner's pidfile must survive the loser's attempt"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A pidfile that *stays* empty past the settle budget is a genuine
+    /// crash leftover (a process that died between create and write) and
+    /// must still be reclaimable — the settle wait must not turn real stale
+    /// recovery into a permanent lockout.
+    #[test]
+    fn acquire_pidfile_reclaims_a_pidfile_that_stays_empty_past_the_settle_budget() {
+        let dir = unique_daemon_dir("acquire-stays-empty");
+        let pid_path = dir.join("daemon.pid");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(&pid_path, "").unwrap();
+
+        acquire_pidfile(&pid_path)
+            .expect("a permanently-empty pidfile must be reclaimable as stale");
+        assert_eq!(
+            read_pidfile(&pid_path).unwrap(),
+            Some(std::process::id() as i32)
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Q2 minor: a second create failure whose re-read shows a live pid is a
+    /// genuine race loss to another acquirer — the ordinary "already
+    /// running" usage error, not an opaque internal one.
+    #[test]
+    fn second_create_failure_error_reports_usage_when_a_live_pid_now_holds_it() {
+        let dir = unique_daemon_dir("second-failure-live");
+        let pid_path = dir.join("daemon.pid");
+        write_pidfile(&pid_path, std::process::id() as i32).unwrap();
+
+        let err = second_create_failure_error(&pid_path, PidfileCreateError::AlreadyExists);
+        assert_eq!(err.kind, ErrorKind::Usage);
+        assert!(err.message.contains("already running"));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A second `AlreadyExists` whose re-read shows no live pid (dead/
+    /// unparsable/missing) has no benign explanation and stays `Internal`.
+    #[test]
+    fn second_create_failure_error_reports_internal_when_no_live_pid_explains_it() {
+        let dir = unique_daemon_dir("second-failure-no-live-pid");
+        let pid_path = dir.join("daemon.pid");
+        // No pidfile at all — an `AlreadyExists` failure with nothing to
+        // read back is not a benign race, so it must stay Internal.
+
+        let err = second_create_failure_error(&pid_path, PidfileCreateError::AlreadyExists);
+        assert_eq!(err.kind, ErrorKind::Internal);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A genuine I/O error on the second create attempt has no live-pid
+    /// explanation to check and must always stay `Internal`.
+    #[test]
+    fn second_create_failure_error_reports_internal_for_a_genuine_io_error() {
+        let dir = unique_daemon_dir("second-failure-io");
+        let pid_path = dir.join("daemon.pid");
+        let io_err = std::io::Error::other("disk full");
+
+        let err = second_create_failure_error(&pid_path, PidfileCreateError::Io(io_err));
+        assert_eq!(err.kind, ErrorKind::Internal);
+        assert!(err.message.contains("disk full"));
+
         std::fs::remove_dir_all(&dir).ok();
     }
 }

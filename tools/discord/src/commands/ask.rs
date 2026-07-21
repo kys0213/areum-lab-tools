@@ -17,6 +17,16 @@ use super::wait::Sleeper;
 /// optional free-text button, so choices are capped at 4.
 const MIN_OPTIONS: usize = 1;
 const MAX_OPTIONS: usize = 4;
+/// Discord's action-row button label cap (spec §7) — enforced here so a
+/// too-long label fails fast in validation rather than surfacing as a 400
+/// from Discord after the message is already sent.
+const MAX_OPTION_LABEL_CHARS: usize = 80;
+/// Upper bound on `--timeout`: 30 days. Not just a sanity limit — a
+/// `timeout_at` past year 9999 fails `normalize_utc`'s SQLite `datetime()`
+/// parse (returns NULL), which `insert_pending_ask` surfaces as an opaque
+/// Internal error; this rejects that input as a usage error instead, before
+/// any message is sent.
+const MAX_TIMEOUT_SECS: u64 = 30 * 24 * 60 * 60;
 
 const COMPONENT_TYPE_ACTION_ROW: u8 = 1;
 const COMPONENT_TYPE_BUTTON: u8 = 2;
@@ -73,7 +83,18 @@ pub(crate) async fn run_ask_create(
         return Err(err);
     }
 
-    insert_pending_ask(db_path, &sent.id, &sent.channel_id, req)?;
+    if let Err(err) = insert_pending_ask(db_path, &sent.id, &sent.channel_id, req) {
+        // The message's buttons are live (the PATCH above succeeded) but no
+        // row exists to resolve a click against — strip them so the message
+        // doesn't look answerable, mirroring the PATCH-failure branch above
+        // rather than leaving an asymmetric silent orphan.
+        let no_components = serde_json::json!([]);
+        let _ = api
+            .edit_message_components(&sent.channel_id, &sent.id, &no_components)
+            .await;
+        mark_orphaned_ask_message(api, &sent.channel_id, &sent.id).await;
+        return Err(err);
+    }
 
     Ok(Payload::AskCreate(AskCreateData {
         ask_id: sent.id,
@@ -140,10 +161,29 @@ fn validate_ask_create(req: &AskCreateRequest) -> Result<(), AppError> {
             "--option labels must not be empty",
         ));
     }
+    if let Some(too_long) = req
+        .options
+        .iter()
+        .find(|opt| opt.chars().count() > MAX_OPTION_LABEL_CHARS)
+    {
+        return Err(AppError::new(
+            ErrorKind::Usage,
+            format!(
+                "--option label must be at most {MAX_OPTION_LABEL_CHARS} characters (got {}: {too_long:?})",
+                too_long.chars().count()
+            ),
+        ));
+    }
     if req.timeout_secs == 0 {
         return Err(AppError::new(
             ErrorKind::Usage,
             "--timeout must be greater than 0",
+        ));
+    }
+    if req.timeout_secs > MAX_TIMEOUT_SECS {
+        return Err(AppError::new(
+            ErrorKind::Usage,
+            format!("--timeout must be at most {MAX_TIMEOUT_SECS} seconds (30 days)"),
         ));
     }
     Ok(())

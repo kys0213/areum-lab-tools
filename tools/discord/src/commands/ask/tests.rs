@@ -165,6 +165,83 @@ async fn create_marks_message_and_propagates_error_when_components_patch_fails()
     std::fs::remove_dir_all(db_path.parent().unwrap()).ok();
 }
 
+/// P2-1: a components PATCH that succeeds but a subsequent `insert_ask`
+/// failure must leave the message in the same "clearly not answerable" state
+/// as the PATCH-failure branch — stripped buttons plus the orphan marker —
+/// rather than a silent orphan with live buttons nobody can resolve.
+/// `insert_pending_ask` fails here because `AskStore::open`'s
+/// `create_dir_all(parent)` cannot create a directory where a plain file of
+/// the same name already exists — a black-box way to force the insert step
+/// to fail without touching `insert_ask` itself.
+#[tokio::test]
+async fn create_orphans_message_when_insert_fails_after_components_patch_succeeds() {
+    let db_path = unique_db_path("create-insert-fails");
+    std::fs::write(db_path.parent().unwrap(), b"not a directory").unwrap();
+    let api = MockDiscordApi::new();
+    api.send_responses
+        .borrow_mut()
+        .push_back(Ok(sent_message("600", "chan-1")));
+    api.edit_components_responses.borrow_mut().push_back(Ok(()));
+    api.send_responses
+        .borrow_mut()
+        .push_back(Ok(sent_message("601", "chan-1")));
+
+    let err = run_ask_create(&api, &db_path, daemon_up, &sample_request())
+        .await
+        .unwrap_err();
+
+    assert_eq!(err.kind, ErrorKind::Internal);
+
+    let edits = api.edit_components_calls.borrow();
+    assert_eq!(
+        edits.len(),
+        2,
+        "the attach PATCH plus the orphan button-strip PATCH"
+    );
+    assert_eq!(
+        edits[1].2,
+        serde_json::json!([]),
+        "the second PATCH must strip the buttons"
+    );
+
+    let sends = api.send_calls.borrow();
+    assert_eq!(sends.len(), 2, "the question send plus the orphan marker");
+    assert_eq!(sends[1].reply_to.as_deref(), Some("600"));
+    assert!(sends[1].content.contains("질문 등록 실패"));
+
+    std::fs::remove_file(db_path.parent().unwrap()).ok();
+}
+
+#[test]
+fn create_rejects_option_label_over_80_chars() {
+    let mut req = sample_request();
+    req.options = vec!["a".repeat(81)];
+    let err = validate_ask_create(&req).unwrap_err();
+    assert_eq!(err.kind, ErrorKind::Usage);
+}
+
+#[test]
+fn create_accepts_option_label_at_80_char_limit() {
+    let mut req = sample_request();
+    req.options = vec!["a".repeat(80)];
+    assert!(validate_ask_create(&req).is_ok());
+}
+
+#[test]
+fn create_rejects_timeout_over_30_days() {
+    let mut req = sample_request();
+    req.timeout_secs = 30 * 24 * 60 * 60 + 1;
+    let err = validate_ask_create(&req).unwrap_err();
+    assert_eq!(err.kind, ErrorKind::Usage);
+}
+
+#[test]
+fn create_accepts_timeout_at_30_day_upper_bound() {
+    let mut req = sample_request();
+    req.timeout_secs = 30 * 24 * 60 * 60;
+    assert!(validate_ask_create(&req).is_ok());
+}
+
 #[test]
 fn create_rejects_zero_options() {
     let mut req = sample_request();
@@ -478,6 +555,87 @@ async fn wait_rejects_interval_zero() {
     assert_eq!(err.kind, ErrorKind::Usage);
 }
 
+/// P3: `--timeout 0` is deliberately *not* rejected — pinning the same
+/// convention `discord wait` already established (`commands/wait.rs`
+/// rejects `interval == 0` but not `timeout == 0`, via
+/// `max_polls = timeout.div_ceil(interval).max(1)`): a zero poll budget
+/// still runs exactly one immediate poll rather than erroring. `ask wait`
+/// mirrors that same expression, so this locks in the existing behavior
+/// rather than introducing a new rejection that would diverge from it.
+#[tokio::test]
+async fn wait_with_zero_timeout_polls_once_immediately_without_sleeping() {
+    let db_path = unique_db_path("wait-zero-timeout");
+    let store = AskStore::open(&db_path).unwrap();
+    store
+        .insert_ask(sample_ask("ask-9", "2999-01-01T00:00:00Z"))
+        .unwrap();
+    let sleeper = FakeSleeper::new();
+
+    let payload = run_ask_wait(&db_path, &sleeper, "ask-9", 0, 5)
+        .await
+        .unwrap();
+
+    match payload {
+        Payload::AskWait(d) => {
+            assert!(
+                d.timed_out,
+                "a zero poll budget must report poll_timed_out after the single poll"
+            );
+            assert_eq!(
+                d.result,
+                AskResultData::Pending {
+                    ask_id: "ask-9".into()
+                }
+            );
+        }
+        other => panic!("expected AskWait, got {other:?}"),
+    }
+    assert_eq!(
+        sleeper.calls.borrow().len(),
+        0,
+        "a single immediate poll needs no sleep"
+    );
+
+    std::fs::remove_dir_all(db_path.parent().unwrap()).ok();
+}
+
+/// P3: `--interval` exceeding `--timeout` still runs exactly one poll
+/// (`ceil(timeout / interval) == 1`) rather than erroring or looping —
+/// pinning the existing arithmetic's behavior at this edge.
+#[tokio::test]
+async fn wait_with_interval_greater_than_timeout_still_polls_exactly_once() {
+    let db_path = unique_db_path("wait-interval-gt-timeout");
+    let store = AskStore::open(&db_path).unwrap();
+    store
+        .insert_ask(sample_ask("ask-10", "2999-01-01T00:00:00Z"))
+        .unwrap();
+    let sleeper = FakeSleeper::new();
+
+    let payload = run_ask_wait(&db_path, &sleeper, "ask-10", 10, 100)
+        .await
+        .unwrap();
+
+    match payload {
+        Payload::AskWait(d) => {
+            assert!(d.timed_out);
+            assert_eq!(
+                d.result,
+                AskResultData::Pending {
+                    ask_id: "ask-10".into()
+                }
+            );
+        }
+        other => panic!("expected AskWait, got {other:?}"),
+    }
+    assert_eq!(
+        sleeper.calls.borrow().len(),
+        0,
+        "a single poll needs no sleep regardless of the interval value"
+    );
+
+    std::fs::remove_dir_all(db_path.parent().unwrap()).ok();
+}
+
 #[tokio::test]
 async fn wait_errors_for_unknown_ask_id() {
     let db_path = unique_db_path("wait-missing");
@@ -642,7 +800,14 @@ async fn wait_local_expiry_and_daemon_sweep_race_without_diverging() {
         tokio::runtime::Runtime::new().unwrap().block_on(async {
             let store = AskStore::open(&expire_db_path).unwrap();
             let api = MockDiscordApi::new();
-            crate::daemon::expire_and_disable(&api, &store, "2024-01-01T00:00:10Z").await
+            let mut retry_queue = crate::daemon::ExpireRetryQueue::new();
+            crate::daemon::expire_and_disable(
+                &api,
+                &store,
+                "2024-01-01T00:00:10Z",
+                &mut retry_queue,
+            )
+            .await
         })
     });
 
