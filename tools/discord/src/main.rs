@@ -9,7 +9,7 @@ use std::path::PathBuf;
 
 use clap::Parser;
 
-use cli::{Cli, Command, DaemonCommand, ThreadCommand};
+use cli::{AskCommand, Cli, Command, DaemonCommand, ThreadCommand};
 use commands::TokioSleeper;
 use common::config;
 use common::http::HttpDiscordApi;
@@ -132,6 +132,45 @@ async fn run(cli: Cli) -> Result<Payload, AppError> {
                 DaemonCommand::Stop => commands::run_daemon_stop(&pid_path).await,
                 DaemonCommand::Status => commands::run_daemon_status(&pid_path, &db_path),
             }
+        }
+        Command::Ask(AskCommand::Create {
+            channel,
+            question,
+            options,
+            allow_text,
+            timeout,
+        }) => {
+            let (api, channels) = authenticated_api(&config_path, cli.token.as_deref())?;
+            let channel_id = config::resolve_channel(&channel, &channels);
+            let db_path = config::default_db_path()?;
+            let pid_path = config::default_pid_path()?;
+            let req = commands::AskCreateRequest {
+                channel_id,
+                question,
+                options,
+                allow_text,
+                timeout_secs: timeout,
+            };
+            commands::run_ask_create(
+                &api,
+                &db_path,
+                || commands::is_daemon_running(&pid_path),
+                &req,
+            )
+            .await
+        }
+        Command::Ask(AskCommand::Result { ask_id }) => {
+            let db_path = config::default_db_path()?;
+            commands::run_ask_result(&db_path, &ask_id)
+        }
+        Command::Ask(AskCommand::Wait {
+            ask_id,
+            timeout,
+            interval,
+        }) => {
+            let db_path = config::default_db_path()?;
+            let sleeper = TokioSleeper;
+            commands::run_ask_wait(&db_path, &sleeper, &ask_id, timeout, interval).await
         }
     }
 }

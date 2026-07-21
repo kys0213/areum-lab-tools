@@ -8,13 +8,24 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Wall-clock "now" as a canonical UTC RFC3339 string (`YYYY-MM-DDTHH:MM:SSZ`).
 pub(crate) fn now_rfc3339() -> String {
-    // A system clock set before 1970 is not a real state we support; clamping
-    // to the epoch keeps `now` monotone-parseable rather than panicking here.
-    let secs = SystemTime::now()
+    format_epoch_secs(now_epoch_secs())
+}
+
+/// `now` shifted forward by `secs`, in the same canonical UTC shape as
+/// [`now_rfc3339`] — used to compute an ask's `timeout_at` from its
+/// `--timeout` duration. Saturates instead of overflowing on a
+/// pathologically large `secs`.
+pub(crate) fn rfc3339_after_secs(secs: u64) -> String {
+    format_epoch_secs(now_epoch_secs().saturating_add(secs))
+}
+
+/// A system clock set before 1970 is not a real state we support; clamping to
+/// the epoch keeps every caller monotone-parseable rather than panicking here.
+fn now_epoch_secs() -> u64 {
+    SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
-        .unwrap_or(0);
-    format_epoch_secs(secs)
+        .unwrap_or(0)
 }
 
 /// Formats seconds-since-Unix-epoch as `YYYY-MM-DDTHH:MM:SSZ`. Pure, so the
@@ -72,5 +83,20 @@ mod tests {
         assert_eq!(now.len(), 20, "expected fixed-width RFC3339 UTC: {now}");
         assert!(now.ends_with('Z'));
         assert_eq!(now.as_bytes()[10], b'T');
+    }
+
+    #[test]
+    fn rfc3339_after_secs_is_later_than_now() {
+        // Canonical UTC strings compare lexicographically as time order, so a
+        // positive offset must sort strictly after `now`.
+        let now = now_rfc3339();
+        let later = rfc3339_after_secs(3600);
+        assert!(later > now, "{later} should be after {now}");
+    }
+
+    #[test]
+    fn rfc3339_after_secs_saturates_instead_of_overflowing() {
+        // Must not panic under debug overflow checks on a pathological input.
+        let _ = rfc3339_after_secs(u64::MAX);
     }
 }

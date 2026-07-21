@@ -1,14 +1,11 @@
-//! Shared SQLite-backed storage for HITL `ask` state. Both the CLI's future
-//! `ask` command and the daemon's interaction handler open the same
-//! `~/.areum/discord/discord.db` file through this module — it owns the
-//! schema and the conditional updates that resolve concurrent responses.
-//! Connection is not `Sync`; async callers (the daemon) are responsible for
-//! their own spawn_blocking/dedicated-thread pattern around an `AskStore`.
-//!
-//! Not yet wired into `commands/` — the `ask` command and daemon that consume
-//! this module land in follow-up units, so `dead_code` is allowed here until
-//! then rather than reporting the whole module unused.
-#![allow(dead_code)]
+//! Shared SQLite-backed storage for HITL `ask` state. Both the CLI's `ask`
+//! command (`commands/ask.rs`) and the daemon's interaction handler
+//! (`daemon/interactions.rs`) open the same `~/.areum/discord/discord.db`
+//! file through this module — it owns the schema and the conditional updates
+//! that resolve concurrent responses.
+//! Connection is not `Sync`; the daemon holds a single `AskStore` on one task
+//! across `.await` points rather than sharing it across tasks (see
+//! `daemon/gateway.rs::run`), so no spawn_blocking/locking wrapper is needed.
 
 use std::path::Path;
 
@@ -85,6 +82,11 @@ pub(crate) struct AskRecord {
     pub(crate) answered_at: Option<String>,
 }
 
+/// How long any statement waits on a lock held by the other process (the CLI
+/// vs. the daemon) before giving up. Also the retry budget for the WAL
+/// transition in [`enable_wal`], which cannot rely on the busy handler.
+const BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(5_000);
+
 /// Synchronous rusqlite wrapper. A single connection is not `Sync` — this
 /// type is deliberately a thin owner of that connection and the SQL that
 /// runs against it, nothing more (async usage patterns are a later unit's
@@ -108,16 +110,19 @@ impl AskStore {
         }
 
         let mut conn = Connection::open(path).map_err(map_sqlite_err)?;
-        conn.pragma_update(None, "journal_mode", "WAL")
-            .map_err(map_sqlite_err)?;
-        conn.busy_timeout(std::time::Duration::from_millis(5_000))
-            .map_err(map_sqlite_err)?;
+        // busy_timeout comes before anything that can take a lock so every
+        // later statement waits its turn instead of failing immediately.
+        conn.busy_timeout(BUSY_TIMEOUT).map_err(map_sqlite_err)?;
+        enable_wal(&conn)?;
         migrate(&mut conn)?;
         Ok(AskStore { conn })
     }
 
     /// Opens an in-memory store for tests. WAL mode is meaningless for
-    /// `:memory:` databases, so it's skipped here.
+    /// `:memory:` databases, so it's skipped here. `cfg(test)`-only: every
+    /// caller is a test, so it would otherwise report as dead code in a
+    /// non-test build.
+    #[cfg(test)]
     pub(crate) fn open_in_memory() -> Result<AskStore, AppError> {
         let mut conn = Connection::open_in_memory().map_err(map_sqlite_err)?;
         migrate(&mut conn)?;
@@ -297,19 +302,61 @@ fn row_to_record(row: &Row<'_>) -> rusqlite::Result<AskRecord> {
     })
 }
 
+/// Switches the connection's journal mode to WAL, retrying on SQLITE_BUSY.
+/// The retry loop (rather than trusting busy_timeout) is deliberate: the WAL
+/// transition needs brief exclusive locks and SQLite skips the busy handler
+/// for parts of that lock dance, so two connections racing the first open of
+/// a fresh database see an immediate "database is locked" despite the
+/// timeout. Once the racing winner completes the switch, WAL is persistent in
+/// the file and the loser's retry is a cheap no-op that reports "wal".
+fn enable_wal(conn: &Connection) -> Result<(), AppError> {
+    const RETRY_SLEEP: std::time::Duration = std::time::Duration::from_millis(10);
+    let deadline = std::time::Instant::now() + BUSY_TIMEOUT;
+    loop {
+        match conn.pragma_update(None, "journal_mode", "WAL") {
+            Ok(()) => return Ok(()),
+            Err(err) if is_busy(&err) && std::time::Instant::now() < deadline => {
+                std::thread::sleep(RETRY_SLEEP);
+            }
+            Err(err) => return Err(map_sqlite_err(err)),
+        }
+    }
+}
+
+/// SQLITE_BUSY ("database is locked") and SQLITE_LOCKED — the transient
+/// lock-contention outcomes worth retrying, as opposed to real errors.
+fn is_busy(err: &rusqlite::Error) -> bool {
+    matches!(
+        err.sqlite_error_code(),
+        Some(rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked)
+    )
+}
+
+/// Version the migration blocks in [`migrate`] bring the schema up to.
+const LATEST_SCHEMA_VERSION: i64 = 1;
+
 /// Applies pending schema migrations, tracked via a single-row
 /// `schema_version` table. Safe to call on every `open` — a database already
-/// at the latest version is a no-op. SP3/SP4 (message cache, event
-/// subscription) grow the same DB file by appending `if current < N`
-/// migration blocks here rather than introducing a new store.
+/// at the latest version returns after one plain SELECT, without taking the
+/// writer lock: `ask wait` polling opens a connection per poll, and a
+/// `BEGIN IMMEDIATE` on each of those would contend with the daemon's
+/// 3-second interaction-response writes for no reason. SP3/SP4 (message
+/// cache, event subscription) grow the same DB file by appending
+/// `if current < N` migration blocks here rather than introducing a new
+/// store.
 ///
-/// The whole version-check + DDL + version-stamp runs inside one
-/// `BEGIN IMMEDIATE` transaction: a crash mid-migration rolls back to a
-/// clean slate, and two processes racing the first open serialize on the
-/// write lock (the loser waits within busy_timeout, then re-reads the
-/// version and skips). `IF NOT EXISTS` on the DDL is a second line of
-/// defense for a database left half-migrated by a pre-transaction binary.
+/// When migration is needed, the version re-check + DDL + version-stamp run
+/// inside one `BEGIN IMMEDIATE` transaction: a crash mid-migration rolls
+/// back to a clean slate, and two processes racing the first open serialize
+/// on the write lock (the loser waits within busy_timeout, then re-reads the
+/// version inside the transaction and skips). `IF NOT EXISTS` on the DDL is
+/// a second line of defense for a database left half-migrated by a
+/// pre-transaction binary.
 fn migrate(conn: &mut Connection) -> Result<(), AppError> {
+    if read_schema_version(conn)? >= LATEST_SCHEMA_VERSION {
+        return Ok(());
+    }
+
     let tx = conn
         .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
         .map_err(map_sqlite_err)?;
@@ -317,6 +364,8 @@ fn migrate(conn: &mut Connection) -> Result<(), AppError> {
     tx.execute_batch("CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL)")
         .map_err(map_sqlite_err)?;
 
+    // Re-read under the write lock: another process may have migrated between
+    // the unlocked fast-path read above and this transaction's start.
     let current: i64 = tx
         .query_row("SELECT version FROM schema_version LIMIT 1", [], |row| {
             row.get(0)
@@ -332,6 +381,29 @@ fn migrate(conn: &mut Connection) -> Result<(), AppError> {
     }
 
     tx.commit().map_err(map_sqlite_err)
+}
+
+/// Lock-free schema version probe for the `migrate` fast path. A database
+/// without a `schema_version` table (fresh file, or pre-migration crash
+/// before the table existed) reads as version 0 — checked via sqlite_master
+/// rather than by pattern-matching a "no such table" error.
+fn read_schema_version(conn: &Connection) -> Result<i64, AppError> {
+    let table_exists: bool = conn
+        .query_row(
+            "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'schema_version')",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(map_sqlite_err)?;
+    if !table_exists {
+        return Ok(0);
+    }
+    conn.query_row("SELECT version FROM schema_version LIMIT 1", [], |row| {
+        row.get(0)
+    })
+    .optional()
+    .map_err(map_sqlite_err)
+    .map(|version| version.unwrap_or(0))
 }
 
 /// v1 DDL. Shared with the partial-migration recovery test, which uses it to

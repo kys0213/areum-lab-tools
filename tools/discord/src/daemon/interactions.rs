@@ -171,6 +171,20 @@ async fn handle_open_modal(
     let Some(record) = store.get_ask(ask_id)? else {
         return respond(api, ctx, &ephemeral("존재하지 않는 질문입니다.")).await;
     };
+    // A real client can only produce this click when `ask create` attached the
+    // text button (spec §5: only emitted when `allow_text`), but the daemon
+    // must not trust the client's component set as the source of truth — the
+    // ask's own record is. A forged/stale `:text` custom_id against an ask
+    // that disallows it is rejected here, the same as any other not-adopted
+    // outcome.
+    if !record.allow_text {
+        return respond(
+            api,
+            ctx,
+            &ephemeral("텍스트 응답이 허용되지 않는 질문입니다."),
+        )
+        .await;
+    }
     // Opening the modal adopts no answer; the MODAL_SUBMIT `try_answer` is the
     // authoritative concurrency point, so a race that resolves the ask between
     // open and submit is handled there (the submit loses and gets ephemeral).
@@ -183,8 +197,19 @@ async fn handle_modal_submit(
     ctx: &Ctx<'_>,
     ask_id: &str,
 ) -> Result<(), AppError> {
-    if store.get_ask(ask_id)?.is_none() {
+    let Some(record) = store.get_ask(ask_id)? else {
         return respond(api, ctx, &ephemeral("존재하지 않는 질문입니다.")).await;
+    };
+    // Same forged-path rejection as `handle_open_modal` — a submit against an
+    // ask that disallows free text must not adopt an answer regardless of how
+    // the client got to a MODAL_SUBMIT.
+    if !record.allow_text {
+        return respond(
+            api,
+            ctx,
+            &ephemeral("텍스트 응답이 허용되지 않는 질문입니다."),
+        )
+        .await;
     }
     let value = extract_modal_text(ctx.payload.get("data")).ok_or_else(|| {
         AppError::new(

@@ -134,6 +134,12 @@ pub(crate) fn run_daemon_status(pid_path: &Path, db_path: &Path) -> Result<Paylo
     }))
 }
 
+/// Whether a live daemon is recorded in the pidfile — the fail-fast gate
+/// `ask create` uses before sending a question nobody can answer (spec §4).
+pub(crate) fn is_daemon_running(pid_path: &Path) -> Result<bool, AppError> {
+    Ok(read_pidfile(pid_path)?.is_some_and(pid_is_alive))
+}
+
 async fn wait_for_exit(pid: i32) -> Result<(), AppError> {
     let deadline = std::time::Instant::now() + STOP_TIMEOUT;
     while std::time::Instant::now() < deadline {
@@ -264,6 +270,44 @@ mod tests {
         assert_eq!(read_pidfile(&path).unwrap(), Some(4321));
         remove_pidfile(&path).unwrap();
         assert_eq!(read_pidfile(&path).unwrap(), None);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn is_daemon_running_false_when_pidfile_missing() {
+        let dir = unique_daemon_dir("is-running-missing");
+        let pid_path = dir.join("daemon.pid");
+
+        assert!(!is_daemon_running(&pid_path).unwrap());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn is_daemon_running_false_when_pidfile_pid_already_exited() {
+        let dir = unique_daemon_dir("is-running-stale");
+        let pid_path = dir.join("daemon.pid");
+
+        let mut child = std::process::Command::new("true")
+            .spawn()
+            .expect("spawn a short-lived child to obtain a guaranteed-dead pid");
+        let dead_pid = child.id();
+        child.wait().unwrap();
+        write_pidfile(&pid_path, dead_pid as i32).unwrap();
+
+        assert!(!is_daemon_running(&pid_path).unwrap());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn is_daemon_running_true_for_a_live_pid() {
+        let dir = unique_daemon_dir("is-running-live");
+        let pid_path = dir.join("daemon.pid");
+        write_pidfile(&pid_path, std::process::id() as i32).unwrap();
+
+        assert!(is_daemon_running(&pid_path).unwrap());
 
         std::fs::remove_dir_all(&dir).ok();
     }
