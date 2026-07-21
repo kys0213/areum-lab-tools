@@ -98,6 +98,26 @@ pub enum Command {
     /// Thread operations on a channel (id or config alias).
     #[command(subcommand)]
     Thread(ThreadCommand),
+
+    /// Manage the resident gateway daemon that answers HITL interactions.
+    #[command(subcommand)]
+    Daemon(DaemonCommand),
+}
+
+#[derive(Subcommand, Debug)]
+pub enum DaemonCommand {
+    /// Start the daemon. Detaches to the background by default; --foreground
+    /// runs the gateway loop in the current process.
+    Start {
+        /// Run in this process instead of detaching (used internally by the
+        /// background launcher, and for debugging).
+        #[arg(long)]
+        foreground: bool,
+    },
+    /// Stop the running daemon via the pidfile (SIGTERM).
+    Stop,
+    /// Report whether the daemon is running and the pending-ask count.
+    Status,
 }
 
 #[derive(Subcommand, Debug)]
@@ -126,6 +146,7 @@ impl Command {
             Command::Read { .. } => "read",
             Command::Wait { .. } => "wait",
             Command::Thread(_) => "thread",
+            Command::Daemon(_) => "daemon",
         }
     }
 }
@@ -472,6 +493,58 @@ mod tests {
         .unwrap();
         assert!(cli.json);
         assert_eq!(cli.command.name(), "thread");
+    }
+
+    #[test]
+    fn daemon_start_defaults_to_background() {
+        let cli = Cli::try_parse_from(["discord", "daemon", "start"]).unwrap();
+        match cli.command {
+            Command::Daemon(DaemonCommand::Start { foreground }) => assert!(!foreground),
+            other => panic!("expected Daemon(Start), got {other:?}"),
+        }
+        assert_eq!(
+            Cli::try_parse_from(["discord", "daemon", "start"])
+                .unwrap()
+                .command
+                .name(),
+            "daemon"
+        );
+    }
+
+    #[test]
+    fn daemon_start_parses_foreground_flag() {
+        let cli = Cli::try_parse_from(["discord", "daemon", "start", "--foreground"]).unwrap();
+        match cli.command {
+            Command::Daemon(DaemonCommand::Start { foreground }) => assert!(foreground),
+            other => panic!("expected Daemon(Start), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn daemon_stop_and_status_parse() {
+        assert!(matches!(
+            Cli::try_parse_from(["discord", "daemon", "stop"])
+                .unwrap()
+                .command,
+            Command::Daemon(DaemonCommand::Stop)
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["discord", "daemon", "status"])
+                .unwrap()
+                .command,
+            Command::Daemon(DaemonCommand::Status)
+        ));
+    }
+
+    #[test]
+    fn daemon_requires_a_subcommand() {
+        assert!(Cli::try_parse_from(["discord", "daemon"]).is_err());
+    }
+
+    #[test]
+    fn foreground_flag_is_rejected_on_daemon_stop() {
+        // --foreground is start-only; clap must reject it on stop.
+        assert!(Cli::try_parse_from(["discord", "daemon", "stop", "--foreground"]).is_err());
     }
 
     #[test]

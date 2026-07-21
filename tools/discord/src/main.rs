@@ -1,6 +1,7 @@
 mod cli;
 mod commands;
 mod common;
+mod daemon;
 mod output;
 
 use std::io::Read;
@@ -8,7 +9,7 @@ use std::path::PathBuf;
 
 use clap::Parser;
 
-use cli::{Cli, Command, ThreadCommand};
+use cli::{Cli, Command, DaemonCommand, ThreadCommand};
 use commands::TokioSleeper;
 use common::config;
 use common::http::HttpDiscordApi;
@@ -111,6 +112,27 @@ async fn run(cli: Cli) -> Result<Payload, AppError> {
             let channel_id = config::resolve_channel(&channel, &channels);
             commands::run_thread_create(&api, &channel_id, &name, from_message.as_deref()).await
         }
+        Command::Daemon(daemon_cmd) => {
+            let db_path = config::default_db_path()?;
+            let pid_path = config::default_pid_path()?;
+            match daemon_cmd {
+                DaemonCommand::Start { foreground } => {
+                    // Resolve the token up front so a missing token fails fast
+                    // before spawning anything (spec §4: no unanswerable asks).
+                    let token = resolve_token(&config_path, cli.token.as_deref())?;
+                    commands::run_daemon_start(
+                        &db_path,
+                        &pid_path,
+                        cli.config.as_deref(),
+                        token,
+                        foreground,
+                    )
+                    .await
+                }
+                DaemonCommand::Stop => commands::run_daemon_stop(&pid_path).await,
+                DaemonCommand::Status => commands::run_daemon_status(&pid_path, &db_path),
+            }
+        }
     }
 }
 
@@ -125,6 +147,18 @@ fn authenticated_api(
     let env_token = std::env::var("DISCORD_BOT_TOKEN").ok();
     let token = config::resolve_token(token_flag, env_token.as_deref(), cfg.token.as_deref())?;
     Ok((HttpDiscordApi::new(token), cfg.channels))
+}
+
+/// Resolves just the bot token (flag > env > config file) without building an
+/// HTTP client — the daemon needs the raw token string for both the gateway
+/// connection and the detached child's environment.
+fn resolve_token(
+    config_path: &std::path::Path,
+    token_flag: Option<&str>,
+) -> Result<String, AppError> {
+    let cfg = config::load_config(config_path)?.unwrap_or_default();
+    let env_token = std::env::var("DISCORD_BOT_TOKEN").ok();
+    config::resolve_token(token_flag, env_token.as_deref(), cfg.token.as_deref())
 }
 
 fn read_stdin() -> std::io::Result<String> {

@@ -54,6 +54,28 @@ fn get_ask_missing_returns_none() {
 }
 
 #[test]
+fn count_pending_counts_only_pending_asks() {
+    let store = AskStore::open_in_memory().unwrap();
+    assert_eq!(store.count_pending().unwrap(), 0);
+
+    store
+        .insert_ask(sample_ask("a", "2024-01-01T01:00:00Z"))
+        .unwrap();
+    store
+        .insert_ask(sample_ask("b", "2024-01-01T01:00:00Z"))
+        .unwrap();
+    assert_eq!(store.count_pending().unwrap(), 2);
+
+    // Resolving one drops it from the pending count.
+    assert!(
+        store
+            .try_answer("a", "choice", "yes", "user1", "2024-01-01T00:00:10Z")
+            .unwrap()
+    );
+    assert_eq!(store.count_pending().unwrap(), 1);
+}
+
+#[test]
 fn options_json_roundtrips_through_insert_and_get() {
     let store = AskStore::open_in_memory().unwrap();
     let mut ask = sample_ask("ask-opts", "2024-01-01T01:00:00Z");

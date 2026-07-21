@@ -46,6 +46,32 @@ pub struct ThreadData {
     pub name: String,
 }
 
+/// `daemon start` result. `foreground` distinguishes a background launch
+/// (reports the detached child's pid) from a foreground run (reports this
+/// process's pid, emitted on graceful shutdown).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DaemonStartData {
+    pub pid: u32,
+    pub foreground: bool,
+}
+
+/// `daemon stop` result — the pid that was signalled and confirmed exited.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DaemonStopData {
+    pub pid: u32,
+    pub stopped: bool,
+}
+
+/// `daemon status` result. `pid` is present only when a live daemon is
+/// recorded; `pending` is the outstanding-ask backlog either way.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DaemonStatusData {
+    pub running: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pid: Option<u32>,
+    pub pending: usize,
+}
+
 /// Command result payload. `untagged` so each variant serializes as its inner
 /// object directly under the envelope `data` key.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -56,6 +82,9 @@ pub enum Payload {
     Read(ReadData),
     Wait(WaitData),
     Thread(ThreadData),
+    DaemonStart(DaemonStartData),
+    DaemonStop(DaemonStopData),
+    DaemonStatus(DaemonStatusData),
 }
 
 impl Payload {
@@ -92,6 +121,21 @@ impl Payload {
                 format_messages(&d.messages)
             ),
             Payload::Thread(d) => format!("created thread {} \"{}\"", d.thread_id, d.name),
+            Payload::DaemonStart(d) if d.foreground => {
+                format!("daemon exited (pid {})", d.pid)
+            }
+            Payload::DaemonStart(d) => {
+                format!("daemon started in background (pid {})", d.pid)
+            }
+            Payload::DaemonStop(d) => format!("daemon stopped (pid {})", d.pid),
+            Payload::DaemonStatus(d) if d.running => format!(
+                "daemon running (pid {}), {} pending ask(s)",
+                d.pid.unwrap_or(0),
+                d.pending
+            ),
+            Payload::DaemonStatus(d) => {
+                format!("daemon not running, {} pending ask(s)", d.pending)
+            }
         }
     }
 }

@@ -63,6 +63,18 @@ pub fn default_config_path() -> Result<PathBuf, AppError> {
     Ok(home_dir()?.join(".areum/discord/config.json"))
 }
 
+/// Shared SQLite store path — the CLI's future `ask` command and the daemon
+/// both open this same file (spec §2).
+pub fn default_db_path() -> Result<PathBuf, AppError> {
+    Ok(home_dir()?.join(".areum/discord/discord.db"))
+}
+
+/// Daemon pidfile path — the CLI checks it to detect a running daemon and to
+/// signal it on stop.
+pub fn default_pid_path() -> Result<PathBuf, AppError> {
+    Ok(home_dir()?.join(".areum/discord/daemon.pid"))
+}
+
 /// Loads the config file if it exists. A missing file is not an error (the
 /// token may come from flag/env). This tool never creates the file.
 pub fn load_config(path: &Path) -> Result<Option<Config>, AppError> {
