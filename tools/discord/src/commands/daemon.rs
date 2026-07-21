@@ -513,4 +513,143 @@ mod tests {
 
         std::fs::remove_dir_all(&dir).ok();
     }
+
+    /// `acquire_pidfile` is the guard `run_foreground` uses on every entry
+    /// (direct `--foreground` or as the background spawner's child), so a
+    /// live holder must reject a second acquirer with a usage error rather
+    /// than silently letting a duplicate daemon start.
+    #[test]
+    fn acquire_pidfile_errors_when_a_live_pid_already_holds_it() {
+        let dir = unique_daemon_dir("acquire-live");
+        let pid_path = dir.join("daemon.pid");
+        // Our own pid stands in for "a live holder" — always alive in-test.
+        write_pidfile(&pid_path, std::process::id() as i32).unwrap();
+
+        let err = acquire_pidfile(&pid_path)
+            .expect_err("a live pidfile holder must block a second acquirer");
+        assert_eq!(err.kind, ErrorKind::Usage);
+        assert!(err.message.contains("already running"));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A pidfile left behind by a daemon that died without cleaning up (or a
+    /// recycled pid) must not block a fresh start: the stale entry is
+    /// cleared and the acquirer claims the pidfile for itself.
+    #[test]
+    fn acquire_pidfile_reclaims_a_stale_pidfile() {
+        let dir = unique_daemon_dir("acquire-stale");
+        let pid_path = dir.join("daemon.pid");
+
+        let mut child = std::process::Command::new("true")
+            .spawn()
+            .expect("spawn a short-lived child to obtain a guaranteed-dead pid");
+        let dead_pid = child.id();
+        child.wait().unwrap();
+        write_pidfile(&pid_path, dead_pid as i32).unwrap();
+
+        acquire_pidfile(&pid_path).expect("a stale pidfile must be reclaimable");
+        assert_eq!(
+            read_pidfile(&pid_path).unwrap(),
+            Some(std::process::id() as i32),
+            "the acquirer must overwrite the stale entry with its own pid"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A pidfile-less path must let acquisition succeed and record this
+    /// process's pid, mirroring the very first daemon start on a machine.
+    #[test]
+    fn acquire_pidfile_succeeds_when_no_pidfile_exists() {
+        let dir = unique_daemon_dir("acquire-fresh");
+        let pid_path = dir.join("daemon.pid");
+
+        acquire_pidfile(&pid_path).expect("acquisition must succeed with no existing pidfile");
+        assert_eq!(
+            read_pidfile(&pid_path).unwrap(),
+            Some(std::process::id() as i32)
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The `O_CREAT|O_EXCL` create is the sole arbiter of the race: with two
+    /// threads racing `acquire_pidfile` against the same fresh path, exactly
+    /// one must observe success (having won the create) and the other must
+    /// be rejected as "already running" (it lost the create, then read back
+    /// the winner's — our own process's, so always-alive — pid). Neither
+    /// outcome may be "both succeed", which is the TOCTOU this guard closes.
+    #[test]
+    fn acquire_pidfile_is_atomic_under_concurrent_attempts() {
+        let dir = unique_daemon_dir("acquire-race");
+        let pid_path = dir.join("daemon.pid");
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+
+        let handles: Vec<_> = (0..2)
+            .map(|_| {
+                let pid_path = pid_path.clone();
+                let barrier = std::sync::Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    acquire_pidfile(&pid_path)
+                })
+            })
+            .collect();
+        let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+
+        let ok_count = results.iter().filter(|r| r.is_ok()).count();
+        let usage_err_count = results
+            .iter()
+            .filter(|r| matches!(r, Err(e) if e.kind == ErrorKind::Usage))
+            .count();
+        assert_eq!(ok_count, 1, "exactly one racer must win the acquire");
+        assert_eq!(
+            usage_err_count, 1,
+            "the loser must be rejected as already-running, not silently succeed too"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `release_own_pidfile` must remove the pidfile when it still records
+    /// this process's own pid (the normal graceful/error-exit path).
+    #[test]
+    fn release_own_pidfile_removes_its_own_entry() {
+        let dir = unique_daemon_dir("release-own");
+        let pid_path = dir.join("daemon.pid");
+        write_pidfile(&pid_path, std::process::id() as i32).unwrap();
+
+        release_own_pidfile(&pid_path);
+
+        assert_eq!(read_pidfile(&pid_path).unwrap(), None);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `release_own_pidfile` must never delete another instance's entry —
+    /// only the pid that currently holds the pidfile may clear it.
+    #[test]
+    fn release_own_pidfile_preserves_a_foreign_entry() {
+        let dir = unique_daemon_dir("release-foreign");
+        let pid_path = dir.join("daemon.pid");
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn a real child process to stand in for another daemon instance");
+        let other_pid = child.id();
+        write_pidfile(&pid_path, other_pid as i32).unwrap();
+
+        release_own_pidfile(&pid_path);
+
+        assert_eq!(
+            read_pidfile(&pid_path).unwrap(),
+            Some(other_pid as i32),
+            "a pidfile owned by another pid must survive our release call"
+        );
+
+        child.kill().ok();
+        child.wait().ok();
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }
