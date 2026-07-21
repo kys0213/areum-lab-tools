@@ -230,9 +230,199 @@ fn reopening_existing_file_db_is_idempotent() {
             .unwrap();
     }
 
+    // Re-running migrate() against an already-migrated file must not error —
+    // if it tried `CREATE TABLE asks` again (no `IF NOT EXISTS`), this
+    // `.unwrap()` would panic on "table asks already exists".
     let store = AskStore::open(&db_path).unwrap();
     assert!(store.get_ask("persisted").unwrap().is_some());
 
     drop(store);
     std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn open_sets_busy_timeout_for_file_backed_db() {
+    let dir = unique_store_dir("busy-timeout");
+    let db_path = dir.join("discord.db");
+
+    let store = AskStore::open(&db_path).unwrap();
+    let timeout_ms: i64 = store
+        .conn
+        .pragma_query_value(None, "busy_timeout", |row| row.get(0))
+        .unwrap();
+    assert_eq!(timeout_ms, 5_000);
+
+    drop(store);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// The real deployment shape: the CLI process and the daemon process each
+/// hold their own `Connection` to the same on-disk file. This is the
+/// scenario every other test (all in-memory or single-connection) misses —
+/// a single `Connection` can't exercise cross-process visibility or the
+/// `WHERE status = 'pending'` race guard for real.
+#[test]
+fn two_connections_see_each_others_inserts() {
+    let dir = unique_store_dir("two-conn-insert");
+    let db_path = dir.join("discord.db");
+
+    let store_a = AskStore::open(&db_path).unwrap();
+    store_a
+        .insert_ask(sample_ask("cross-conn", "2024-01-01T01:00:00Z"))
+        .unwrap();
+
+    let store_b = AskStore::open(&db_path).unwrap();
+    let record = store_b.get_ask("cross-conn").unwrap();
+    assert!(
+        record.is_some(),
+        "insert via store_a's connection should be visible through store_b's separate connection"
+    );
+
+    drop(store_a);
+    drop(store_b);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn two_connections_racing_try_answer_exactly_one_wins() {
+    let dir = unique_store_dir("two-conn-race");
+    let db_path = dir.join("discord.db");
+
+    let setup = AskStore::open(&db_path).unwrap();
+    setup
+        .insert_ask(sample_ask("race-ask", "2024-01-01T01:00:00Z"))
+        .unwrap();
+    drop(setup);
+
+    let path_a = db_path.clone();
+    let path_b = db_path.clone();
+
+    let handle_a = std::thread::spawn(move || {
+        let store = AskStore::open(&path_a).unwrap();
+        store
+            .try_answer(
+                "race-ask",
+                "choice",
+                "yes",
+                "user-a",
+                "2024-01-01T00:10:00Z",
+            )
+            .unwrap()
+    });
+    let handle_b = std::thread::spawn(move || {
+        let store = AskStore::open(&path_b).unwrap();
+        store
+            .try_answer("race-ask", "choice", "no", "user-b", "2024-01-01T00:10:01Z")
+            .unwrap()
+    });
+
+    let a_won = handle_a.join().unwrap();
+    let b_won = handle_b.join().unwrap();
+
+    assert_ne!(
+        a_won, b_won,
+        "exactly one of the two independent connections must win the race"
+    );
+
+    let verify = AskStore::open(&db_path).unwrap();
+    let record = verify.get_ask("race-ask").unwrap().unwrap();
+    assert_eq!(record.status, AskStatus::Answered);
+    let expected_winner = if a_won { "user-a" } else { "user-b" };
+    assert_eq!(record.answered_by.as_deref(), Some(expected_winner));
+
+    drop(verify);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn try_answer_is_false_once_already_timed_out() {
+    let store = AskStore::open_in_memory().unwrap();
+    store
+        .insert_ask(sample_ask("ask-6", "2024-01-01T01:00:00Z"))
+        .unwrap();
+    assert!(store.try_timeout("ask-6").unwrap());
+
+    let accepted = store
+        .try_answer("ask-6", "choice", "yes", "user-1", "2024-01-01T00:10:00Z")
+        .unwrap();
+    assert!(!accepted);
+
+    let record = store.get_ask("ask-6").unwrap().unwrap();
+    assert_eq!(record.status, AskStatus::TimedOut);
+    assert_eq!(record.value, None);
+    assert_eq!(record.answered_by, None);
+}
+
+#[test]
+fn expire_due_includes_boundary_timeout_equal_to_now() {
+    let store = AskStore::open_in_memory().unwrap();
+    store
+        .insert_ask(sample_ask("boundary-ask", "2024-03-01T00:00:00Z"))
+        .unwrap();
+
+    // expire_due uses `timeout_at <= now`; timeout_at == now must expire.
+    let expired = store.expire_due("2024-03-01T00:00:00Z").unwrap();
+
+    assert_eq!(expired.len(), 1);
+    assert_eq!(expired[0].ask_id, "boundary-ask");
+    assert_eq!(expired[0].status, AskStatus::TimedOut);
+}
+
+#[test]
+fn cleanup_keeps_row_exactly_at_cutoff_boundary() {
+    let store = AskStore::open_in_memory().unwrap();
+    let mut boundary = sample_ask("boundary-ask", "2024-01-02T01:00:00Z");
+    boundary.created_at = "2024-01-02T00:00:00Z".to_owned();
+    store.insert_ask(boundary).unwrap();
+
+    // retention_days=30, now=2024-02-01 -> cutoff=2024-01-02T00:00:00Z exactly.
+    // cleanup's condition is strict `<`, so a row created exactly at the
+    // cutoff must be kept, not deleted.
+    let deleted = store.cleanup(30, "2024-02-01T00:00:00Z").unwrap();
+
+    assert_eq!(deleted, 0);
+    assert!(store.get_ask("boundary-ask").unwrap().is_some());
+}
+
+/// Locks in the current behavior: `cleanup` has no `status` filter, so a
+/// still-`pending` ask (e.g. the daemon never resolved it) is purged by
+/// retention exactly like an answered/timed_out one. This may or may not be
+/// intended — flagged for the QA verdict rather than changed here.
+#[test]
+fn cleanup_deletes_old_pending_rows_too() {
+    let store = AskStore::open_in_memory().unwrap();
+    let mut old_pending = sample_ask("old-pending", "2024-01-01T01:00:00Z");
+    old_pending.created_at = "2024-01-01T00:00:00Z".to_owned();
+    store.insert_ask(old_pending).unwrap();
+
+    let deleted = store.cleanup(30, "2024-02-01T00:00:00Z").unwrap();
+
+    assert_eq!(deleted, 1);
+    assert!(store.get_ask("old-pending").unwrap().is_none());
+}
+
+#[test]
+fn get_ask_errors_on_unknown_status_instead_of_defaulting() {
+    let store = AskStore::open_in_memory().unwrap();
+    store
+        .insert_ask(sample_ask("bad-status", "2024-01-01T01:00:00Z"))
+        .unwrap();
+    // Bypass insert_ask/try_answer/try_timeout (which only ever write the
+    // three known statuses) to simulate a schema contract violation.
+    store
+        .conn
+        .execute(
+            "UPDATE asks SET status = 'bogus' WHERE ask_id = ?1",
+            params!["bad-status"],
+        )
+        .unwrap();
+
+    let err = store
+        .get_ask("bad-status")
+        .expect_err("unknown status must surface as an error, not a silently-defaulted record");
+    assert!(
+        err.message.contains("unknown ask status"),
+        "expected fail-fast status error, got: {}",
+        err.message
+    );
 }
