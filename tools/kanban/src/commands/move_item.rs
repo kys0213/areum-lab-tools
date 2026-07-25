@@ -132,4 +132,19 @@ mod tests {
         assert_eq!(err.kind, ErrorKind::NotFound);
         assert_eq!(exit_code(&err), 7);
     }
+
+    #[test]
+    fn moving_to_an_unknown_state_token_is_a_usage_error() {
+        // clap's `ItemState` ValueEnum keeps this out of the CLI path; `state`
+        // is still a plain `&str` at this boundary, so the store's own token
+        // validation is what a non-CLI caller relies on.
+        let board = TempBoard::new("move-unknown-state");
+        let id = seed_item(board.db_path(), false);
+        let err = run_move(board.db_path(), &id, "failed").unwrap_err();
+        assert_eq!(err.kind, ErrorKind::Usage);
+        assert_eq!(exit_code(&err), 2);
+
+        let stored = Store::open(board.db_path()).unwrap().get_item(&id).unwrap();
+        assert_eq!(stored.state.as_str(), "backlog");
+    }
 }

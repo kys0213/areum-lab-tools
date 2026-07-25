@@ -107,4 +107,19 @@ mod tests {
         assert_eq!(err.kind, ErrorKind::NotFound);
         assert_eq!(exit_code(&err), 7);
     }
+
+    #[test]
+    fn assign_rejects_an_unknown_priority_token_and_changes_nothing() {
+        // clap keeps this out of the CLI path (Priority is a ValueEnum); the
+        // store rejects it anyway so a non-CLI caller cannot smuggle a token
+        // past the schema's CHECK, and the item stays exactly where it was.
+        let board = TempBoard::new("assign-unknown-priority");
+        let id = seed_inbox(board.db_path());
+        let err = run_assign(board.db_path(), &id, "belt", Some("P9")).unwrap_err();
+        assert_eq!(err.kind, ErrorKind::Usage);
+        assert_eq!(exit_code(&err), 2);
+
+        let stored = Store::open(board.db_path()).unwrap().get_item(&id).unwrap();
+        assert_eq!(stored.state.as_str(), "inbox");
+    }
 }
