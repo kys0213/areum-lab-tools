@@ -109,6 +109,21 @@ fn opening_an_existing_board_reuses_its_schema_and_data() {
 }
 
 #[test]
+fn open_reporting_created_is_true_only_on_the_first_open() {
+    let path = unique_db_path("reporting-created");
+    let (_, created) =
+        Store::open_with_clock_reporting_created(&path, Box::new(SeqClock::default()))
+            .expect("first open");
+    assert!(created, "a fresh path must report created = true");
+
+    let (_, created) =
+        Store::open_with_clock_reporting_created(&path, Box::new(SeqClock::default()))
+            .expect("second open");
+    assert!(!created, "an existing board must report created = false");
+    let _ = std::fs::remove_dir_all(path.parent().expect("fixture path has a parent"));
+}
+
+#[test]
 fn running_without_a_session_is_rejected_at_write_time() {
     let store = memory_store();
     seeded_project(&store);
