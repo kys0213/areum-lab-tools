@@ -3,9 +3,8 @@
 //! `YYYY-MM-DDTHH:MM:SSZ` strings compare lexicographically as time order —
 //! which is what `ORDER BY created_at ASC` in the atomic claim relies on.
 //!
-//! The clock has no caller yet: the store that writes these columns lands with
-//! the command bodies, so nothing outside the tests reaches it in this stage.
-#![allow(dead_code)]
+//! `common::store::SystemClock` is the production caller; the store takes the
+//! clock as an injected dependency so tests can pin timestamps.
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -14,13 +13,14 @@ pub(crate) fn now_rfc3339() -> String {
     format_epoch_secs(now_epoch_secs())
 }
 
-/// A system clock set before 1970 is not a real state we support; clamping to
-/// the epoch keeps every caller monotone-parseable rather than panicking here.
+/// A pre-epoch system clock is not a state the board can represent: clamping
+/// it would stamp `1970-01-01T00:00:00Z` into `created_at` and silently place
+/// the row ahead of every real item in the claim's `ORDER BY created_at`.
 fn now_epoch_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
+        .expect("system clock is after the Unix epoch")
+        .as_secs()
 }
 
 /// Formats seconds-since-Unix-epoch as `YYYY-MM-DDTHH:MM:SSZ`. Pure, so the
