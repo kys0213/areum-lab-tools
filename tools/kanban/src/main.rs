@@ -85,44 +85,14 @@ mod tests {
     use output::ErrorKind;
 
     #[test]
-    fn every_subcommand_dispatches_to_its_loud_stub() {
-        // Pins the wiring end to end: each parsed subcommand must reach its
-        // handler and surface that handler's "not implemented yet" message,
-        // never a panic and never a synthesized success.
+    fn every_remaining_stub_subcommand_dispatches_to_its_loud_stub() {
+        // Pins the wiring end to end for the subcommands a later task still
+        // owns: each parsed subcommand must reach its handler and surface
+        // that handler's "not implemented yet" message, never a panic and
+        // never a synthesized success. init/project/add/list/show are
+        // implemented (T3) and covered by their own command-level tests
+        // instead, since they no longer fail this way.
         let cases: Vec<(Vec<&str>, &str)> = vec![
-            (vec!["kanban", "init"], "init is not implemented yet"),
-            (
-                vec!["kanban", "project", "add", "belt", "--desc", "conveyor"],
-                "project add is not implemented yet",
-            ),
-            (
-                vec!["kanban", "project", "list"],
-                "project list is not implemented yet",
-            ),
-            (
-                vec!["kanban", "project", "rm", "belt"],
-                "project rm is not implemented yet",
-            ),
-            (
-                vec![
-                    "kanban",
-                    "add",
-                    "--source",
-                    "discord",
-                    "--external-id",
-                    "msg-1",
-                    "--title",
-                    "t",
-                    "--body",
-                    "b",
-                ],
-                "add is not implemented yet",
-            ),
-            (vec!["kanban", "list"], "list is not implemented yet"),
-            (
-                vec!["kanban", "show", "itm-000017"],
-                "show is not implemented yet",
-            ),
             (
                 vec![
                     "kanban",
@@ -171,9 +141,11 @@ mod tests {
 
     #[test]
     fn dispatch_renders_a_stub_failure_through_the_json_envelope() {
-        // The stubs fail through the normal error path, so --json output is
-        // verifiable now rather than after the command bodies land.
-        let cli = Cli::try_parse_from(["kanban", "--json", "--db", "/tmp/k.db", "show", "itm-1"])
+        // The remaining stubs fail through the normal error path, so --json
+        // output is verifiable now rather than after their command bodies
+        // land. `done` is still a stub; `show` is not (T3), so it can no
+        // longer serve this case.
+        let cli = Cli::try_parse_from(["kanban", "--json", "--db", "/tmp/k.db", "done", "itm-1"])
             .unwrap();
         let name = cli.command.name();
         let result = run(cli);
@@ -182,7 +154,7 @@ mod tests {
         assert_eq!(code, 1);
         assert_eq!(
             line,
-            r#"{"ok":false,"command":"show","error":{"kind":"internal","message":"show is not implemented yet"}}"#
+            r#"{"ok":false,"command":"done","error":{"kind":"internal","message":"done is not implemented yet"}}"#
         );
     }
 }

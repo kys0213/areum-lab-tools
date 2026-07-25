@@ -122,11 +122,31 @@ impl Store {
         Store::open_with_clock(path, Box::new(SystemClock))
     }
 
+    /// Same as [`Store::open`], additionally reporting whether this call
+    /// created the board file rather than opening one that already existed.
+    /// `init` is the only caller that needs the flag; every other caller
+    /// keeps using [`Store::open`].
+    pub(crate) fn open_reporting_created(path: &Path) -> Result<(Store, bool), AppError> {
+        Store::open_with_clock_reporting_created(path, Box::new(SystemClock))
+    }
+
     /// Same as [`Store::open`] with an injected clock. Creates the parent
     /// directory, configures the connection (foreign keys, WAL, busy timeout)
     /// and ensures the schema — all idempotent, so opening an existing board
     /// is the same call as creating one.
     pub(crate) fn open_with_clock(path: &Path, clock: Box<dyn Clock>) -> Result<Store, AppError> {
+        Store::open_with_clock_reporting_created(path, clock).map(|(store, _created)| store)
+    }
+
+    /// Same as [`Store::open_with_clock`], additionally reporting whether
+    /// this call created the board file. The existence check happens here,
+    /// immediately before the call that would create the file, rather than
+    /// in the caller — checking from outside this function would race this
+    /// function's own directory/file creation below.
+    pub(crate) fn open_with_clock_reporting_created(
+        path: &Path,
+        clock: Box<dyn Clock>,
+    ) -> Result<(Store, bool), AppError> {
         if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
             std::fs::create_dir_all(parent).map_err(|e| {
                 AppError::new(
@@ -136,6 +156,7 @@ impl Store {
             })?;
         }
 
+        let created = !path.exists();
         let conn = Connection::open(path).map_err(map_sqlite_err)?;
         // busy_timeout is set before anything that can take a lock so every
         // later statement queues instead of failing immediately.
@@ -143,7 +164,7 @@ impl Store {
         enable_foreign_keys(&conn)?;
         enable_wal(&conn)?;
         create_schema(&conn)?;
-        Ok(Store { conn, clock })
+        Ok((Store { conn, clock }, created))
     }
 
     /// In-memory board for tests that do not need two connections. WAL is
