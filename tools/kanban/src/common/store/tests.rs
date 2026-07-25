@@ -228,8 +228,11 @@ fn removing_an_unknown_project_is_not_found() {
 
 #[test]
 fn project_rm_is_refused_while_items_reference_it() {
-    // Also the proof that `PRAGMA foreign_keys = ON` is really on: with FK
-    // enforcement off this delete would succeed and orphan the item.
+    // This end-to-end behavior does NOT by itself prove `enable_foreign_keys`
+    // is doing anything: the bundled libsqlite3-sys build compiles with
+    // `-DSQLITE_DEFAULT_FOREIGN_KEYS=1`, so FK enforcement is already on
+    // before any pragma call runs. `enable_foreign_keys_actually_turns_fk_on`
+    // below isolates the function itself against that compile-time default.
     let mut store = memory_store();
     seeded_project(&store);
     let id = add_backlog(&mut store, "msg-1", "belt", "P1");
@@ -243,6 +246,30 @@ fn project_rm_is_refused_while_items_reference_it() {
     store.move_item(&id, "inbox").unwrap();
     store.remove_project("belt").unwrap();
     assert!(store.list_projects().unwrap().is_empty());
+}
+
+#[test]
+fn enable_foreign_keys_actually_turns_fk_on() {
+    // `project_rm_is_refused_while_items_reference_it` cannot tell
+    // `enable_foreign_keys` apart from a no-op, because this build's SQLite
+    // already defaults foreign_keys to ON at compile time (verified via
+    // libsqlite3-sys's build.rs: `-DSQLITE_DEFAULT_FOREIGN_KEYS=1`). Starting
+    // from an explicit OFF and asserting the flip to ON tests the function's
+    // own effect, independent of that default.
+    let conn = Connection::open_in_memory().expect("in-memory connection");
+    conn.pragma_update(None, "foreign_keys", "OFF")
+        .expect("start from an explicit OFF, overriding the compile-time default");
+    let before: i64 = conn
+        .query_row("PRAGMA foreign_keys", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(before, 0, "test setup must actually start from OFF");
+
+    enable_foreign_keys(&conn).expect("enable_foreign_keys");
+
+    let after: i64 = conn
+        .query_row("PRAGMA foreign_keys", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(after, 1, "enable_foreign_keys must turn FK enforcement on");
 }
 
 // --- intake ----------------------------------------------------------------
@@ -431,6 +458,20 @@ fn claims_are_scoped_to_the_requested_project() {
     assert!(
         store
             .claim_next("belt", "sess-abc", "claude")
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
+fn claiming_from_an_unregistered_project_is_not_an_error() {
+    // `claim_next` has no `require_project` guard (unlike `assign`): a project
+    // name that was never registered simply matches no backlog rows, so it
+    // answers `None` the same as an empty backlog rather than `not_found`.
+    let store = memory_store();
+    assert!(
+        store
+            .claim_next("ghost-project", "sess-abc", "claude")
             .unwrap()
             .is_none()
     );
