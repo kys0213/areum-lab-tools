@@ -37,24 +37,15 @@ pub(crate) fn run_show(db_path: &Path, id: &str) -> Result<Payload, AppError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::commands::testutil::TempBoard;
     use crate::common::store::NewItem;
-    use crate::output::ErrorKind;
-    use std::path::PathBuf;
-
-    fn unique_db_path(label: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "areum-kanban-show-test-{}-{label}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        dir.join("kanban.db")
-    }
+    use crate::output::{ErrorKind, exit_code};
 
     #[test]
     fn show_returns_the_full_item_including_body_and_labels() {
-        let path = unique_db_path("success");
+        let board = TempBoard::new("show-success");
         let id = {
-            let mut store = Store::open(&path).unwrap();
+            let mut store = Store::open(board.db_path()).unwrap();
             let item = store
                 .insert_item(&NewItem {
                     source: "discord",
@@ -69,7 +60,7 @@ mod tests {
             item.id
         };
 
-        let payload = run_show(&path, &id).unwrap();
+        let payload = run_show(board.db_path(), &id).unwrap();
         match payload {
             Payload::Show(data) => {
                 assert_eq!(data.id, id);
@@ -81,15 +72,13 @@ mod tests {
             }
             other => panic!("expected Payload::Show, got {other:?}"),
         }
-        let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
     #[test]
     fn show_of_a_missing_id_is_not_found() {
-        let path = unique_db_path("missing");
-        let err = run_show(&path, "itm-999999").unwrap_err();
+        let board = TempBoard::new("show-missing");
+        let err = run_show(board.db_path(), "itm-999999").unwrap_err();
         assert_eq!(err.kind, ErrorKind::NotFound);
-        assert_eq!(crate::output::exit_code(&err), 7);
-        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+        assert_eq!(exit_code(&err), 7);
     }
 }

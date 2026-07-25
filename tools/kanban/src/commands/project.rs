@@ -49,23 +49,14 @@ pub(crate) fn run_project_rm(db_path: &Path, name: &str) -> Result<Payload, AppE
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::commands::testutil::TempBoard;
     use crate::common::store::NewItem;
-    use crate::output::ErrorKind;
-    use std::path::PathBuf;
-
-    fn unique_db_path(label: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "areum-kanban-project-test-{}-{label}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        dir.join("kanban.db")
-    }
+    use crate::output::{ErrorKind, exit_code};
 
     #[test]
     fn project_add_registers_and_echoes_the_description() {
-        let path = unique_db_path("add");
-        let payload = run_project_add(&path, "belt", "conveyor").unwrap();
+        let board = TempBoard::new("project-add");
+        let payload = run_project_add(board.db_path(), "belt", "conveyor").unwrap();
         match payload {
             Payload::ProjectAdd(data) => {
                 assert_eq!(data.name, "belt");
@@ -73,25 +64,23 @@ mod tests {
             }
             other => panic!("expected Payload::ProjectAdd, got {other:?}"),
         }
-        let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
     #[test]
     fn adding_a_duplicate_project_name_is_a_conflict() {
-        let path = unique_db_path("dup");
-        run_project_add(&path, "belt", "conveyor").unwrap();
-        let err = run_project_add(&path, "belt", "again").unwrap_err();
+        let board = TempBoard::new("project-dup");
+        run_project_add(board.db_path(), "belt", "conveyor").unwrap();
+        let err = run_project_add(board.db_path(), "belt", "again").unwrap_err();
         assert_eq!(err.kind, ErrorKind::Conflict);
-        assert_eq!(crate::output::exit_code(&err), 8);
-        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+        assert_eq!(exit_code(&err), 8);
     }
 
     #[test]
     fn project_list_reports_every_registered_project_by_name() {
-        let path = unique_db_path("list");
-        run_project_add(&path, "belt", "conveyor").unwrap();
-        run_project_add(&path, "areum", "tools").unwrap();
-        let payload = run_project_list(&path).unwrap();
+        let board = TempBoard::new("project-list");
+        run_project_add(board.db_path(), "belt", "conveyor").unwrap();
+        run_project_add(board.db_path(), "areum", "tools").unwrap();
+        let payload = run_project_list(board.db_path()).unwrap();
         match payload {
             Payload::ProjectList(data) => {
                 assert_eq!(data.count, 2);
@@ -100,13 +89,12 @@ mod tests {
             }
             other => panic!("expected Payload::ProjectList, got {other:?}"),
         }
-        let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
     #[test]
     fn project_list_is_empty_for_a_fresh_board() {
-        let path = unique_db_path("list-empty");
-        let payload = run_project_list(&path).unwrap();
+        let board = TempBoard::new("project-list-empty");
+        let payload = run_project_list(board.db_path()).unwrap();
         match payload {
             Payload::ProjectList(data) => {
                 assert_eq!(data.count, 0);
@@ -114,35 +102,32 @@ mod tests {
             }
             other => panic!("expected Payload::ProjectList, got {other:?}"),
         }
-        let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
     #[test]
     fn project_rm_succeeds_when_unreferenced() {
-        let path = unique_db_path("rm-ok");
-        run_project_add(&path, "belt", "conveyor").unwrap();
-        let payload = run_project_rm(&path, "belt").unwrap();
+        let board = TempBoard::new("project-rm-ok");
+        run_project_add(board.db_path(), "belt", "conveyor").unwrap();
+        let payload = run_project_rm(board.db_path(), "belt").unwrap();
         match payload {
             Payload::ProjectRm(data) => assert_eq!(data.name, "belt"),
             other => panic!("expected Payload::ProjectRm, got {other:?}"),
         }
-        let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
     #[test]
     fn project_rm_of_an_unknown_project_is_not_found() {
-        let path = unique_db_path("rm-missing");
-        let err = run_project_rm(&path, "ghost").unwrap_err();
+        let board = TempBoard::new("project-rm-missing");
+        let err = run_project_rm(board.db_path(), "ghost").unwrap_err();
         assert_eq!(err.kind, ErrorKind::NotFound);
-        assert_eq!(crate::output::exit_code(&err), 7);
-        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+        assert_eq!(exit_code(&err), 7);
     }
 
     #[test]
     fn project_rm_is_refused_while_an_item_references_it() {
-        let path = unique_db_path("rm-referenced");
+        let board = TempBoard::new("project-rm-referenced");
         {
-            let mut store = Store::open(&path).unwrap();
+            let mut store = Store::open(board.db_path()).unwrap();
             store.add_project("belt", "conveyor").unwrap();
             let item = store
                 .insert_item(&NewItem {
@@ -154,9 +139,8 @@ mod tests {
                 .unwrap();
             store.assign(&item.id, "belt", None).unwrap();
         }
-        let err = run_project_rm(&path, "belt").unwrap_err();
+        let err = run_project_rm(board.db_path(), "belt").unwrap_err();
         assert_eq!(err.kind, ErrorKind::Conflict);
-        assert_eq!(crate::output::exit_code(&err), 8);
-        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+        assert_eq!(exit_code(&err), 8);
     }
 }

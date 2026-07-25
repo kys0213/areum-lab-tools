@@ -370,17 +370,17 @@ mod tests {
     }
 
     #[test]
-    fn unimplemented_stub_error_renders_through_the_normal_envelope_path() {
-        // Stage-1 stubs fail loudly with `internal` rather than panicking, so
-        // the --json contract is verifiable end to end before the command
-        // bodies exist.
-        let err = AppError::new(ErrorKind::Internal, "show is not implemented yet");
+    fn an_internal_failure_renders_through_the_normal_envelope_path() {
+        // An unexpected failure still leaves through the envelope with exit 1
+        // rather than panicking past it, so agents parsing stdout always get
+        // JSON.
+        let err = AppError::new(ErrorKind::Internal, "sqlite error: disk I/O error");
         let (sink, json, code) = render("show", &Err(err), true);
         assert_eq!(sink, Sink::Stdout);
         assert_eq!(code, 1);
         assert_eq!(
             json,
-            r#"{"ok":false,"command":"show","error":{"kind":"internal","message":"show is not implemented yet"}}"#
+            r#"{"ok":false,"command":"show","error":{"kind":"internal","message":"sqlite error: disk I/O error"}}"#
         );
     }
 }

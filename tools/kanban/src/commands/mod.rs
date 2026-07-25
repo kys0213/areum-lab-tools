@@ -1,12 +1,10 @@
 //! One file per subcommand. Adding a subcommand is adding a file plus a line
 //! here — no existing command file changes (OCP).
 //!
-//! Every handler is a scaffold in this stage and answers
-//! `internal: "<name> is not implemented yet"`. That is deliberate: a
-//! synthesized success would report board changes that never happened, and
-//! `todo!()` would panic past the envelope instead of through it. Failing
-//! loudly through the normal error path keeps `--json` verifiable end to end
-//! (see `rust-coding.md` principle 1).
+//! Every handler resolves its own store from the board path `main.rs` passes
+//! in, and answers either a [`crate::output::Payload`] variant or an
+//! [`crate::output::AppError`] whose kind decides the exit code. Nothing here
+//! prints: rendering is the output layer's job.
 
 mod add;
 mod assign;
@@ -19,6 +17,9 @@ mod priority;
 mod project;
 mod release;
 mod show;
+
+#[cfg(test)]
+pub(crate) mod testutil;
 
 pub(crate) use add::run_add;
 pub(crate) use assign::run_assign;

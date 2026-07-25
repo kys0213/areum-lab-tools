@@ -52,23 +52,20 @@ fn resolve_body(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
-
-    fn unique_db_path(label: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "areum-kanban-add-test-{}-{label}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        dir.join("kanban.db")
-    }
+    use crate::commands::testutil::TempBoard;
+    use crate::output::exit_code;
 
     #[test]
     fn add_lands_the_item_in_inbox_with_the_minted_id() {
-        let path = unique_db_path("success");
-        let payload = run_add(&path, "discord", "msg-1", "cache drifts", "details", || {
-            Ok(String::new())
-        })
+        let board = TempBoard::new("add-success");
+        let payload = run_add(
+            board.db_path(),
+            "discord",
+            "msg-1",
+            "cache drifts",
+            "details",
+            || Ok(String::new()),
+        )
         .unwrap();
         match payload {
             Payload::Add(data) => {
@@ -80,13 +77,12 @@ mod tests {
             }
             other => panic!("expected Payload::Add, got {other:?}"),
         }
-        let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
     #[test]
     fn dash_body_reads_the_body_from_stdin() {
-        let path = unique_db_path("stdin-body");
-        let payload = run_add(&path, "cli", "local-1", "t", "-", || {
+        let board = TempBoard::new("add-stdin-body");
+        let payload = run_add(board.db_path(), "cli", "local-1", "t", "-", || {
             Ok("piped body".to_owned())
         })
         .unwrap();
@@ -94,21 +90,27 @@ mod tests {
             Payload::Add(data) => data.id,
             other => panic!("expected Payload::Add, got {other:?}"),
         };
-        let stored = Store::open(&path).unwrap().get_item(&id).unwrap();
+        let stored = Store::open(board.db_path()).unwrap().get_item(&id).unwrap();
         assert_eq!(stored.body, "piped body");
-        let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
     #[test]
     fn a_repeated_source_and_external_id_pair_is_a_conflict() {
-        let path = unique_db_path("dup");
-        run_add(&path, "discord", "msg-1", "t", "b", || Ok(String::new())).unwrap();
-        let err = run_add(&path, "discord", "msg-1", "different title", "b", || {
+        let board = TempBoard::new("add-dup");
+        run_add(board.db_path(), "discord", "msg-1", "t", "b", || {
             Ok(String::new())
         })
+        .unwrap();
+        let err = run_add(
+            board.db_path(),
+            "discord",
+            "msg-1",
+            "different title",
+            "b",
+            || Ok(String::new()),
+        )
         .unwrap_err();
         assert_eq!(err.kind, ErrorKind::Conflict);
-        assert_eq!(crate::output::exit_code(&err), 8);
-        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+        assert_eq!(exit_code(&err), 8);
     }
 }

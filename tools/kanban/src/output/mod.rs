@@ -2,9 +2,8 @@ mod envelope;
 mod payload;
 
 pub(crate) use crate::common::error::{AppError, ErrorKind, exit_code};
-// The payload contract is the module's public surface, but the command
-// handlers that construct it are still scaffolds — nothing imports these yet.
-#[allow(unused_imports)]
+// The payload contract is this module's surface: command handlers import the
+// data types from here rather than reaching into `payload` directly.
 pub(crate) use payload::{
     AddData, AssignData, ClaimedItemData, DoneData, InitData, ItemData, ItemSummaryData, LabelData,
     ListData, MoveData, NextData, Payload, PriorityData, ProjectData, ProjectListData,
