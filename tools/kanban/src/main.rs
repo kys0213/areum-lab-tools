@@ -1,0 +1,231 @@
+mod cli;
+mod commands;
+mod common;
+mod output;
+
+use std::io::Read;
+use std::path::PathBuf;
+
+use clap::Parser;
+
+use cli::{Cli, Command, ItemState, Priority, ProjectCommand};
+use output::{AppError, ErrorKind, Payload, Sink};
+
+fn main() {
+    let cli = Cli::parse();
+    let command_name = cli.command.name();
+    let json = cli.json;
+
+    let result = run(cli);
+    let (sink, line, code) = output::render(command_name, &result, json);
+    match sink {
+        Sink::Stdout => println!("{line}"),
+        Sink::Stderr => eprintln!("{line}"),
+    }
+    std::process::exit(code);
+}
+
+/// Resolves the board path and dispatches to the command handlers. Pure
+/// delegation — no business logic lives here.
+fn run(cli: Cli) -> Result<Payload, AppError> {
+    let db_path = resolve_db_path(cli.db.as_deref(), std::env::var("HOME").ok().as_deref())?;
+
+    match cli.command {
+        Command::Init => commands::run_init(&db_path),
+        Command::Project(ProjectCommand::Add { name, description }) => {
+            commands::run_project_add(&db_path, &name, &description)
+        }
+        Command::Project(ProjectCommand::List) => commands::run_project_list(&db_path),
+        Command::Project(ProjectCommand::Rm { name }) => commands::run_project_rm(&db_path, &name),
+        Command::Add {
+            source,
+            external_id,
+            title,
+            body,
+        } => commands::run_add(&db_path, &source, &external_id, &title, &body, read_stdin),
+        Command::List {
+            project,
+            state,
+            label,
+        } => commands::run_list(
+            &db_path,
+            project.as_deref(),
+            state.map(ItemState::as_str),
+            label.as_deref(),
+        ),
+        Command::Show { id } => commands::run_show(&db_path, &id),
+        Command::Next {
+            project,
+            session,
+            agent,
+        } => commands::run_next(&db_path, &project, &session, &agent),
+        Command::Done { id } => commands::run_done(&db_path, &id),
+        Command::Release { id, reason } => commands::run_release(&db_path, &id, &reason),
+        Command::Assign {
+            id,
+            project,
+            priority,
+        } => commands::run_assign(&db_path, &id, &project, priority.map(Priority::as_str)),
+        Command::Priority { id, priority } => {
+            commands::run_priority(&db_path, &id, priority.as_str())
+        }
+        Command::Move { id, state } => commands::run_move(&db_path, &id, state.as_str()),
+    }
+}
+
+/// Resolves the board database path: the `--db` override when given, else
+/// `~/.areum/kanban/kanban.db` per the tool-crate config-location convention.
+/// `home` is passed in so the resolution is testable without touching the
+/// process environment.
+fn resolve_db_path(flag: Option<&str>, home: Option<&str>) -> Result<PathBuf, AppError> {
+    if let Some(path) = flag {
+        return Ok(PathBuf::from(path));
+    }
+    home.map(|h| PathBuf::from(h).join(".areum/kanban/kanban.db"))
+        .ok_or_else(|| {
+            AppError::new(
+                ErrorKind::Config,
+                "HOME is not set; cannot locate ~/.areum/kanban/kanban.db (pass --db)",
+            )
+        })
+}
+
+fn read_stdin() -> std::io::Result<String> {
+    let mut buffer = String::new();
+    std::io::stdin().read_to_string(&mut buffer)?;
+    Ok(buffer)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn db_flag_wins_over_the_home_default() {
+        let path = resolve_db_path(Some("/tmp/custom.db"), Some("/home/user")).unwrap();
+        assert_eq!(path, PathBuf::from("/tmp/custom.db"));
+    }
+
+    #[test]
+    fn default_db_path_lives_under_the_areum_tool_directory() {
+        let path = resolve_db_path(None, Some("/home/user")).unwrap();
+        assert_eq!(path, PathBuf::from("/home/user/.areum/kanban/kanban.db"));
+    }
+
+    #[test]
+    fn missing_home_without_db_flag_is_a_config_error() {
+        // Fail fast rather than falling back to a relative path that would
+        // silently create a stray database in the working directory.
+        let err = resolve_db_path(None, None).unwrap_err();
+        assert_eq!(err.kind, ErrorKind::Config);
+        assert!(err.message.contains("--db"));
+    }
+
+    #[test]
+    fn missing_home_is_tolerated_when_db_is_given() {
+        let path = resolve_db_path(Some("/tmp/custom.db"), None).unwrap();
+        assert_eq!(path, PathBuf::from("/tmp/custom.db"));
+    }
+
+    #[test]
+    fn every_subcommand_dispatches_to_its_loud_stub() {
+        // Pins the wiring end to end: each parsed subcommand must reach its
+        // handler and surface that handler's "not implemented yet" message,
+        // never a panic and never a synthesized success.
+        let cases: Vec<(Vec<&str>, &str)> = vec![
+            (vec!["kanban", "init"], "init is not implemented yet"),
+            (
+                vec!["kanban", "project", "add", "belt", "--desc", "conveyor"],
+                "project add is not implemented yet",
+            ),
+            (
+                vec!["kanban", "project", "list"],
+                "project list is not implemented yet",
+            ),
+            (
+                vec!["kanban", "project", "rm", "belt"],
+                "project rm is not implemented yet",
+            ),
+            (
+                vec![
+                    "kanban",
+                    "add",
+                    "--source",
+                    "discord",
+                    "--external-id",
+                    "msg-1",
+                    "--title",
+                    "t",
+                    "--body",
+                    "b",
+                ],
+                "add is not implemented yet",
+            ),
+            (vec!["kanban", "list"], "list is not implemented yet"),
+            (
+                vec!["kanban", "show", "itm-000017"],
+                "show is not implemented yet",
+            ),
+            (
+                vec![
+                    "kanban",
+                    "next",
+                    "--project",
+                    "belt",
+                    "--session",
+                    "sess-abc",
+                    "--agent",
+                    "claude",
+                ],
+                "next is not implemented yet",
+            ),
+            (
+                vec!["kanban", "done", "itm-000017"],
+                "done is not implemented yet",
+            ),
+            (
+                vec!["kanban", "release", "itm-000017", "--reason", "boom"],
+                "release is not implemented yet",
+            ),
+            (
+                vec!["kanban", "assign", "itm-000021", "--project", "belt"],
+                "assign is not implemented yet",
+            ),
+            (
+                vec!["kanban", "priority", "itm-000017", "P0"],
+                "priority is not implemented yet",
+            ),
+            (
+                vec!["kanban", "move", "itm-000017", "done"],
+                "move is not implemented yet",
+            ),
+        ];
+
+        for (argv, expected) in cases {
+            let mut args = argv.clone();
+            args.push("--db");
+            args.push("/tmp/kanban-dispatch-test.db");
+            let cli = Cli::try_parse_from(&args).expect("argv should parse");
+            let err = run(cli).unwrap_err();
+            assert_eq!(err.kind, ErrorKind::Internal, "for {argv:?}");
+            assert_eq!(err.message, expected, "for {argv:?}");
+        }
+    }
+
+    #[test]
+    fn dispatch_renders_a_stub_failure_through_the_json_envelope() {
+        // The stubs fail through the normal error path, so --json output is
+        // verifiable now rather than after the command bodies land.
+        let cli = Cli::try_parse_from(["kanban", "--json", "--db", "/tmp/k.db", "show", "itm-1"])
+            .unwrap();
+        let name = cli.command.name();
+        let result = run(cli);
+        let (sink, line, code) = output::render(name, &result, true);
+        assert_eq!(sink, Sink::Stdout);
+        assert_eq!(code, 1);
+        assert_eq!(
+            line,
+            r#"{"ok":false,"command":"show","error":{"kind":"internal","message":"show is not implemented yet"}}"#
+        );
+    }
+}
