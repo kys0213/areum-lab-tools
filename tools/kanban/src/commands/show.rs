@@ -89,6 +89,7 @@ mod tests {
         let path = unique_db_path("missing");
         let err = run_show(&path, "itm-999999").unwrap_err();
         assert_eq!(err.kind, ErrorKind::NotFound);
+        assert_eq!(crate::output::exit_code(&err), 7);
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 }

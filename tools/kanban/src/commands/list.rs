@@ -142,4 +142,40 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
+
+    #[test]
+    fn label_filter_matches_the_key_not_the_value() {
+        let path = unique_db_path("label-key-not-value");
+        {
+            let mut store = Store::open(&path).unwrap();
+            let item = store
+                .insert_item(&NewItem {
+                    source: "discord",
+                    external_id: "msg-1",
+                    title: "cache drifts",
+                    body: "b",
+                })
+                .unwrap();
+            store
+                .attach_label(&item.id, "kind", "bug", Some(0.9))
+                .unwrap();
+        }
+
+        // "kind" is the label's key, so it matches.
+        let by_key = run_list(&path, None, None, Some("kind")).unwrap();
+        match by_key {
+            Payload::List(data) => assert_eq!(data.count, 1),
+            other => panic!("expected Payload::List, got {other:?}"),
+        }
+
+        // "bug" is the label's value, not its key, so it must not match —
+        // this is what proves the filter checks the key and not the value.
+        let by_value = run_list(&path, None, None, Some("bug")).unwrap();
+        match by_value {
+            Payload::List(data) => assert_eq!(data.count, 0),
+            other => panic!("expected Payload::List, got {other:?}"),
+        }
+
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
 }

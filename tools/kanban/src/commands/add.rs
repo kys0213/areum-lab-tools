@@ -108,6 +108,7 @@ mod tests {
         })
         .unwrap_err();
         assert_eq!(err.kind, ErrorKind::Conflict);
+        assert_eq!(crate::output::exit_code(&err), 8);
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 }

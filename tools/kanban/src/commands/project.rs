@@ -82,6 +82,7 @@ mod tests {
         run_project_add(&path, "belt", "conveyor").unwrap();
         let err = run_project_add(&path, "belt", "again").unwrap_err();
         assert_eq!(err.kind, ErrorKind::Conflict);
+        assert_eq!(crate::output::exit_code(&err), 8);
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
@@ -133,6 +134,7 @@ mod tests {
         let path = unique_db_path("rm-missing");
         let err = run_project_rm(&path, "ghost").unwrap_err();
         assert_eq!(err.kind, ErrorKind::NotFound);
+        assert_eq!(crate::output::exit_code(&err), 7);
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
@@ -154,6 +156,7 @@ mod tests {
         }
         let err = run_project_rm(&path, "belt").unwrap_err();
         assert_eq!(err.kind, ErrorKind::Conflict);
+        assert_eq!(crate::output::exit_code(&err), 8);
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 }
