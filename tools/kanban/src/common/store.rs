@@ -12,10 +12,6 @@
 //! Only the classifier's `classification`/`golden` tables are missing: they
 //! are additive DDL owned by later stages and land the same way this schema
 //! does.
-//!
-//! The command bodies that call this module land in later tasks, so nothing
-//! outside the tests reaches most of this surface yet.
-#![allow(dead_code)]
 
 use std::path::Path;
 
@@ -437,43 +433,85 @@ impl Store {
     pub(crate) fn move_item(&self, id: &str, state: &str) -> Result<Transition, AppError> {
         let target = parse_state(state)?;
         let before = self.get_item(id)?;
+        self.apply_move(before, target)
+    }
+
+    /// Applies a `move` planned from the `before` snapshot, guarding the write
+    /// on that exact snapshot.
+    ///
+    /// The guard is not optional bookkeeping. [`plan_move`] decides in Rust
+    /// which columns to clear by reading `before.project`/`before.session_id`,
+    /// so a concurrent writer that changes either between the read and the
+    /// update invalidates the plan. Without the state/project/session guard, a
+    /// `running → done` move racing a `release` would still land — `done` is
+    /// the loose branch of the composite CHECK — and the returned transition
+    /// would report a `before` the row no longer had. Guarding turns that into
+    /// a `conflict`, the same as every other lost race.
+    ///
+    /// Taking the snapshot as a parameter is also what makes the lost race
+    /// reachable from a test: pass a stale `before` and the guard must refuse.
+    fn apply_move(&self, before: ItemRecord, target: ItemState) -> Result<Transition, AppError> {
         let plan = plan_move(
             target,
             before.project.as_deref(),
             before.session_id.as_deref(),
         )?;
+        // plan_move already rejected every target this row cannot legally
+        // reach, so zero rows updated can only mean the row moved underneath.
         let hint = format!(
-            "item {id} cannot move from {} to {}",
+            "item {} is no longer {}; the move to {} lost a race with another writer",
+            before.id,
             before.state.as_str(),
             target.as_str()
         );
         let now = self.clock.now();
-        self.apply(
-            before,
-            &format!(
-                "UPDATE items
-                    SET state = ?2,
-                        project    = CASE WHEN ?3 THEN NULL ELSE project END,
-                        session_id = CASE WHEN ?4 THEN NULL ELSE session_id END,
-                        agent      = CASE WHEN ?4 THEN NULL ELSE agent END,
-                        claimed_at = CASE WHEN ?4 THEN NULL ELSE claimed_at END,
-                        updated_at = ?5
-                  WHERE id = ?1
-                 RETURNING {ITEM_COLUMNS}"
-            ),
+        // `IS` rather than `=` so the NULL columns the plan read compare equal
+        // to themselves.
+        let sql = format!(
+            "UPDATE items
+                SET state = ?2,
+                    project    = CASE WHEN ?3 THEN NULL ELSE project END,
+                    session_id = CASE WHEN ?4 THEN NULL ELSE session_id END,
+                    agent      = CASE WHEN ?4 THEN NULL ELSE agent END,
+                    claimed_at = CASE WHEN ?4 THEN NULL ELSE claimed_at END,
+                    updated_at = ?5
+              WHERE id = ?1
+                AND state = ?6
+                AND project IS ?7
+                AND session_id IS ?8
+             RETURNING {ITEM_COLUMNS}"
+        );
+        let after = self.guarded_update(
+            &sql,
             params![
-                id,
+                before.id,
                 target.as_str(),
                 plan.clear_project,
                 plan.clear_claim,
-                now
+                now,
+                before.state.as_str(),
+                before.project,
+                before.session_id,
             ],
-            hint,
-        )
+            &hint,
+        )?;
+        Ok(Transition { before, after })
     }
 
     /// Attaches (or re-scores) a label. The classifier owns the write path;
     /// `list`/`show` read it back through [`Store::labels_for`].
+    ///
+    /// No command writes labels yet, so outside the tests the first caller
+    /// arrives with the classifier. The expectation is scoped to this one
+    /// method rather than the module, so anything else going unused still
+    /// fails the build, and it lifts on its own once that caller lands.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "label writes belong to the classifier; the read path already ships"
+        )
+    )]
     pub(crate) fn attach_label(
         &self,
         item_id: &str,
@@ -535,11 +573,14 @@ impl Store {
         }
     }
 
-    /// Runs a guarded `UPDATE ... RETURNING` and pairs the new row with the
-    /// one read before it. The guard living in the statement's `WHERE` is
-    /// what makes a lost race indistinguishable from an illegal transition —
-    /// both update zero rows and both are a `conflict`, never a silent
-    /// success.
+    /// Pairs the row a guarded update wrote with the one read before it.
+    ///
+    /// Every caller but [`Store::set_priority`] carries its precondition in
+    /// the statement's `WHERE`, which is what makes a lost race and an
+    /// illegal transition indistinguishable: both update zero rows and both
+    /// are a `conflict`, never a silent success. `set_priority` is the
+    /// exception — a priority correction is legal from every state, so it
+    /// guards on `id` alone and zero rows can only mean the row vanished.
     fn apply(
         &self,
         before: ItemRecord,
@@ -547,8 +588,21 @@ impl Store {
         params: impl rusqlite::Params,
         conflict_hint: String,
     ) -> Result<Transition, AppError> {
+        let after = self.guarded_update(sql, params, &conflict_hint)?;
+        Ok(Transition { before, after })
+    }
+
+    /// Runs an `UPDATE ... RETURNING` and answers the row it wrote. Matching
+    /// nothing is a `conflict` carrying `conflict_hint`, as is tripping any
+    /// constraint the schema declares.
+    fn guarded_update(
+        &self,
+        sql: &str,
+        params: impl rusqlite::Params,
+        conflict_hint: &str,
+    ) -> Result<ItemRecord, AppError> {
         match self.conn.query_row(sql, params, row_to_item).optional() {
-            Ok(Some(after)) => Ok(Transition { before, after }),
+            Ok(Some(after)) => Ok(after),
             Ok(None) => Err(AppError::new(ErrorKind::Conflict, conflict_hint)),
             Err(err) if is_constraint_violation(&err) => Err(AppError::new(
                 ErrorKind::Conflict,
@@ -569,9 +623,12 @@ struct MovePlan {
 
 /// Pure transition planner for `move`. `inbox`/`unmatched` must end up with
 /// neither a project nor a claim; `backlog` keeps its project but drops the
-/// claim; `running` and `done` keep both, and are refused when the row does
-/// not already carry what the invariant requires — `move` cannot invent a
-/// session, so promoting an unclaimed item to `running` is `next`'s job.
+/// claim; `running` and `done` keep both.
+///
+/// A target the row cannot reach is rejected here, before the statement runs,
+/// so the caller gets an actionable `conflict` instead of an opaque CHECK
+/// failure. `move` cannot invent a session, so an unclaimed item can never
+/// become `running` — that is `next`'s job, and the message says so.
 fn plan_move(
     target: ItemState,
     project: Option<&str>,
@@ -594,11 +651,12 @@ fn plan_move(
             clear_project: false,
             clear_claim: false,
         }),
-        ItemState::Running if project.is_some() => Err(AppError::new(
+        ItemState::Running => Err(AppError::new(
             ErrorKind::Conflict,
-            "running needs a claim; use `next` to claim an item",
+            "running needs a project and a claim, and `move` can invent neither; \
+             use `next` to claim a backlog item",
         )),
-        _ => Err(AppError::new(
+        ItemState::Backlog | ItemState::Done => Err(AppError::new(
             ErrorKind::Conflict,
             format!("{} needs a project; assign the item first", target.as_str()),
         )),

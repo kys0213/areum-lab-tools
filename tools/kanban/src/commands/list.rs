@@ -55,22 +55,13 @@ pub(crate) fn run_list(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::commands::testutil::TempBoard;
     use crate::common::store::NewItem;
-    use std::path::PathBuf;
-
-    fn unique_db_path(label: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "areum-kanban-list-test-{}-{label}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        dir.join("kanban.db")
-    }
 
     #[test]
     fn list_is_empty_for_a_fresh_board() {
-        let path = unique_db_path("empty");
-        let payload = run_list(&path, None, None, None).unwrap();
+        let board = TempBoard::new("list-empty");
+        let payload = run_list(board.db_path(), None, None, None).unwrap();
         match payload {
             Payload::List(data) => {
                 assert_eq!(data.count, 0);
@@ -78,14 +69,13 @@ mod tests {
             }
             other => panic!("expected Payload::List, got {other:?}"),
         }
-        let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
     #[test]
     fn list_filters_by_project_state_and_label_and_reads_labels_back() {
-        let path = unique_db_path("filters");
+        let board = TempBoard::new("list-filters");
         {
-            let mut store = Store::open(&path).unwrap();
+            let mut store = Store::open(board.db_path()).unwrap();
             store.add_project("belt", "conveyor").unwrap();
             let assigned = store
                 .insert_item(&NewItem {
@@ -109,7 +99,7 @@ mod tests {
                 .unwrap();
         }
 
-        let by_project = run_list(&path, Some("belt"), None, None).unwrap();
+        let by_project = run_list(board.db_path(), Some("belt"), None, None).unwrap();
         match by_project {
             Payload::List(data) => {
                 assert_eq!(data.count, 1);
@@ -122,32 +112,30 @@ mod tests {
             other => panic!("expected Payload::List, got {other:?}"),
         }
 
-        let by_state = run_list(&path, None, Some("inbox"), None).unwrap();
+        let by_state = run_list(board.db_path(), None, Some("inbox"), None).unwrap();
         match by_state {
             Payload::List(data) => assert_eq!(data.count, 1),
             other => panic!("expected Payload::List, got {other:?}"),
         }
 
-        let by_label = run_list(&path, None, None, Some("kind")).unwrap();
+        let by_label = run_list(board.db_path(), None, None, Some("kind")).unwrap();
         match by_label {
             Payload::List(data) => assert_eq!(data.count, 1),
             other => panic!("expected Payload::List, got {other:?}"),
         }
 
-        let no_match = run_list(&path, Some("belt"), Some("inbox"), None).unwrap();
+        let no_match = run_list(board.db_path(), Some("belt"), Some("inbox"), None).unwrap();
         match no_match {
             Payload::List(data) => assert_eq!(data.count, 0),
             other => panic!("expected Payload::List, got {other:?}"),
         }
-
-        let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
     #[test]
     fn label_filter_matches_the_key_not_the_value() {
-        let path = unique_db_path("label-key-not-value");
+        let board = TempBoard::new("list-label-key-not-value");
         {
-            let mut store = Store::open(&path).unwrap();
+            let mut store = Store::open(board.db_path()).unwrap();
             let item = store
                 .insert_item(&NewItem {
                     source: "discord",
@@ -162,7 +150,7 @@ mod tests {
         }
 
         // "kind" is the label's key, so it matches.
-        let by_key = run_list(&path, None, None, Some("kind")).unwrap();
+        let by_key = run_list(board.db_path(), None, None, Some("kind")).unwrap();
         match by_key {
             Payload::List(data) => assert_eq!(data.count, 1),
             other => panic!("expected Payload::List, got {other:?}"),
@@ -170,12 +158,10 @@ mod tests {
 
         // "bug" is the label's value, not its key, so it must not match —
         // this is what proves the filter checks the key and not the value.
-        let by_value = run_list(&path, None, None, Some("bug")).unwrap();
+        let by_value = run_list(board.db_path(), None, None, Some("bug")).unwrap();
         match by_value {
             Payload::List(data) => assert_eq!(data.count, 0),
             other => panic!("expected Payload::List, got {other:?}"),
         }
-
-        let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 }

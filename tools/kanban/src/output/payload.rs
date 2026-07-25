@@ -2,9 +2,9 @@
 //! that command answers with. Derived from docs/kanban-board.md §4 (state
 //! table), §5 (command surface), and §6 (schema).
 //!
-//! The whole contract is defined here ahead of the command bodies that will
-//! construct it, so nothing outside the tests builds a payload in this stage.
-#![allow(dead_code)]
+//! These types are the machine-readable contract: their field names and
+//! shapes are what `--json` emits, so renaming one is a breaking change for
+//! every agent parsing the envelope.
 
 use serde::Serialize;
 

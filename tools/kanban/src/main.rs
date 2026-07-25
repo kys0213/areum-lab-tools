@@ -82,79 +82,274 @@ fn read_stdin() -> std::io::Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use output::ErrorKind;
+    use commands::testutil::TempBoard;
+    use common::store::Store;
+    use output::{ErrorKind, NextData};
+
+    /// Parses `argv` and runs it through the real dispatch, so the assertions
+    /// below cover the clap→handler wiring itself. Every command test calls
+    /// its `run_*` directly and would not notice a mis-wired argument here.
+    fn dispatch(argv: &[&str]) -> Result<Payload, AppError> {
+        let cli = Cli::try_parse_from(argv).expect("argv should parse");
+        run(cli)
+    }
 
     #[test]
-    fn every_remaining_stub_subcommand_dispatches_to_its_loud_stub() {
-        // Pins the wiring end to end for the subcommands a later task still
-        // owns: each parsed subcommand must reach its handler and surface
-        // that handler's "not implemented yet" message, never a panic and
-        // never a synthesized success. init/project/add/list/show are
-        // implemented (T3) and covered by their own command-level tests
-        // instead, since they no longer fail this way.
-        let cases: Vec<(Vec<&str>, &str)> = vec![
-            (
-                vec![
-                    "kanban",
-                    "next",
-                    "--project",
-                    "belt",
-                    "--session",
-                    "sess-abc",
-                    "--agent",
-                    "claude",
-                ],
-                "next is not implemented yet",
-            ),
-            (
-                vec!["kanban", "done", "itm-000017"],
-                "done is not implemented yet",
-            ),
-            (
-                vec!["kanban", "release", "itm-000017", "--reason", "boom"],
-                "release is not implemented yet",
-            ),
-            (
-                vec!["kanban", "assign", "itm-000021", "--project", "belt"],
-                "assign is not implemented yet",
-            ),
-            (
-                vec!["kanban", "priority", "itm-000017", "P0"],
-                "priority is not implemented yet",
-            ),
-            (
-                vec!["kanban", "move", "itm-000017", "done"],
-                "move is not implemented yet",
-            ),
-        ];
+    fn every_subcommand_dispatches_to_its_handler_with_arguments_in_order() {
+        // `main.rs` hands several same-typed arguments to each handler
+        // positionally — (source, external_id, title, body) for `add`,
+        // (project, state, label) for `list`, (id, project) for `assign`.
+        // Swapping any pair still compiles, so every assertion here uses a
+        // value that differs per parameter; asserting only "dispatch
+        // returned Ok" would let a swap through.
+        let board = TempBoard::new("dispatch-order");
+        let db = board.db_path().display().to_string();
+        let db = db.as_str();
 
-        for (argv, expected) in cases {
-            let mut args = argv.clone();
-            args.push("--db");
-            args.push("/tmp/kanban-dispatch-test.db");
-            let cli = Cli::try_parse_from(&args).expect("argv should parse");
-            let err = run(cli).unwrap_err();
-            assert_eq!(err.kind, ErrorKind::Internal, "for {argv:?}");
-            assert_eq!(err.message, expected, "for {argv:?}");
+        match dispatch(&["kanban", "--db", db, "init"]).unwrap() {
+            Payload::Init(data) => assert!(data.created),
+            other => panic!("expected Payload::Init, got {other:?}"),
+        }
+
+        match dispatch(&[
+            "kanban", "--db", db, "project", "add", "belt", "--desc", "conveyor",
+        ])
+        .unwrap()
+        {
+            Payload::ProjectAdd(data) => {
+                assert_eq!(data.name, "belt");
+                assert_eq!(data.description, "conveyor");
+            }
+            other => panic!("expected Payload::ProjectAdd, got {other:?}"),
+        }
+
+        match dispatch(&["kanban", "--db", db, "project", "list"]).unwrap() {
+            Payload::ProjectList(data) => {
+                assert_eq!(data.count, 1);
+                assert_eq!(data.projects[0].name, "belt");
+            }
+            other => panic!("expected Payload::ProjectList, got {other:?}"),
+        }
+
+        match dispatch(&[
+            "kanban",
+            "--db",
+            db,
+            "add",
+            "--source",
+            "discord",
+            "--external-id",
+            "msg-1",
+            "--title",
+            "cache drifts",
+            "--body",
+            "steps to reproduce",
+        ])
+        .unwrap()
+        {
+            Payload::Add(data) => {
+                assert_eq!(data.id, "itm-000001");
+                assert_eq!(data.source, "discord");
+                assert_eq!(data.external_id, "msg-1");
+                assert_eq!(data.title, "cache drifts");
+                assert_eq!(data.state, "inbox");
+            }
+            other => panic!("expected Payload::Add, got {other:?}"),
+        }
+
+        // `body` is the one `add` argument its payload does not echo, so
+        // `show` is what pins it apart from title/source/external_id.
+        match dispatch(&["kanban", "--db", db, "show", "itm-000001"]).unwrap() {
+            Payload::Show(data) => {
+                assert_eq!(data.id, "itm-000001");
+                assert_eq!(data.title, "cache drifts");
+                assert_eq!(data.body, "steps to reproduce");
+                assert_eq!(data.source, "discord");
+                assert_eq!(data.external_id, "msg-1");
+            }
+            other => panic!("expected Payload::Show, got {other:?}"),
+        }
+
+        match dispatch(&[
+            "kanban",
+            "--db",
+            db,
+            "assign",
+            "itm-000001",
+            "--project",
+            "belt",
+            "--priority",
+            "P1",
+        ])
+        .unwrap()
+        {
+            Payload::Assign(data) => {
+                assert_eq!(data.id, "itm-000001");
+                assert_eq!(data.project, "belt");
+                assert_eq!(data.priority, "P1");
+                assert_eq!(data.previous_state, "inbox");
+                assert_eq!(data.state, "backlog");
+            }
+            other => panic!("expected Payload::Assign, got {other:?}"),
+        }
+
+        // Only the classifier writes labels, so the --label filter needs one
+        // arranged directly. With all three filters set to different values,
+        // any swap among them selects nothing.
+        Store::open(board.db_path())
+            .unwrap()
+            .attach_label("itm-000001", "kind", "bug", None)
+            .unwrap();
+        match dispatch(&[
+            "kanban",
+            "--db",
+            db,
+            "list",
+            "--project",
+            "belt",
+            "--state",
+            "backlog",
+            "--label",
+            "kind",
+        ])
+        .unwrap()
+        {
+            Payload::List(data) => {
+                assert_eq!(data.count, 1);
+                assert_eq!(data.items[0].id, "itm-000001");
+                assert_eq!(data.items[0].project.as_deref(), Some("belt"));
+                assert_eq!(data.items[0].state, "backlog");
+                assert_eq!(data.items[0].labels[0].key, "kind");
+            }
+            other => panic!("expected Payload::List, got {other:?}"),
+        }
+
+        match dispatch(&[
+            "kanban",
+            "--db",
+            db,
+            "next",
+            "--project",
+            "belt",
+            "--session",
+            "sess-abc",
+            "--agent",
+            "claude",
+        ])
+        .unwrap()
+        {
+            Payload::Next(NextData::Claimed(data)) => {
+                assert_eq!(data.id, "itm-000001");
+                assert_eq!(data.project, "belt");
+                assert_eq!(data.session_id, "sess-abc");
+                assert_eq!(data.agent, "claude");
+            }
+            other => panic!("expected a claim, got {other:?}"),
+        }
+
+        match dispatch(&[
+            "kanban",
+            "--db",
+            db,
+            "release",
+            "itm-000001",
+            "--reason",
+            "build failed",
+        ])
+        .unwrap()
+        {
+            Payload::Release(data) => {
+                assert_eq!(data.id, "itm-000001");
+                assert_eq!(data.reason, "build failed");
+                assert_eq!(data.released_session_id.as_deref(), Some("sess-abc"));
+                assert_eq!(data.released_agent.as_deref(), Some("claude"));
+            }
+            other => panic!("expected Payload::Release, got {other:?}"),
+        }
+
+        match dispatch(&["kanban", "--db", db, "priority", "itm-000001", "P0"]).unwrap() {
+            Payload::Priority(data) => {
+                assert_eq!(data.id, "itm-000001");
+                assert_eq!(data.previous_priority, "P1");
+                assert_eq!(data.priority, "P0");
+            }
+            other => panic!("expected Payload::Priority, got {other:?}"),
+        }
+
+        // Claim it again so `done` runs from the only state it accepts.
+        dispatch(&[
+            "kanban",
+            "--db",
+            db,
+            "next",
+            "--project",
+            "belt",
+            "--session",
+            "sess-two",
+            "--agent",
+            "codex",
+        ])
+        .unwrap();
+        match dispatch(&["kanban", "--db", db, "done", "itm-000001"]).unwrap() {
+            Payload::Done(data) => {
+                assert_eq!(data.id, "itm-000001");
+                assert_eq!(data.state, "done");
+                assert_eq!(data.session_id.as_deref(), Some("sess-two"));
+                assert_eq!(data.agent.as_deref(), Some("codex"));
+            }
+            other => panic!("expected Payload::Done, got {other:?}"),
+        }
+
+        match dispatch(&["kanban", "--db", db, "move", "itm-000001", "unmatched"]).unwrap() {
+            Payload::Move(data) => {
+                assert_eq!(data.id, "itm-000001");
+                assert_eq!(data.from_state, "done");
+                assert_eq!(data.to_state, "unmatched");
+                assert_eq!(data.project, None);
+            }
+            other => panic!("expected Payload::Move, got {other:?}"),
+        }
+
+        // Nothing references `belt` any more, so the removal goes through.
+        match dispatch(&["kanban", "--db", db, "project", "rm", "belt"]).unwrap() {
+            Payload::ProjectRm(data) => assert_eq!(data.name, "belt"),
+            other => panic!("expected Payload::ProjectRm, got {other:?}"),
         }
     }
 
     #[test]
-    fn dispatch_renders_a_stub_failure_through_the_json_envelope() {
-        // The remaining stubs fail through the normal error path, so --json
-        // output is verifiable now rather than after their command bodies
-        // land. `done` is still a stub; `show` is not (T3), so it can no
-        // longer serve this case.
-        let cli = Cli::try_parse_from(["kanban", "--json", "--db", "/tmp/k.db", "done", "itm-1"])
-            .unwrap();
+    fn dispatch_renders_success_and_failure_through_the_json_envelope() {
+        // Both envelope shapes, pinned as literals through the real dispatch
+        // rather than through a hand-built payload.
+        let board = TempBoard::new("dispatch-envelope");
+        let db = board.db_path().display().to_string();
+
+        let cli = Cli::try_parse_from(["kanban", "--json", "--db", &db, "list"]).unwrap();
         let name = cli.command.name();
         let result = run(cli);
         let (sink, line, code) = output::render(name, &result, true);
         assert_eq!(sink, Sink::Stdout);
-        assert_eq!(code, 1);
+        assert_eq!(code, 0);
         assert_eq!(
             line,
-            r#"{"ok":false,"command":"done","error":{"kind":"internal","message":"done is not implemented yet"}}"#
+            r#"{"ok":true,"command":"list","data":{"count":0,"items":[]}}"#
+        );
+
+        let cli =
+            Cli::try_parse_from(["kanban", "--json", "--db", &db, "done", "itm-999999"]).unwrap();
+        let name = cli.command.name();
+        let result = run(cli);
+        assert_eq!(
+            result.as_ref().unwrap_err().kind,
+            ErrorKind::NotFound,
+            "a missing item must not be reported as an internal failure"
+        );
+        let (sink, line, code) = output::render(name, &result, true);
+        assert_eq!(sink, Sink::Stdout);
+        assert_eq!(code, 7);
+        assert_eq!(
+            line,
+            r#"{"ok":false,"command":"done","error":{"kind":"not_found","message":"no item itm-999999"}}"#
         );
     }
 }

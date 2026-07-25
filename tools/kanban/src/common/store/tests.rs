@@ -1,26 +1,5 @@
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
-
 use super::*;
-
-/// Strictly increasing timestamps, one per call, so `created_at` ordering in
-/// the claim is pinned by insertion order instead of by how fast the test ran.
-#[derive(Default)]
-struct SeqClock {
-    ticks: AtomicU64,
-}
-
-impl Clock for SeqClock {
-    fn now(&self) -> String {
-        let n = self.ticks.fetch_add(1, Ordering::SeqCst);
-        format!(
-            "2024-01-01T{:02}:{:02}:{:02}Z",
-            n / 3_600,
-            (n / 60) % 60,
-            n % 60
-        )
-    }
-}
+use crate::commands::testutil::{SeqClock, TempBoard};
 
 struct FixedClock(&'static str);
 
@@ -32,18 +11,6 @@ impl Clock for FixedClock {
 
 fn memory_store() -> Store {
     Store::open_in_memory(Box::new(SeqClock::default())).expect("in-memory board opens")
-}
-
-/// A unique, not-yet-existing directory under the OS temp dir. Mirrors the
-/// `tools/discord` store fixtures: file-backed tests exercise the real
-/// "create parent dir" path without clobbering each other.
-fn unique_db_path(label: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "areum-kanban-store-test-{}-{label}",
-        std::process::id()
-    ));
-    let _ = std::fs::remove_dir_all(&dir);
-    dir.join("kanban.db")
 }
 
 fn new_item(external_id: &str) -> NewItem<'_> {
@@ -96,31 +63,31 @@ fn seeded_project(store: &Store) {
 
 #[test]
 fn opening_an_existing_board_reuses_its_schema_and_data() {
-    let path = unique_db_path("idempotent-open");
+    let board = TempBoard::new("store-idempotent-open");
     {
-        let mut store =
-            Store::open_with_clock(&path, Box::new(SeqClock::default())).expect("first open");
+        let mut store = Store::open_with_clock(board.db_path(), Box::new(SeqClock::default()))
+            .expect("first open");
         seeded_project(&store);
         add_inbox(&mut store, "msg-1");
     }
-    let store = Store::open_with_clock(&path, Box::new(SeqClock::default())).expect("second open");
+    let store = Store::open_with_clock(board.db_path(), Box::new(SeqClock::default()))
+        .expect("second open");
     assert_eq!(store.list_projects().unwrap().len(), 1);
     assert_eq!(store.list_items(&ItemFilter::default()).unwrap().len(), 1);
 }
 
 #[test]
 fn open_reporting_created_is_true_only_on_the_first_open() {
-    let path = unique_db_path("reporting-created");
+    let board = TempBoard::new("store-reporting-created");
     let (_, created) =
-        Store::open_with_clock_reporting_created(&path, Box::new(SeqClock::default()))
+        Store::open_with_clock_reporting_created(board.db_path(), Box::new(SeqClock::default()))
             .expect("first open");
     assert!(created, "a fresh path must report created = true");
 
     let (_, created) =
-        Store::open_with_clock_reporting_created(&path, Box::new(SeqClock::default()))
+        Store::open_with_clock_reporting_created(board.db_path(), Box::new(SeqClock::default()))
             .expect("second open");
     assert!(!created, "an existing board must report created = false");
-    let _ = std::fs::remove_dir_all(path.parent().expect("fixture path has a parent"));
 }
 
 #[test]
@@ -499,9 +466,10 @@ fn two_connections_claiming_concurrently_never_receive_the_same_item() {
     // a read-then-write claim would hand the same row to both, showing up
     // here as a duplicate id (and as a total above the seeded count).
     const TOTAL: usize = 24;
-    let path = unique_db_path("concurrent-claim");
+    let board = TempBoard::new("store-concurrent-claim");
+    let path = board.db_path();
     {
-        let mut store = Store::open_with_clock(&path, Box::new(SeqClock::default())).unwrap();
+        let mut store = Store::open_with_clock(path, Box::new(SeqClock::default())).unwrap();
         seeded_project(&store);
         for i in 0..TOTAL {
             add_backlog(&mut store, &format!("msg-{i}"), "belt", "P1");
@@ -514,7 +482,6 @@ fn two_connections_claiming_concurrently_never_receive_the_same_item() {
             .into_iter()
             .map(|agent| {
                 let start = &start;
-                let path = path.as_path();
                 scope.spawn(move || {
                     let store =
                         Store::open_with_clock(path, Box::new(SeqClock::default())).unwrap();
@@ -549,19 +516,19 @@ fn two_connections_claiming_concurrently_never_receive_the_same_item() {
     );
 
     // Every row is now claimed by exactly one of the two sessions.
-    let store = Store::open_with_clock(&path, Box::new(SeqClock::default())).unwrap();
+    let store = Store::open_with_clock(path, Box::new(SeqClock::default())).unwrap();
     for item in store.list_items(&ItemFilter::default()).unwrap() {
         assert_eq!(item.state, ItemState::Running, "{item:?}");
         assert!(item.session_id.is_some(), "{item:?}");
     }
-    let _ = std::fs::remove_dir_all(path.parent().expect("fixture path has a parent"));
 }
 
 #[test]
 fn a_single_backlog_item_is_claimed_by_exactly_one_of_two_racers() {
-    let path = unique_db_path("single-item-race");
+    let board = TempBoard::new("store-single-item-race");
+    let path = board.db_path();
     {
-        let mut store = Store::open_with_clock(&path, Box::new(SeqClock::default())).unwrap();
+        let mut store = Store::open_with_clock(path, Box::new(SeqClock::default())).unwrap();
         seeded_project(&store);
         add_backlog(&mut store, "msg-1", "belt", "P0");
     }
@@ -572,7 +539,6 @@ fn a_single_backlog_item_is_claimed_by_exactly_one_of_two_racers() {
             .into_iter()
             .map(|agent| {
                 let start = &start;
-                let path = path.as_path();
                 scope.spawn(move || {
                     let store =
                         Store::open_with_clock(path, Box::new(SeqClock::default())).unwrap();
@@ -595,7 +561,6 @@ fn a_single_backlog_item_is_claimed_by_exactly_one_of_two_racers() {
         1,
         "exactly one racer may win the only backlog item: {outcomes:?}"
     );
-    let _ = std::fs::remove_dir_all(path.parent().expect("fixture path has a parent"));
 }
 
 // --- done / release --------------------------------------------------------
@@ -817,6 +782,42 @@ fn moving_an_unassigned_item_into_an_assigned_state_is_a_conflict() {
         assert_eq!(err.kind, ErrorKind::Conflict, "target {target}");
     }
     assert_eq!(store.get_item(&item.id).unwrap().state, ItemState::Inbox);
+}
+
+#[test]
+fn a_move_planned_from_a_stale_snapshot_is_refused_instead_of_reporting_a_lie() {
+    // `move` decides in Rust which columns to clear, from a snapshot it read
+    // first. Another writer can invalidate that snapshot in between — here a
+    // `release` drops the claim while a `running → done` move is in flight.
+    //
+    // With the guard on `id` alone the UPDATE still lands, because `done` is
+    // the loose branch of the composite CHECK: no row invariant breaks, but
+    // the returned transition reports `before.state = running` for a row that
+    // was already `backlog`, and the release is silently overwritten. The
+    // state/project/session guard turns that into a `conflict` like every
+    // other lost race.
+    let mut store = memory_store();
+    seeded_project(&store);
+    let id = add_backlog(&mut store, "msg-1", "belt", "P1");
+    store.claim_next("belt", "sess-abc", "claude").unwrap();
+
+    let stale = store.get_item(&id).unwrap();
+    assert_eq!(stale.state, ItemState::Running, "snapshot setup");
+
+    // The concurrent writer wins the race.
+    store.release(&id).unwrap();
+
+    let err = store.apply_move(stale, ItemState::Done).unwrap_err();
+    assert_eq!(err.kind, ErrorKind::Conflict);
+    assert!(err.message.contains("race"), "{}", err.message);
+
+    let survivor = store.get_item(&id).unwrap();
+    assert_eq!(
+        survivor.state,
+        ItemState::Backlog,
+        "a lost race must not write over the winner"
+    );
+    assert_eq!(survivor.session_id, None);
 }
 
 #[test]
