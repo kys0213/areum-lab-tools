@@ -43,8 +43,9 @@ mod tests {
     use super::*;
     use crate::common::error::ErrorKind;
     use crate::output::payload::{
-        AddData, AssignData, ClaimedItemData, DoneData, InitData, ItemSummaryData, LabelData,
-        ListData, NextData, ReleaseData,
+        AddData, AssignData, ClaimedItemData, DoneData, InitData, ItemData, ItemSummaryData,
+        LabelData, ListData, MoveData, NextData, PriorityData, ProjectData, ProjectListData,
+        ProjectRmData, ReleaseData,
     };
     use crate::output::{Sink, render};
 
@@ -182,6 +183,113 @@ mod tests {
         assert_eq!(
             json,
             r#"{"ok":true,"command":"assign","data":{"id":"itm-000021","state":"backlog","previous_state":"unmatched","project":"belt","priority":"P1","updated_at":"2024-01-03T00:00:00Z"}}"#
+        );
+    }
+
+    #[test]
+    fn project_add_success_matches_contract() {
+        let payload = Payload::ProjectAdd(ProjectData {
+            name: "belt".into(),
+            description: "conveyor".into(),
+            created_at: "2024-01-01T00:00:00Z".into(),
+        });
+        let (_, json, _) = render("project", &Ok(payload), true);
+        assert_eq!(
+            json,
+            r#"{"ok":true,"command":"project","data":{"name":"belt","description":"conveyor","created_at":"2024-01-01T00:00:00Z"}}"#
+        );
+    }
+
+    #[test]
+    fn project_list_success_matches_contract() {
+        let payload = Payload::ProjectList(ProjectListData {
+            count: 1,
+            projects: vec![ProjectData {
+                name: "belt".into(),
+                description: "conveyor".into(),
+                created_at: "2024-01-01T00:00:00Z".into(),
+            }],
+        });
+        let (_, json, _) = render("project", &Ok(payload), true);
+        assert_eq!(
+            json,
+            r#"{"ok":true,"command":"project","data":{"count":1,"projects":[{"name":"belt","description":"conveyor","created_at":"2024-01-01T00:00:00Z"}]}}"#
+        );
+    }
+
+    #[test]
+    fn project_rm_success_matches_contract() {
+        let payload = Payload::ProjectRm(ProjectRmData {
+            name: "belt".into(),
+        });
+        let (_, json, _) = render("project", &Ok(payload), true);
+        assert_eq!(
+            json,
+            r#"{"ok":true,"command":"project","data":{"name":"belt"}}"#
+        );
+    }
+
+    #[test]
+    fn show_success_matches_contract() {
+        // Unlike `list`, `show` carries the body and a null claim when the
+        // item was never picked up — both must round-trip as literal JSON.
+        let payload = Payload::Show(ItemData {
+            id: "itm-000017".into(),
+            source: "discord".into(),
+            external_id: "msg-1".into(),
+            title: "cache keeps drifting".into(),
+            body: "steps to reproduce".into(),
+            state: "backlog".into(),
+            project: Some("belt".into()),
+            priority: "P1".into(),
+            session_id: None,
+            agent: None,
+            claimed_at: None,
+            created_at: "2024-01-01T00:00:00Z".into(),
+            updated_at: "2024-01-02T00:00:00Z".into(),
+            labels: vec![LabelData {
+                key: "kind".into(),
+                value: "bug".into(),
+                confidence: Some(0.5),
+            }],
+        });
+        let (_, json, _) = render("show", &Ok(payload), true);
+        assert_eq!(
+            json,
+            r#"{"ok":true,"command":"show","data":{"id":"itm-000017","source":"discord","external_id":"msg-1","title":"cache keeps drifting","body":"steps to reproduce","state":"backlog","project":"belt","priority":"P1","session_id":null,"agent":null,"claimed_at":null,"created_at":"2024-01-01T00:00:00Z","updated_at":"2024-01-02T00:00:00Z","labels":[{"key":"kind","value":"bug","confidence":0.5}]}}"#
+        );
+    }
+
+    #[test]
+    fn priority_success_matches_contract() {
+        let payload = Payload::Priority(PriorityData {
+            id: "itm-000017".into(),
+            priority: "P0".into(),
+            previous_priority: "P2".into(),
+            updated_at: "2024-01-03T00:00:00Z".into(),
+        });
+        let (_, json, _) = render("priority", &Ok(payload), true);
+        assert_eq!(
+            json,
+            r#"{"ok":true,"command":"priority","data":{"id":"itm-000017","priority":"P0","previous_priority":"P2","updated_at":"2024-01-03T00:00:00Z"}}"#
+        );
+    }
+
+    #[test]
+    fn move_success_matches_contract() {
+        // `project` is null for the inbox/unmatched targets the schema's
+        // CHECK requires to be project-less — pin that null, not just the set case.
+        let payload = Payload::Move(MoveData {
+            id: "itm-000017".into(),
+            from_state: "backlog".into(),
+            to_state: "unmatched".into(),
+            project: None,
+            updated_at: "2024-01-03T00:00:00Z".into(),
+        });
+        let (_, json, _) = render("move", &Ok(payload), true);
+        assert_eq!(
+            json,
+            r#"{"ok":true,"command":"move","data":{"id":"itm-000017","from_state":"backlog","to_state":"unmatched","project":null,"updated_at":"2024-01-03T00:00:00Z"}}"#
         );
     }
 
