@@ -14,7 +14,7 @@ pub(crate) fn run_assign(
     project: &str,
     priority: Option<&str>,
 ) -> Result<Payload, AppError> {
-    let store = Store::open(db_path)?;
+    let mut store = Store::open(db_path)?;
     let Transition { before, after } = store.assign(id, project, priority)?;
     Ok(Payload::Assign(AssignData {
         id: after.id,
