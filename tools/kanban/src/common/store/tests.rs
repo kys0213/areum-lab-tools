@@ -1,3 +1,5 @@
+use std::cell::{Cell, RefCell};
+use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use super::*;
@@ -700,6 +702,113 @@ fn release_never_revokes_a_claim_it_did_not_see() {
     }
 }
 
+/// Runs one `move_item(racer_id, "unmatched")` from a second connection on
+/// its first tick, then behaves like [`SeqClock`]. Same mechanism as
+/// [`ClaimingClock`], but the racing call itself opens a transaction (it goes
+/// through [`Store::apply`] too), so it needs `&mut Store` and the `RefCell`
+/// gives it that from behind `Clock::now`'s `&self`.
+///
+/// `assign`'s own guard is `state IN ('inbox', 'unmatched')` — both ends of
+/// the race this drives — so a landed race would not turn into a rejected
+/// write the way `release`'s literal `state = 'running'` does. The only
+/// place the defect would show is `before` itself: `landed` records whether
+/// the racer's move committed, so the test can assert the honest
+/// `previous_state` for whichever outcome the run actually produced instead
+/// of asserting the one outcome the fix guarantees.
+struct RacingMoveClock {
+    racer: RefCell<Store>,
+    racer_id: String,
+    inner: SeqClock,
+    fired: AtomicBool,
+    landed: Cell<bool>,
+}
+
+impl RacingMoveClock {
+    fn new(path: &Path, racer_id: &str) -> RacingMoveClock {
+        let racer = Store::open_with_clock(path, Box::new(SeqClock::default()))
+            .expect("the racing connection opens the same board");
+        racer
+            .conn
+            .busy_timeout(std::time::Duration::from_millis(100))
+            .expect("busy timeout");
+        RacingMoveClock {
+            racer: RefCell::new(racer),
+            racer_id: racer_id.to_owned(),
+            inner: SeqClock::default(),
+            fired: AtomicBool::new(false),
+            landed: Cell::new(false),
+        }
+    }
+}
+
+impl Clock for RacingMoveClock {
+    fn now(&self) -> String {
+        if !self.fired.swap(true, Ordering::SeqCst) {
+            match self
+                .racer
+                .borrow_mut()
+                .move_item(&self.racer_id, "unmatched")
+            {
+                Ok(_) => self.landed.set(true),
+                // Any failure other than losing the write lock would
+                // silently look like "the fix kept the racer out".
+                Err(err) => assert!(
+                    err.message.contains("locked") || err.message.contains("busy"),
+                    "the racer must fail only by losing the write lock: {}",
+                    err.message
+                ),
+            }
+        }
+        self.inner.now()
+    }
+}
+
+/// Lets the test keep a handle to `landed` after the clock is boxed and
+/// handed to `Store`.
+impl Clock for Rc<RacingMoveClock> {
+    fn now(&self) -> String {
+        <RacingMoveClock as Clock>::now(self)
+    }
+}
+
+#[test]
+fn assign_never_reports_a_previous_state_a_concurrent_move_already_overtook() {
+    // Same defect class as `release_never_revokes_a_claim_it_did_not_see`,
+    // exercised through `assign` because `previous_state` is what
+    // `output/payload.rs` builds the stage-2 golden set from: a wrong value
+    // here silently poisons training data, even though both mutations share
+    // the one `Store::apply` seam that closes the race.
+    let board = TempBoard::new("store-assign-interleaving");
+    let path = board.db_path();
+    let id = {
+        let mut store = Store::open_with_clock(path, Box::new(SeqClock::default())).unwrap();
+        seeded_project(&store);
+        add_inbox(&mut store, "msg-1").id
+    };
+
+    let clock = Rc::new(RacingMoveClock::new(path, &id));
+    let mut store = Store::open_with_clock(path, Box::new(Rc::clone(&clock))).unwrap();
+    let assigned = store.assign(&id, "belt", None).unwrap();
+
+    if clock.landed.get() {
+        // The racer's move committed before assign's write, so the row's
+        // true state just before that write was `unmatched` — reporting
+        // `inbox` here is exactly the stale-`before` lie the fix closes.
+        assert_eq!(
+            assigned.before.state,
+            ItemState::Unmatched,
+            "assign reported a previous_state the racer's move had already overtaken"
+        );
+    } else {
+        // The write lock kept the racer out, so `inbox` is the row's own,
+        // uncontested history.
+        assert_eq!(assigned.before.state, ItemState::Inbox);
+    }
+    assert_eq!(assigned.before.project, None);
+    assert_eq!(assigned.after.state, ItemState::Backlog);
+    assert_eq!(store.get_item(&id).unwrap().state, ItemState::Backlog);
+}
+
 #[test]
 fn completing_or_releasing_an_unclaimed_item_is_a_conflict() {
     let mut store = memory_store();
@@ -903,6 +1012,40 @@ fn a_move_between_two_unassigned_states_matches_its_null_project_snapshot() {
         store.get_item(&item.id).unwrap().state,
         ItemState::Unmatched
     );
+}
+
+#[test]
+fn a_move_planned_from_a_stale_snapshot_is_refused_even_outside_apply() {
+    // `Store::apply` now holds the write lock across the read and the write,
+    // so nothing can invalidate `before` between them in practice — but
+    // `apply_move`'s own WHERE restates the snapshot for exactly the moment
+    // that stops being true (a caller that reaches it some other way, or a
+    // future refactor that loosens the transaction). Call the free function
+    // directly, bypassing `apply` entirely, with a `before` a concurrent
+    // `release` has already invalidated, and confirm the guard itself — not
+    // the transaction around it — is what refuses the write.
+    let mut store = memory_store();
+    seeded_project(&store);
+    let id = add_backlog(&mut store, "msg-1", "belt", "P1");
+    store.claim_next("belt", "sess-abc", "claude").unwrap();
+
+    let stale = store.get_item(&id).unwrap();
+    assert_eq!(stale.state, ItemState::Running, "snapshot setup");
+
+    // The concurrent writer wins the race.
+    store.release(&id).unwrap();
+
+    let err = apply_move(&store.conn, &stale, ItemState::Done, "2024-01-01T00:00:00Z").unwrap_err();
+    assert_eq!(err.kind, ErrorKind::Conflict);
+    assert!(err.message.contains("no longer"), "{}", err.message);
+
+    let survivor = store.get_item(&id).unwrap();
+    assert_eq!(
+        survivor.state,
+        ItemState::Backlog,
+        "a stale snapshot must not write over the winner"
+    );
+    assert_eq!(survivor.session_id, None);
 }
 
 #[test]
