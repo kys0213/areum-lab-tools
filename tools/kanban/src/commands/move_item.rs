@@ -12,7 +12,7 @@ use crate::output::{AppError, MoveData, Payload};
 /// rejected as a `conflict` before the write, with a message naming the
 /// command that can get there instead.
 pub(crate) fn run_move(db_path: &Path, id: &str, state: &str) -> Result<Payload, AppError> {
-    let store = Store::open(db_path)?;
+    let mut store = Store::open(db_path)?;
     let Transition { before, after } = store.move_item(id, state)?;
     Ok(Payload::Move(MoveData {
         id: after.id,

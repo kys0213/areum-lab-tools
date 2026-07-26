@@ -1,3 +1,5 @@
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use super::*;
 use crate::commands::testutil::{SeqClock, TempBoard};
 
@@ -222,7 +224,10 @@ fn project_rm_is_refused_while_items_reference_it() {
     let err = store.remove_project("belt").unwrap_err();
     assert_eq!(err.kind, ErrorKind::Conflict);
     assert!(err.message.contains("belt"), "{}", err.message);
-    assert!(store.find_item(&id).unwrap().is_some(), "item was orphaned");
+    assert!(
+        fetch_item(&store.conn, &id).unwrap().is_some(),
+        "item was orphaned"
+    );
 
     // Once nothing references it, the same delete goes through.
     store.move_item(&id, "inbox").unwrap();
@@ -306,7 +311,7 @@ fn a_missing_item_is_not_found() {
     let err = store.get_item("itm-000017").unwrap_err();
     assert_eq!(err.kind, ErrorKind::NotFound);
     assert_eq!(err.message, "no item itm-000017");
-    assert!(store.find_item("itm-000017").unwrap().is_none());
+    assert!(fetch_item(&store.conn, "itm-000017").unwrap().is_none());
 }
 
 // --- listing ---------------------------------------------------------------
@@ -600,6 +605,101 @@ fn done_preserves_the_claim_and_release_clears_it() {
     );
 }
 
+/// Runs one `claim_next` from a second connection on its first tick, then
+/// behaves like [`SeqClock`].
+///
+/// A mutation asks the clock for its timestamp after reading the row it plans
+/// from and before writing it, so this drives another connection into exactly
+/// the window the fix has to close — no threads, no sleeps, same interleaving
+/// on every run.
+struct ClaimingClock {
+    racer: Store,
+    inner: SeqClock,
+    fired: AtomicBool,
+}
+
+impl ClaimingClock {
+    /// The racer must be connected before the mutation under test starts: a
+    /// fresh `Store::open` writes (schema, WAL) and would itself block on the
+    /// lock this clock is about to be called under.
+    fn new(path: &Path) -> ClaimingClock {
+        let racer = Store::open_with_clock(path, Box::new(SeqClock::default()))
+            .expect("the racing connection opens the same board");
+        // Losing the write lock has to be reported in milliseconds; the
+        // default five seconds is a timeout, not a test.
+        racer
+            .conn
+            .busy_timeout(std::time::Duration::from_millis(100))
+            .expect("busy timeout");
+        ClaimingClock {
+            racer,
+            inner: SeqClock::default(),
+            fired: AtomicBool::new(false),
+        }
+    }
+}
+
+impl Clock for ClaimingClock {
+    fn now(&self) -> String {
+        if !self.fired.swap(true, Ordering::SeqCst) {
+            // Either the claim commits inside the window or the write lock
+            // keeps it out — both are outcomes the test asserts against, but
+            // any *other* failure would silently look like the second one.
+            if let Err(err) = self.racer.claim_next("belt", "sess-racer", "codex") {
+                assert!(
+                    err.message.contains("locked") || err.message.contains("busy"),
+                    "the racer must fail only by losing the write lock: {}",
+                    err.message
+                );
+            }
+        }
+        self.inner.now()
+    }
+}
+
+#[test]
+fn release_never_revokes_a_claim_it_did_not_see() {
+    // The user-visible shape of the defect. `release` plans from a `backlog`
+    // snapshot — nothing to release — while another process claims the same
+    // row. The literal `WHERE state = 'running'` then matches the racer's
+    // fresh claim and revokes it, while the transition still carries the stale
+    // snapshot: `commands/release.rs` builds `released_session_id` from that
+    // `before`, so the payload reports releasing nothing while the racer's
+    // session is in fact dropped.
+    let board = TempBoard::new("store-release-interleaving");
+    let path = board.db_path();
+    {
+        let mut store = Store::open_with_clock(path, Box::new(SeqClock::default())).unwrap();
+        seeded_project(&store);
+        add_backlog(&mut store, "msg-1", "belt", "P1");
+    }
+
+    let mut store = Store::open_with_clock(path, Box::new(ClaimingClock::new(path))).unwrap();
+    match store.release("itm-000001") {
+        Ok(released) => {
+            // Only a `running` row can be released, and the racer's claim is
+            // the only thing that could have made this one running.
+            assert_eq!(
+                released.before.session_id.as_deref(),
+                Some("sess-racer"),
+                "release revoked the racer's claim while reporting a before-image \
+                 that never held it"
+            );
+            assert_eq!(released.before.state, ItemState::Running);
+            assert_eq!(released.after.session_id, None);
+        }
+        Err(err) => {
+            // The transaction kept the racer out, so the row is still the
+            // untouched `backlog` snapshot the release refused.
+            assert_eq!(err.kind, ErrorKind::Conflict);
+            assert!(err.message.contains("backlog"), "{}", err.message);
+            let row = store.get_item("itm-000001").unwrap();
+            assert_eq!(row.state, ItemState::Backlog);
+            assert_eq!(row.session_id, None);
+        }
+    }
+}
+
 #[test]
 fn completing_or_releasing_an_unclaimed_item_is_a_conflict() {
     let mut store = memory_store();
@@ -617,7 +717,7 @@ fn completing_or_releasing_an_unclaimed_item_is_a_conflict() {
 
 #[test]
 fn completing_a_missing_item_is_not_found() {
-    let store = memory_store();
+    let mut store = memory_store();
     assert_eq!(
         store.mark_done("itm-000017").unwrap_err().kind,
         ErrorKind::NotFound
@@ -785,39 +885,24 @@ fn moving_an_unassigned_item_into_an_assigned_state_is_a_conflict() {
 }
 
 #[test]
-fn a_move_planned_from_a_stale_snapshot_is_refused_instead_of_reporting_a_lie() {
-    // `move` decides in Rust which columns to clear, from a snapshot it read
-    // first. Another writer can invalidate that snapshot in between — here a
-    // `release` drops the claim while a `running → done` move is in flight.
-    //
-    // With the guard on `id` alone the UPDATE still lands, because `done` is
-    // the loose branch of the composite CHECK: no row invariant breaks, but
-    // the returned transition reports `before.state = running` for a row that
-    // was already `backlog`, and the release is silently overwritten. The
-    // state/project/session guard turns that into a `conflict` like every
-    // other lost race.
+fn a_move_between_two_unassigned_states_matches_its_null_project_snapshot() {
+    // `apply_move` restates the snapshot it planned from in the `WHERE`, and
+    // an `inbox → unmatched` move is the case where every guarded column is
+    // NULL on both ends. `project IS ?7` is what makes a NULL bind compare
+    // equal to a NULL column; with `=` the guard would match nothing and this
+    // entirely uncontended move would be reported as a lost snapshot.
     let mut store = memory_store();
-    seeded_project(&store);
-    let id = add_backlog(&mut store, "msg-1", "belt", "P1");
-    store.claim_next("belt", "sess-abc", "claude").unwrap();
+    let item = add_inbox(&mut store, "msg-1");
 
-    let stale = store.get_item(&id).unwrap();
-    assert_eq!(stale.state, ItemState::Running, "snapshot setup");
-
-    // The concurrent writer wins the race.
-    store.release(&id).unwrap();
-
-    let err = store.apply_move(stale, ItemState::Done).unwrap_err();
-    assert_eq!(err.kind, ErrorKind::Conflict);
-    assert!(err.message.contains("race"), "{}", err.message);
-
-    let survivor = store.get_item(&id).unwrap();
+    let moved = store.move_item(&item.id, "unmatched").unwrap();
+    assert_eq!(moved.before.state, ItemState::Inbox);
+    assert_eq!(moved.before.project, None);
+    assert_eq!(moved.after.state, ItemState::Unmatched);
+    assert_eq!(moved.after.project, None);
     assert_eq!(
-        survivor.state,
-        ItemState::Backlog,
-        "a lost race must not write over the winner"
+        store.get_item(&item.id).unwrap().state,
+        ItemState::Unmatched
     );
-    assert_eq!(survivor.session_id, None);
 }
 
 #[test]

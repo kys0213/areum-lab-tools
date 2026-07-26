@@ -10,7 +10,7 @@ use crate::output::{AppError, Payload, ReleaseData};
 /// The claim it reports is the one it just cleared, so it comes from the
 /// transition's `before`, not from the row that is now unowned.
 pub(crate) fn run_release(db_path: &Path, id: &str, reason: &str) -> Result<Payload, AppError> {
-    let store = Store::open(db_path)?;
+    let mut store = Store::open(db_path)?;
     let Transition { before, after } = store.release(id)?;
     Ok(Payload::Release(ReleaseData {
         id: after.id,

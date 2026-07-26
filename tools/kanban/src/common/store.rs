@@ -1,7 +1,10 @@
 //! SQLite persistence for the board. Owns the schema of docs/kanban-board.md
 //! §6 verbatim — including the composite state/project/session invariant that
 //! makes an inconsistent row unwritable — plus the single-statement atomic
-//! claim that `next` relies on.
+//! claim that `next` relies on. Every mutation that reports both ends of a
+//! transition reads and writes inside one `BEGIN IMMEDIATE` transaction (see
+//! [`Store::apply`]), so the `before` it answers with is an image of the row
+//! it actually wrote.
 //!
 //! Every failure leaves here as an [`AppError`] with the kind the CLI contract
 //! promises (§8): a missing item or project is `not_found`, and every
@@ -263,19 +266,7 @@ impl Store {
     }
 
     pub(crate) fn get_item(&self, id: &str) -> Result<ItemRecord, AppError> {
-        self.find_item(id)?
-            .ok_or_else(|| not_found(format!("no item {id}")))
-    }
-
-    pub(crate) fn find_item(&self, id: &str) -> Result<Option<ItemRecord>, AppError> {
-        self.conn
-            .query_row(
-                &format!("SELECT {ITEM_COLUMNS} FROM items WHERE id = ?1"),
-                params![id],
-                row_to_item,
-            )
-            .optional()
-            .map_err(map_sqlite_err)
+        require_item(&self.conn, id)
     }
 
     pub(crate) fn list_items(&self, filter: &ItemFilter<'_>) -> Result<Vec<ItemRecord>, AppError> {
@@ -327,47 +318,48 @@ impl Store {
 
     /// Completes a claimed item. `session_id`/`agent` are deliberately left
     /// in place: who did the work has to survive completion (§4).
-    pub(crate) fn mark_done(&self, id: &str) -> Result<Transition, AppError> {
-        let before = self.get_item(id)?;
-        let hint = format!(
-            "item {id} is {}, not running; only a claimed item can be completed",
-            before.state.as_str()
-        );
-        let now = self.clock.now();
-        self.apply(
-            before,
-            &format!(
-                "UPDATE items SET state = 'done', updated_at = ?2
-                  WHERE id = ?1 AND state = 'running'
-                 RETURNING {ITEM_COLUMNS}"
-            ),
-            params![id, now],
-            hint,
-        )
+    pub(crate) fn mark_done(&mut self, id: &str) -> Result<Transition, AppError> {
+        self.apply(id, |conn, before, now| {
+            let hint = format!(
+                "item {id} is {}, not running; only a claimed item can be completed",
+                before.state.as_str()
+            );
+            guarded_update(
+                conn,
+                &format!(
+                    "UPDATE items SET state = 'done', updated_at = ?2
+                      WHERE id = ?1 AND state = 'running'
+                     RETURNING {ITEM_COLUMNS}"
+                ),
+                params![id, now],
+                &hint,
+            )
+        })
     }
 
     /// Drops a claim and returns the item to `backlog`, clearing
     /// `session_id`/`agent`/`claimed_at`. The dropped claim is readable from
-    /// the returned transition's `before`.
-    pub(crate) fn release(&self, id: &str) -> Result<Transition, AppError> {
-        let before = self.get_item(id)?;
-        let hint = format!(
-            "item {id} is {}, not running; there is no claim to release",
-            before.state.as_str()
-        );
-        let now = self.clock.now();
-        self.apply(
-            before,
-            &format!(
-                "UPDATE items
-                    SET state = 'backlog', session_id = NULL, agent = NULL,
-                        claimed_at = NULL, updated_at = ?2
-                  WHERE id = ?1 AND state = 'running'
-                 RETURNING {ITEM_COLUMNS}"
-            ),
-            params![id, now],
-            hint,
-        )
+    /// the returned transition's `before`, so that snapshot has to be the
+    /// image of the very row this write revokes — see [`Store::apply`].
+    pub(crate) fn release(&mut self, id: &str) -> Result<Transition, AppError> {
+        self.apply(id, |conn, before, now| {
+            let hint = format!(
+                "item {id} is {}, not running; there is no claim to release",
+                before.state.as_str()
+            );
+            guarded_update(
+                conn,
+                &format!(
+                    "UPDATE items
+                        SET state = 'backlog', session_id = NULL, agent = NULL,
+                            claimed_at = NULL, updated_at = ?2
+                      WHERE id = ?1 AND state = 'running'
+                     RETURNING {ITEM_COLUMNS}"
+                ),
+                params![id, now],
+                &hint,
+            )
+        })
     }
 
     /// Assigns an unclassified item to a project (`inbox`/`unmatched` →
@@ -375,127 +367,77 @@ impl Store {
     /// already-assigned item is refused: re-targeting a claimed or finished
     /// item would strand its agent, so `move` is the escape hatch for that.
     pub(crate) fn assign(
-        &self,
+        &mut self,
         id: &str,
         project: &str,
         priority: Option<&str>,
     ) -> Result<Transition, AppError> {
         let priority = priority.map(parse_priority).transpose()?;
-        let before = self.get_item(id)?;
-        self.require_project(project)?;
-        let hint = format!(
-            "item {id} is {}; only an inbox or unmatched item can be assigned",
-            before.state.as_str()
-        );
-        let now = self.clock.now();
-        self.apply(
-            before,
-            &format!(
-                "UPDATE items
-                    SET state = 'backlog', project = ?2,
-                        priority = COALESCE(?3, priority), updated_at = ?4
-                  WHERE id = ?1 AND state IN ('inbox', 'unmatched')
-                 RETURNING {ITEM_COLUMNS}"
-            ),
-            params![id, project, priority.map(Priority::as_str), now],
-            hint,
-        )
+        self.apply(id, move |conn, before, now| {
+            // Inside the transaction, so a project that survives this check
+            // cannot be removed before the write lands on it.
+            require_project(conn, project)?;
+            let hint = format!(
+                "item {id} is {}; only an inbox or unmatched item can be assigned",
+                before.state.as_str()
+            );
+            guarded_update(
+                conn,
+                &format!(
+                    "UPDATE items
+                        SET state = 'backlog', project = ?2,
+                            priority = COALESCE(?3, priority), updated_at = ?4
+                      WHERE id = ?1 AND state IN ('inbox', 'unmatched')
+                     RETURNING {ITEM_COLUMNS}"
+                ),
+                params![id, project, priority.map(Priority::as_str), now],
+                &hint,
+            )
+        })
     }
 
     /// Corrects the priority without touching the state.
-    pub(crate) fn set_priority(&self, id: &str, priority: &str) -> Result<Transition, AppError> {
+    ///
+    /// The statement carries no precondition — a priority correction is legal
+    /// from every state — but the read still shares [`Store::apply`]'s
+    /// transaction, because the payload reports `previous_priority` from the
+    /// snapshot and that value has to be the one this write replaced.
+    pub(crate) fn set_priority(
+        &mut self,
+        id: &str,
+        priority: &str,
+    ) -> Result<Transition, AppError> {
         let priority = parse_priority(priority)?;
-        let before = self.get_item(id)?;
-        // The token is already validated and the statement has no state guard,
-        // so the only way this update matches nothing is a row that vanished
-        // between the read and the write.
-        let hint = format!(
-            "item {id} is no longer available to take priority {}",
-            priority.as_str()
-        );
-        let now = self.clock.now();
-        self.apply(
-            before,
-            &format!(
-                "UPDATE items SET priority = ?2, updated_at = ?3
-                  WHERE id = ?1
-                 RETURNING {ITEM_COLUMNS}"
-            ),
-            params![id, priority.as_str(), now],
-            hint,
-        )
+        self.apply(id, move |conn, _before, now| {
+            // The row was read in this transaction and nothing but `id` guards
+            // the statement, so zero rows here is unreachable short of the
+            // transaction failing to isolate.
+            let hint = format!(
+                "item {id} is no longer available to take priority {}",
+                priority.as_str()
+            );
+            guarded_update(
+                conn,
+                &format!(
+                    "UPDATE items SET priority = ?2, updated_at = ?3
+                      WHERE id = ?1
+                     RETURNING {ITEM_COLUMNS}"
+                ),
+                params![id, priority.as_str(), now],
+                &hint,
+            )
+        })
     }
 
     /// The `move` escape hatch. The target state dictates which columns must
     /// be cleared for the row to stay inside the schema's invariant (see
     /// [`plan_move`]); a target the current row cannot legally reach is a
     /// `conflict` rather than a silent no-op.
-    pub(crate) fn move_item(&self, id: &str, state: &str) -> Result<Transition, AppError> {
+    pub(crate) fn move_item(&mut self, id: &str, state: &str) -> Result<Transition, AppError> {
         let target = parse_state(state)?;
-        let before = self.get_item(id)?;
-        self.apply_move(before, target)
-    }
-
-    /// Applies a `move` planned from the `before` snapshot, guarding the write
-    /// on that exact snapshot.
-    ///
-    /// The guard is not optional bookkeeping. [`plan_move`] decides in Rust
-    /// which columns to clear by reading `before.project`/`before.session_id`,
-    /// so a concurrent writer that changes either between the read and the
-    /// update invalidates the plan. Without the state/project/session guard, a
-    /// `running → done` move racing a `release` would still land — `done` is
-    /// the loose branch of the composite CHECK — and the returned transition
-    /// would report a `before` the row no longer had. Guarding turns that into
-    /// a `conflict`, the same as every other lost race.
-    ///
-    /// Taking the snapshot as a parameter is also what makes the lost race
-    /// reachable from a test: pass a stale `before` and the guard must refuse.
-    fn apply_move(&self, before: ItemRecord, target: ItemState) -> Result<Transition, AppError> {
-        let plan = plan_move(
-            target,
-            before.project.as_deref(),
-            before.session_id.as_deref(),
-        )?;
-        // plan_move already rejected every target this row cannot legally
-        // reach, so zero rows updated can only mean the row moved underneath.
-        let hint = format!(
-            "item {} is no longer {}; the move to {} lost a race with another writer",
-            before.id,
-            before.state.as_str(),
-            target.as_str()
-        );
-        let now = self.clock.now();
-        // `IS` rather than `=` so the NULL columns the plan read compare equal
-        // to themselves.
-        let sql = format!(
-            "UPDATE items
-                SET state = ?2,
-                    project    = CASE WHEN ?3 THEN NULL ELSE project END,
-                    session_id = CASE WHEN ?4 THEN NULL ELSE session_id END,
-                    agent      = CASE WHEN ?4 THEN NULL ELSE agent END,
-                    claimed_at = CASE WHEN ?4 THEN NULL ELSE claimed_at END,
-                    updated_at = ?5
-              WHERE id = ?1
-                AND state = ?6
-                AND project IS ?7
-                AND session_id IS ?8
-             RETURNING {ITEM_COLUMNS}"
-        );
-        let after = self.guarded_update(
-            &sql,
-            params![
-                before.id,
-                target.as_str(),
-                plan.clear_project,
-                plan.clear_claim,
-                now,
-                before.state.as_str(),
-                before.project,
-                before.session_id,
-            ],
-            &hint,
-        )?;
-        Ok(Transition { before, after })
+        self.apply(id, move |conn, before, now| {
+            apply_move(conn, before, target, now)
+        })
     }
 
     /// Attaches (or re-scores) a label. The classifier owns the write path;
@@ -557,59 +499,155 @@ impl Store {
         .map_err(map_sqlite_err)
     }
 
-    fn require_project(&self, name: &str) -> Result<(), AppError> {
-        let exists: bool = self
-            .conn
-            .query_row(
-                "SELECT EXISTS (SELECT 1 FROM projects WHERE name = ?1)",
-                params![name],
-                |row| row.get(0),
-            )
-            .map_err(map_sqlite_err)?;
-        if exists {
-            Ok(())
-        } else {
-            Err(not_found(format!("no project {name}")))
-        }
-    }
-
-    /// Pairs the row a guarded update wrote with the one read before it.
+    /// Reads the row, lets `write` plan and run its update from that exact
+    /// snapshot, and pairs both ends into the [`Transition`] the payloads are
+    /// built from.
     ///
-    /// Every caller but [`Store::set_priority`] carries its precondition in
-    /// the statement's `WHERE`, which is what makes a lost race and an
-    /// illegal transition indistinguishable: both update zero rows and both
-    /// are a `conflict`, never a silent success. `set_priority` is the
-    /// exception — a priority correction is legal from every state, so it
-    /// guards on `id` alone and zero rows can only mean the row vanished.
+    /// The read and the write share one `BEGIN IMMEDIATE` transaction, and
+    /// that — not the statement's `WHERE` — is what makes `before` an honest
+    /// image of the row this call wrote. The preconditions in the `WHERE`
+    /// (`state = 'running'`, `state IN ('inbox','unmatched')`) are literals:
+    /// they keep an illegal transition from landing, but on their own they
+    /// match any row that happens to satisfy them, including one another
+    /// process moved into that state after the snapshot was taken. Holding the
+    /// write lock across both statements removes that window, so zero rows
+    /// updated means the snapshot itself failed the precondition — an illegal
+    /// transition, reported as a `conflict` with the caller's hint, never a
+    /// silent success and no longer a lost race.
+    ///
+    /// `write` is handed the timestamp rather than reading the clock itself so
+    /// `updated_at` is stamped inside that same window, and a row that is not
+    /// on the board costs no tick at all.
     fn apply(
-        &self,
-        before: ItemRecord,
-        sql: &str,
-        params: impl rusqlite::Params,
-        conflict_hint: String,
+        &mut self,
+        id: &str,
+        write: impl FnOnce(&Connection, &ItemRecord, &str) -> Result<ItemRecord, AppError>,
     ) -> Result<Transition, AppError> {
-        let after = self.guarded_update(sql, params, &conflict_hint)?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(map_sqlite_err)?;
+        let before = require_item(&tx, id)?;
+        let now = self.clock.now();
+        let after = write(&tx, &before, &now)?;
+        tx.commit().map_err(map_sqlite_err)?;
         Ok(Transition { before, after })
     }
+}
 
-    /// Runs an `UPDATE ... RETURNING` and answers the row it wrote. Matching
-    /// nothing is a `conflict` carrying `conflict_hint`, as is tripping any
-    /// constraint the schema declares.
-    fn guarded_update(
-        &self,
-        sql: &str,
-        params: impl rusqlite::Params,
-        conflict_hint: &str,
-    ) -> Result<ItemRecord, AppError> {
-        match self.conn.query_row(sql, params, row_to_item).optional() {
-            Ok(Some(after)) => Ok(after),
-            Ok(None) => Err(AppError::new(ErrorKind::Conflict, conflict_hint)),
-            Err(err) if is_constraint_violation(&err) => Err(AppError::new(
-                ErrorKind::Conflict,
-                format!("{conflict_hint} ({err})"),
-            )),
-            Err(err) => Err(map_sqlite_err(err)),
-        }
+/// Writes a `move` planned from `before`, guarding the update on that exact
+/// snapshot.
+///
+/// The guard is redundant with [`Store::apply`]'s transaction and kept
+/// deliberately: [`plan_move`] decides in Rust which columns to clear by
+/// reading `before.project`/`before.session_id`, and a `running → done` move
+/// is the one transition the composite CHECK would happily let land on a row
+/// that had changed underneath (`done` is its loose branch). Restating the
+/// snapshot in the `WHERE` states that dependency in the statement itself, so
+/// the plan can never be applied to a row it was not planned from — whatever
+/// isolation the surrounding call happens to provide.
+fn apply_move(
+    conn: &Connection,
+    before: &ItemRecord,
+    target: ItemState,
+    now: &str,
+) -> Result<ItemRecord, AppError> {
+    let plan = plan_move(
+        target,
+        before.project.as_deref(),
+        before.session_id.as_deref(),
+    )?;
+    // plan_move already rejected every target this row cannot legally reach,
+    // and the snapshot was read inside this transaction, so zero rows updated
+    // means the guard and the row disagree — the isolation the caller relies
+    // on failed, not a refused transition.
+    let hint = format!(
+        "item {} could not be moved to {}: the row no longer matches the {} snapshot \
+         the move was planned from",
+        before.id,
+        target.as_str(),
+        before.state.as_str()
+    );
+    // `IS` rather than `=` so the NULL columns the plan read compare equal to
+    // themselves: an `inbox`/`unmatched` snapshot carries a NULL project and a
+    // NULL session, and `=` would make the guard match nothing at all.
+    let sql = format!(
+        "UPDATE items
+            SET state = ?2,
+                project    = CASE WHEN ?3 THEN NULL ELSE project END,
+                session_id = CASE WHEN ?4 THEN NULL ELSE session_id END,
+                agent      = CASE WHEN ?4 THEN NULL ELSE agent END,
+                claimed_at = CASE WHEN ?4 THEN NULL ELSE claimed_at END,
+                updated_at = ?5
+          WHERE id = ?1
+            AND state = ?6
+            AND project IS ?7
+            AND session_id IS ?8
+         RETURNING {ITEM_COLUMNS}"
+    );
+    guarded_update(
+        conn,
+        &sql,
+        params![
+            before.id,
+            target.as_str(),
+            plan.clear_project,
+            plan.clear_claim,
+            now,
+            before.state.as_str(),
+            before.project,
+            before.session_id,
+        ],
+        &hint,
+    )
+}
+
+fn fetch_item(conn: &Connection, id: &str) -> Result<Option<ItemRecord>, AppError> {
+    conn.query_row(
+        &format!("SELECT {ITEM_COLUMNS} FROM items WHERE id = ?1"),
+        params![id],
+        row_to_item,
+    )
+    .optional()
+    .map_err(map_sqlite_err)
+}
+
+fn require_item(conn: &Connection, id: &str) -> Result<ItemRecord, AppError> {
+    fetch_item(conn, id)?.ok_or_else(|| not_found(format!("no item {id}")))
+}
+
+fn require_project(conn: &Connection, name: &str) -> Result<(), AppError> {
+    let exists: bool = conn
+        .query_row(
+            "SELECT EXISTS (SELECT 1 FROM projects WHERE name = ?1)",
+            params![name],
+            |row| row.get(0),
+        )
+        .map_err(map_sqlite_err)?;
+    if exists {
+        Ok(())
+    } else {
+        Err(not_found(format!("no project {name}")))
+    }
+}
+
+/// Runs an `UPDATE ... RETURNING` and answers the row it wrote. Matching
+/// nothing is a `conflict` carrying `conflict_hint`, as is tripping any
+/// constraint the schema declares.
+fn guarded_update(
+    conn: &Connection,
+    sql: &str,
+    params: impl rusqlite::Params,
+    conflict_hint: &str,
+) -> Result<ItemRecord, AppError> {
+    match conn.query_row(sql, params, row_to_item).optional() {
+        Ok(Some(after)) => Ok(after),
+        Ok(None) => Err(AppError::new(ErrorKind::Conflict, conflict_hint)),
+        Err(err) if is_constraint_violation(&err) => Err(AppError::new(
+            ErrorKind::Conflict,
+            format!("{conflict_hint} ({err})"),
+        )),
+        Err(err) => Err(map_sqlite_err(err)),
     }
 }
 

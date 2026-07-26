@@ -7,7 +7,7 @@ use crate::output::{AppError, DoneData, Payload};
 /// the record of who did the work survives completion (docs §4). Calling it
 /// on an item that is not claimed is a `conflict`, not a silent success.
 pub(crate) fn run_done(db_path: &Path, id: &str) -> Result<Payload, AppError> {
-    let store = Store::open(db_path)?;
+    let mut store = Store::open(db_path)?;
     let after = store.mark_done(id)?.after;
     Ok(Payload::Done(DoneData {
         id: after.id,

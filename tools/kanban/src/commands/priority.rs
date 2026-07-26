@@ -9,7 +9,7 @@ use crate::output::{AppError, Payload, PriorityData};
 /// Both ends are reported so a caller can tell a real change from a no-op
 /// re-assertion of the same value.
 pub(crate) fn run_priority(db_path: &Path, id: &str, priority: &str) -> Result<Payload, AppError> {
-    let store = Store::open(db_path)?;
+    let mut store = Store::open(db_path)?;
     let Transition { before, after } = store.set_priority(id, priority)?;
     Ok(Payload::Priority(PriorityData {
         id: after.id,
