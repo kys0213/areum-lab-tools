@@ -26,8 +26,11 @@ impl HookRunner for ProcessHookRunner {
         let (program, args) = argv.split_first().ok_or_else(|| {
             AppError::new(ErrorKind::Config, "on_message must not be an empty array")
         })?;
+        // The hook is arbitrary user code; it must not see the bot token the
+        // daemon may carry in its own environment.
         let mut child = Command::new(program)
             .args(args)
+            .env_remove("DISCORD_BOT_TOKEN")
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .stderr(Stdio::inherit())
@@ -136,6 +139,32 @@ mod tests {
             !injected.exists(),
             "a shell metacharacter inside an argument must not run a command"
         );
+        std::fs::remove_file(&out).ok();
+    }
+
+    /// The daemon itself runs with the bot token in its environment (the
+    /// background spawner passes it that way); a hook must not inherit it.
+    #[test]
+    fn run_does_not_pass_the_bot_token_environment_to_the_hook() {
+        let out = unique_path("token-env");
+        let _ = std::fs::remove_file(&out);
+        let script = format!(
+            "printf '%s\\n' \"${{DISCORD_BOT_TOKEN-unset}}\" > {}",
+            out.display()
+        );
+
+        // The variable lives only for the synchronous spawn inside `run` and
+        // is removed right after, so no other test observes it. No other test
+        // depends on DISCORD_BOT_TOKEN being absent.
+        // SAFETY: std serializes `set_var`/`remove_var` with its own env reads
+        // (including `Command::spawn`), and no test calls into C code that
+        // reads the environment directly.
+        unsafe { std::env::set_var("DISCORD_BOT_TOKEN", "leaked-token") };
+        let result = ProcessHookRunner.run(&argv(&["sh", "-c", &script]), String::new());
+        unsafe { std::env::remove_var("DISCORD_BOT_TOKEN") };
+        result.expect("a valid command must start");
+
+        assert_eq!(wait_for_file(&out), "unset\n");
         std::fs::remove_file(&out).ok();
     }
 
