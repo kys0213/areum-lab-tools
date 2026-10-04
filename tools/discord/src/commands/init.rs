@@ -33,19 +33,15 @@ pub(crate) fn run_init(
         ));
     }
 
-    // Preserve `channels` from a --force overwrite rather than discarding it;
-    // a malformed existing file fails fast here instead of being silently
-    // dropped.
-    let channels = if already_exists {
-        load_existing()?.map(|c| c.channels).unwrap_or_default()
+    // A --force overwrite replaces only the token and preserves every other
+    // field (`channels`, message-trigger settings); a malformed existing file
+    // fails fast here instead of being silently dropped.
+    let mut new_config = if already_exists {
+        load_existing()?.unwrap_or_default()
     } else {
-        Default::default()
+        Config::default()
     };
-
-    let new_config = Config {
-        token: Some(token),
-        channels,
-    };
+    new_config.token = Some(token);
     write(&new_config)?;
 
     Ok(Payload::Init(InitData {

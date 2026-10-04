@@ -1,7 +1,10 @@
 mod gateway;
+mod hook_runner;
 mod interactions;
+mod message_trigger;
 
 pub(crate) use gateway::run;
+pub(crate) use message_trigger::MessageTriggerSettings;
 // Re-exported for the CLI<->daemon contract round-trip tests in
 // `commands::ask::tests`, which call the daemon's real interaction handler
 // against `ask create`'s real output rather than a hand-built fixture.

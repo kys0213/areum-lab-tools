@@ -138,6 +138,7 @@ async fn run(cli: Cli) -> Result<Payload, AppError> {
                     commands::run_daemon_start(
                         &db_path,
                         &pid_path,
+                        &config_path,
                         cli.config.as_deref(),
                         token,
                         foreground,

@@ -22,8 +22,10 @@ use std::process::Stdio;
 
 use std::os::unix::process::CommandExt;
 
+use crate::common::config::load_config;
 use crate::common::http::HttpDiscordApi;
 use crate::common::store::AskStore;
+use crate::daemon::MessageTriggerSettings;
 use crate::output::{
     AppError, DaemonStartData, DaemonStatusData, DaemonStopData, ErrorKind, Payload,
 };
@@ -45,12 +47,13 @@ const START_CONFIRM_POLL_INTERVAL: std::time::Duration = std::time::Duration::fr
 pub(crate) async fn run_daemon_start(
     db_path: &Path,
     pid_path: &Path,
+    config_path: &Path,
     config_flag: Option<&str>,
     token: String,
     foreground: bool,
 ) -> Result<Payload, AppError> {
     if foreground {
-        run_foreground(db_path, pid_path, token).await
+        run_foreground(db_path, pid_path, config_path, token).await
     } else {
         start_background(pid_path, config_flag, &token).await
     }
@@ -60,11 +63,18 @@ pub(crate) async fn run_daemon_start(
 /// (`--foreground` directly, or as [`start_background`]'s detached child).
 /// Atomically claims the pidfile before touching the store or gateway, so a
 /// second instance is rejected here rather than racing a spawner-side check.
+/// Message-trigger settings are validated first so a bad `on_message` fails
+/// before anything is claimed.
 async fn run_foreground(
     db_path: &Path,
     pid_path: &Path,
+    config_path: &Path,
     token: String,
 ) -> Result<Payload, AppError> {
+    let message_trigger = match load_config(config_path)? {
+        Some(config) => MessageTriggerSettings::from_config(&config)?,
+        None => None,
+    };
     acquire_pidfile(pid_path)?;
     let api = HttpDiscordApi::new(token.clone());
     let store = match AskStore::open(db_path) {
@@ -77,7 +87,7 @@ async fn run_foreground(
     // Blocks until SIGTERM (graceful) or a fatal gateway close (Err). Either
     // way this process is the pidfile's sole owner until now, so release it
     // on both outcomes before propagating.
-    let run_result = crate::daemon::run(&api, &store, token).await;
+    let run_result = crate::daemon::run(&api, &store, token, message_trigger).await;
     release_own_pidfile(pid_path);
     run_result?;
     Ok(Payload::DaemonStart(DaemonStartData {
