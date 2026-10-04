@@ -26,6 +26,10 @@ pub struct Config {
     /// Absolute or `~/`-prefixed.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub workdirs: HashMap<String, String>,
+    /// Numeric user ids of bots (this bot included) whose messages go through
+    /// the same trigger filter as a person's. Empty keeps every bot ignored.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub trigger_bots: Vec<String>,
     /// Directory for channels without a `workdirs` entry.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_workdir: Option<String>,
@@ -285,6 +289,18 @@ mod tests {
         let cfg = parse_config(r#"{"token":"t","on_message":["/bin/run"]}"#).unwrap();
         assert!(cfg.workdirs.is_empty());
         assert!(cfg.default_workdir.is_none());
+    }
+
+    #[test]
+    fn parse_config_reads_trigger_bots() {
+        let cfg = parse_config(r#"{"trigger_bots":["123","456"]}"#).unwrap();
+        assert_eq!(cfg.trigger_bots, vec!["123", "456"]);
+    }
+
+    #[test]
+    fn parse_config_without_trigger_bots_leaves_it_empty() {
+        let cfg = parse_config(r#"{"token":"t"}"#).unwrap();
+        assert!(cfg.trigger_bots.is_empty());
     }
 
     #[test]

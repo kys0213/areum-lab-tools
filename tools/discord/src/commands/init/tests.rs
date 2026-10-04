@@ -136,6 +136,32 @@ fn run_init_force_preserves_message_trigger_settings() {
 }
 
 #[test]
+fn run_init_force_preserves_trigger_bots() {
+    let dir = unique_init_dir("force-preserve-trigger-bots");
+    let path = dir.join("config.json");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(&path, r#"{"token":"old","trigger_bots":["123","456"]}"#).unwrap();
+
+    run_init(
+        &path,
+        Some("newtoken"),
+        true,
+        unreachable_stdin,
+        || path.exists(),
+        || config::load_config(&path),
+        |cfg| config::write_config_file(&path, cfg),
+    )
+    .unwrap();
+
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        r#"{"token":"newtoken","trigger_bots":["123","456"]}"#
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
 fn run_init_force_preserves_workdir_settings() {
     let dir = unique_init_dir("force-preserve-workdirs");
     let path = dir.join("config.json");

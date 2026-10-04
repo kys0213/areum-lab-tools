@@ -4,7 +4,8 @@
 //! guarantees the filter rules and the payload contract (see
 //! `docs/discord-message-trigger.md`).
 //!
-//! Filter rules: bots (including this bot) never trigger; inside a thread only
+//! Filter rules: bots (including this bot) never trigger unless listed in
+//! `trigger_bots`, in which case they are judged like a person; inside a thread only
 //! a bot mention triggers; a top-level post in an issue channel triggers even
 //! without a mention (once, as `issue_channel`); anywhere else only a bot
 //! mention triggers.
@@ -37,6 +38,7 @@ const CHANNEL_LOOKUP_TIMEOUT: std::time::Duration = std::time::Duration::from_se
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct MessageTriggerSettings {
     issue_channels: HashSet<String>,
+    trigger_bots: HashSet<String>,
     on_message: Vec<String>,
     workdirs: Workdirs,
 }
@@ -45,7 +47,8 @@ impl MessageTriggerSettings {
     /// `Ok(None)` when `on_message` is absent (feature off). Issue-channel
     /// aliases resolve through `channels` the same way `send`/`read` do. An
     /// empty `on_message` array, or no working directory setting at all,
-    /// cannot be executed, so both fail fast.
+    /// cannot be executed, so both fail fast, as does a `trigger_bots` entry
+    /// that is not a numeric user id.
     pub(crate) fn from_config(config: &Config) -> Result<Option<Self>, AppError> {
         let Some(on_message) = &config.on_message else {
             return Ok(None);
@@ -54,6 +57,16 @@ impl MessageTriggerSettings {
             return Err(AppError::new(
                 ErrorKind::Config,
                 "on_message must be a non-empty argv array, e.g. [\"/path/to/command\"]",
+            ));
+        }
+        if let Some(bad) = config
+            .trigger_bots
+            .iter()
+            .find(|id| id.is_empty() || !id.bytes().all(|b| b.is_ascii_digit()))
+        {
+            return Err(AppError::new(
+                ErrorKind::Config,
+                format!("trigger_bots entries must be numeric bot user ids, got {bad:?}"),
             ));
         }
         let issue_channels = config
@@ -65,6 +78,7 @@ impl MessageTriggerSettings {
         let workdirs = Workdirs::from_config(config, home.as_deref())?;
         Ok(Some(Self {
             issue_channels,
+            trigger_bots: config.trigger_bots.iter().cloned().collect(),
             on_message: on_message.clone(),
             workdirs,
         }))
@@ -196,10 +210,19 @@ impl<R: HookRunner> MessageTrigger<R> {
             )
         })?;
         let issue_channels = &self.settings.issue_channels;
+        let trigger_bots = &self.settings.trigger_bots;
         // A thread only ever publishes on a mention, which would also publish
         // at top level — so a message that fails the top-level rule fails
         // both, and the REST lookup can be skipped.
-        if decide(&message, bot_user_id, &Placement::TopLevel, issue_channels).is_none() {
+        if decide(
+            &message,
+            bot_user_id,
+            &Placement::TopLevel,
+            issue_channels,
+            trigger_bots,
+        )
+        .is_none()
+        {
             return Ok(None);
         }
         let placement = match self.placements.get(&message.channel_id) {
@@ -235,7 +258,13 @@ impl<R: HookRunner> MessageTrigger<R> {
                 placement
             }
         };
-        let Some(trigger) = decide(&message, bot_user_id, &placement, issue_channels) else {
+        let Some(trigger) = decide(
+            &message,
+            bot_user_id,
+            &placement,
+            issue_channels,
+            trigger_bots,
+        ) else {
             return Ok(None);
         };
         let parent_id = match &placement {
@@ -266,8 +295,11 @@ fn decide(
     bot_user_id: &str,
     placement: &Placement,
     issue_channels: &HashSet<String>,
+    trigger_bots: &HashSet<String>,
 ) -> Option<Trigger> {
-    if message.author.bot || message.author.id == bot_user_id {
+    // A bot (this one included) is judged like a person only when listed.
+    let is_bot = message.author.bot || message.author.id == bot_user_id;
+    if is_bot && !trigger_bots.contains(&message.author.id) {
         return None;
     }
     if !USER_MESSAGE_TYPES.contains(&message.kind) {

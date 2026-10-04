@@ -327,6 +327,154 @@ async fn own_message_is_ignored() {
     assert!(runner.calls.borrow().is_empty());
 }
 
+const OTHER_BOT: &str = "888";
+
+fn settings_trusting(bots: &[&str]) -> MessageTriggerSettings {
+    settings_from(&format!(
+        r#","default_workdir":{},"trigger_bots":{}"#,
+        serde_json::to_string(default_dir().to_str().unwrap()).unwrap(),
+        serde_json::to_string(bots).unwrap()
+    ))
+}
+
+fn authored_by_bot(mut payload: serde_json::Value, id: &str) -> serde_json::Value {
+    payload["author"] = serde_json::json!({ "id": id, "username": "robot", "bot": true });
+    payload
+}
+
+#[test]
+fn settings_reject_a_non_numeric_trigger_bot_id() {
+    let config = parse(&format!(
+        r#"{{"on_message":["{HOOK}"],"default_workdir":"/tmp","trigger_bots":["888","helper"]}}"#
+    ));
+    let err = MessageTriggerSettings::from_config(&config).unwrap_err();
+    assert_eq!(err.kind, ErrorKind::Config);
+    assert!(err.message.contains("helper"), "{}", err.message);
+}
+
+#[tokio::test]
+async fn listed_bot_message_with_a_mention_publishes() {
+    let runner = FakeRunner::new();
+    let api = api_with_channels(vec![text_channel("c1")]);
+    let payload = authored_by_bot(message("c1", &[BOT]), OTHER_BOT);
+
+    let outcome = trigger_with(settings_trusting(&[OTHER_BOT]), &runner)
+        .handle(&api, &payload)
+        .await
+        .unwrap();
+
+    assert_eq!(outcome, Some(Trigger::Mention));
+    let event = sent_event(&runner, 0);
+    assert_eq!(event["author"]["id"], OTHER_BOT);
+    assert_eq!(event["author"]["bot"], true);
+}
+
+#[tokio::test]
+async fn listed_own_message_with_a_mention_publishes() {
+    let runner = FakeRunner::new();
+    let api = api_with_channels(vec![text_channel("c1")]);
+    let payload = authored_by_bot(message("c1", &[BOT]), BOT);
+
+    let outcome = trigger_with(settings_trusting(&[BOT]), &runner)
+        .handle(&api, &payload)
+        .await
+        .unwrap();
+
+    assert_eq!(outcome, Some(Trigger::Mention));
+    assert_eq!(runner.calls.borrow().len(), 1);
+}
+
+#[tokio::test]
+async fn unlisted_bot_is_ignored_when_another_bot_is_listed() {
+    let runner = FakeRunner::new();
+    let api = MockDiscordApi::new();
+    let payload = authored_by_bot(message("c1", &[BOT]), "777");
+
+    let outcome = trigger_with(settings_trusting(&[OTHER_BOT]), &runner)
+        .handle(&api, &payload)
+        .await
+        .unwrap();
+
+    assert_eq!(outcome, None);
+    assert!(runner.calls.borrow().is_empty());
+    assert!(api.channel_calls.borrow().is_empty());
+}
+
+#[tokio::test]
+async fn own_message_is_ignored_when_only_another_bot_is_listed() {
+    let runner = FakeRunner::new();
+    let api = MockDiscordApi::new();
+    let payload = authored_by_bot(message("c1", &[BOT]), BOT);
+
+    let outcome = trigger_with(settings_trusting(&[OTHER_BOT]), &runner)
+        .handle(&api, &payload)
+        .await
+        .unwrap();
+
+    assert_eq!(outcome, None);
+    assert!(runner.calls.borrow().is_empty());
+}
+
+#[tokio::test]
+async fn listed_bot_thread_message_without_a_mention_is_ignored() {
+    let runner = FakeRunner::new();
+    let api = api_with_channels(vec![thread("t1", "c1")]);
+    let payload = authored_by_bot(message("t1", &[]), OTHER_BOT);
+
+    let outcome = trigger_with(settings_trusting(&[OTHER_BOT]), &runner)
+        .handle(&api, &payload)
+        .await
+        .unwrap();
+
+    assert_eq!(outcome, None);
+    assert!(runner.calls.borrow().is_empty());
+}
+
+#[tokio::test]
+async fn listed_bot_top_level_issue_channel_post_publishes() {
+    let runner = FakeRunner::new();
+    let api = api_with_channels(vec![text_channel(ISSUE)]);
+    let payload = authored_by_bot(message(ISSUE, &[]), OTHER_BOT);
+
+    let outcome = trigger_with(settings_trusting(&[OTHER_BOT]), &runner)
+        .handle(&api, &payload)
+        .await
+        .unwrap();
+
+    assert_eq!(outcome, Some(Trigger::IssueChannel));
+}
+
+#[tokio::test]
+async fn listed_bot_system_message_is_ignored() {
+    let runner = FakeRunner::new();
+    let api = MockDiscordApi::new();
+    let mut payload = authored_by_bot(message(ISSUE, &[]), OTHER_BOT);
+    payload["type"] = serde_json::json!(21);
+
+    let outcome = trigger_with(settings_trusting(&[OTHER_BOT]), &runner)
+        .handle(&api, &payload)
+        .await
+        .unwrap();
+
+    assert_eq!(outcome, None);
+    assert!(runner.calls.borrow().is_empty());
+}
+
+#[tokio::test]
+async fn empty_trigger_bots_keeps_bots_ignored() {
+    let runner = FakeRunner::new();
+    let api = MockDiscordApi::new();
+    let payload = authored_by_bot(message("c1", &[BOT]), OTHER_BOT);
+
+    let outcome = trigger_with(settings_trusting(&[]), &runner)
+        .handle(&api, &payload)
+        .await
+        .unwrap();
+
+    assert_eq!(outcome, None);
+    assert!(runner.calls.borrow().is_empty());
+}
+
 #[tokio::test]
 async fn thread_message_with_bot_mention_publishes_mention() {
     let runner = FakeRunner::new();

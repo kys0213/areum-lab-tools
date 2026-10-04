@@ -504,6 +504,18 @@ mod tests {
     }
 
     #[test]
+    fn message_trigger_settings_reject_a_non_numeric_trigger_bot() {
+        let config = parse_config(
+            r#"{"on_message":["/bin/hook"],"default_workdir":"/tmp","trigger_bots":["helper"]}"#,
+        )
+        .unwrap();
+
+        let err = message_trigger_settings(Some(&config))
+            .expect_err("a non-numeric trigger_bots entry must fail at start");
+        assert_eq!(err.kind, ErrorKind::Config);
+    }
+
+    #[test]
     fn message_trigger_settings_are_off_without_a_config_file() {
         assert_eq!(message_trigger_settings(None).unwrap(), None);
     }

@@ -8,7 +8,7 @@
 
 ## 설정
 
-`~/.areum/discord/config.json`에 네 필드를 더해요.
+`~/.areum/discord/config.json`에 다섯 필드를 더해요.
 
 | 필드 | 형식 | 설명 |
 |---|---|---|
@@ -16,6 +16,7 @@
 | `issue_channels` | 문자열 배열 | 멘션 없이도 새 글을 발행할 채널. 채널 ID나 `channels`의 별칭을 써요. 생략하면 멘션만 감지해요. |
 | `workdirs` | `{ "<채널 ID 또는 별칭>": "<디렉토리>" }` | 채널별로 `on_message`를 실행할 디렉토리. 키의 별칭은 `channels`로 풀어요. |
 | `default_workdir` | 문자열 | `workdirs`에 없는 채널에서 쓸 디렉토리. |
+| `trigger_bots` | 문자열 배열 | 메시지가 트리거 대상이 되는 봇의 user ID(이 봇 자신 포함). 숫자 ID만 받아요. 생략하거나 비우면 모든 봇 메시지를 무시해요. |
 
 ```json
 {
@@ -24,7 +25,8 @@
   "issue_channels": ["issues"],
   "on_message": ["/usr/local/bin/discord-run", "--verbose"],
   "workdirs": { "issues": "/Users/me/work/app", "docs": "~/work/docs" },
-  "default_workdir": "~/work/scratch"
+  "default_workdir": "~/work/scratch",
+  "trigger_bots": ["999888777666555444"]
 }
 ```
 
@@ -33,6 +35,7 @@
 - `on_message`를 설정했을 때만 경로·디렉토리 설정을 검증해요. 디렉토리는 절대경로이거나 `~/`로 시작해야 해요(`~/`는 홈 디렉토리로 펼쳐요). 상대경로와 `~user/...` 형식은 데몬 시작 시 설정 오류로 끝나요.
 - `workdirs`의 서로 다른 키(채널 ID나 별칭)가 같은 채널로 풀리면 디렉토리 값이 같아도 데몬 시작 시 설정 오류로 끝나요. 어느 디렉토리를 쓸지 모호해지기 때문이에요.
 - 설정은 데몬 시작 시 한 번 읽어요. 바꾼 뒤에는 `discord daemon stop` 후 `discord daemon start`로 다시 띄우세요.
+- `trigger_bots`에 숫자가 아닌 값(별칭 포함)이 있으면 `on_message`를 설정했을 때 데몬 시작 시 설정 오류로 끝나요. `channels` 별칭은 채널용이라 봇에는 쓰지 않아요.
 - `discord init --force`로 토큰을 바꿔도 토큰 외 필드는 보존돼요.
 
 ### 실행 디렉토리 결정
@@ -67,12 +70,13 @@ error [config]: gateway closed with 4014 (Disallowed Intents): message detection
 
 | # | 조건 | 결과 |
 |---|---|---|
-| 1 | 작성자가 봇(`author.bot`)이거나 이 봇 자신 | 발행 안 함 |
+| 1 | 작성자가 봇(`author.bot`)이거나 이 봇 자신이고, `trigger_bots`에 없음 | 발행 안 함 |
 | 2 | 사람이 쓴 일반 글·답장(메시지 type 0, 19)이 아님 — 스레드 생성 알림, 고정 알림, 입장 알림 같은 시스템 메시지 | 발행 안 함 |
 | 3 | 스레드 안의 글 | 봇 멘션이 있을 때만 `trigger: "mention"` |
 | 4 | 이슈 채널의 최상위 글 | 멘션이 없어도 `trigger: "issue_channel"` (멘션이 있어도 이 한 번만) |
 | 5 | 그 밖의 채널 | 봇 멘션이 있을 때만 `trigger: "mention"` |
 
+- `trigger_bots`에 있는 봇(자기 자신 포함)의 메시지는 1번을 통과해 2~5번 규칙을 사람 메시지와 똑같이 거쳐요. stdin JSON에서는 `author.bot`이 `true`로 올 수 있어요.
 - **봇 멘션**은 메시지의 `mentions` 목록에 봇 user ID가 있는지로 판정해요. 역할 멘션과 `@everyone`/`@here`는 멘션으로 치지 않아요.
 - 이슈 채널 글에서 파생된 스레드 안의 글은 3번(스레드) 규칙을 따라요. 즉 스레드 답글은 멘션해야 발행돼요.
 - 포럼 채널은 이슈 채널로 쓸 수 없어요. 포럼 글은 스레드라서 봇을 멘션해야 발행돼요.
@@ -85,6 +89,15 @@ error [config]: gateway closed with 4014 (Disallowed Intents): message detection
 - 채널 type 10·11·12(공지·공개·비공개 스레드)면 스레드로 보고 `parent_id`를 상위 채널로 써요.
 - 조회 결과는 데몬이 떠 있는 동안 캐시해요. 채널이 스레드인지와 상위 채널은 바뀌지 않기 때문이에요. 실패한 조회는 캐시하지 않고 다음 메시지에서 다시 조회해요.
 - 멘션도 없고 이슈 채널도 아닌 글은 조회 없이 바로 버려요.
+
+### 루프 위험과 안전 조건
+
+`trigger_bots`에 이 봇 자신을 넣으면, 훅이 `discord send`로 올린 글이 다시 훅을 실행하는 순환이 생길 수 있어요.
+
+- 훅이 결과를 **스레드 안에 봇 멘션 없이** 올리면 스레드 규칙(3번) 때문에 다시 발행되지 않아요. 안전해요.
+- 훅이 **이슈 채널 최상위**에 글을 올리면 4번 규칙으로 다시 발행돼요. 무한 반복되므로 피하세요.
+- 목록에 넣은 봇이 올리는 글은 위 규칙으로 판정되니, 넣기 전에 그 봇이 어디에 어떤 글을 올리는지 확인하세요.
+- 목록에 없는 봇·웹훅은 그대로 무시해서, 다른 봇이 Claude 실행을 일으키지 못해요.
 
 ## stdin JSON 계약
 
