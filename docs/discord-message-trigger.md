@@ -56,6 +56,7 @@ error [config]: gateway closed with 4014 (Disallowed Intents): message detection
 
 - **봇 멘션**은 메시지의 `mentions` 목록에 봇 user ID가 있는지로 판정해요. 역할 멘션과 `@everyone`/`@here`는 멘션으로 치지 않아요.
 - 이슈 채널 글에서 파생된 스레드 안의 글은 3번(스레드) 규칙을 따라요. 즉 스레드 답글은 멘션해야 발행돼요.
+- 포럼 채널은 이슈 채널로 쓸 수 없어요. 포럼 글은 스레드라서 봇을 멘션해야 발행돼요.
 - 봇 user ID는 게이트웨이 READY 이벤트에서 얻어요.
 
 ### 스레드 판정
@@ -101,6 +102,8 @@ error [config]: gateway closed with 4014 (Disallowed Intents): message detection
 - 명령은 셸 없이 바로 실행해요. 파이프나 리다이렉션이 필요하면 `["sh", "-c", "..."]`처럼 직접 셸을 넣으세요.
 - 데몬은 명령의 종료를 기다리지 않아요. 별도 스레드가 stdin을 쓰고 닫은 뒤 종료를 회수해서 좀비 프로세스가 남지 않아요.
 - 명령의 stdout은 버리고, stderr는 데몬의 stderr로 이어져요. 오래 걸리는 작업이면 명령 쪽에서 스스로 로그를 남기세요.
+- 명령에는 `DISCORD_BOT_TOKEN` 환경변수가 넘어가지 않아요. 봇 토큰이 외부 명령으로 새지 않게 하려고 데몬이 지우고 실행해요. 명령 안에서 `discord send`·`discord ask`를 부르려면 config 파일에 토큰이 있어야 해요(`discord init`으로 저장).
+- 채널 조회(REST)는 3초 제한이 있어요. 넘기면 그 메시지는 발행하지 않고 로그를 남겨요. 느린 Discord 응답 하나가 다른 이벤트 처리까지 막지 않게 하려는 제한이에요.
 - 아래 실패는 모두 데몬 stderr에 한 줄로 남기고, 데몬은 계속 돌아요.
 
 | 상황 | 결과 |
@@ -109,6 +112,7 @@ error [config]: gateway closed with 4014 (Disallowed Intents): message detection
 | 명령이 0이 아닌 코드로 종료 | `daemon: on_message "..." exited with ...` 로그 |
 | 명령이 stdin을 읽지 않고 종료 | `failed to write stdin` 로그 |
 | 채널 조회(REST) 실패 | 발행하지 않고 로그. 추측으로 발행하지 않아요 |
+| 채널 조회가 3초를 넘김 | 발행하지 않고 `channel lookup for <channel> timed out after 3s, message <id> not published` 로그 |
 | 인텐트 거부 close(4013/4014) | 데몬이 위 오류로 종료(재시도 안 함) |
 
 - 발행에 성공하면 `daemon: message <id> in <channel> -> on_message (Mention)` 로그가 남아요.
@@ -135,3 +139,11 @@ tail -f /tmp/discord-trigger.log
 - 일반 채널에서 봇을 멘션하면 `"trigger":"mention"` 한 줄이 쌓여요.
 - 이슈 채널에 새 글을 올리면 `"trigger":"issue_channel"` 한 줄이 쌓여요.
 - 멘션 없는 일반 채널 글, 봇이 보낸 글은 쌓이지 않아요.
+
+## E2E로 확인할 항목
+
+필터 규칙·JSON 변환·명령 실행은 단위 테스트로 덮지만, 아래 연결부는 실제 게이트웨이가 있어야 확인돼요. 릴리스 전에 위 "확인 방법"으로 직접 봐요.
+
+- **READY에서 봇 ID 기록**: 데몬을 띄운 직후 봇을 멘션했을 때 `"trigger":"mention"`이 쌓이고 `bot_user_id`가 봇 ID와 같은지 봐요. READY 처리가 빠지면 멘션 판정이 안 돼요.
+- **MESSAGE_CREATE 구독**: `on_message`를 설정했을 때 새 글이 데몬에 도착하는지 봐요. 이벤트 구독이 빠지면 아무 글도 쌓이지 않고 로그도 남지 않아요.
+- **4013/4014 close 처리**: Developer Portal에서 Message Content Intent를 끈 채 띄우면 데몬이 위 `4014 (Disallowed Intents)` 오류로 끝나고 재시도하지 않는지 봐요. 4013(Invalid Intents)은 데몬이 잘못된 인텐트 값을 보낼 때만 나서 수동 재현이 어렵고, close 코드 분류는 단위 테스트로 덮어요.
