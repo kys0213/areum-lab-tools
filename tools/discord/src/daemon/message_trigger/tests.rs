@@ -352,6 +352,15 @@ fn settings_reject_a_non_numeric_trigger_bot_id() {
     assert!(err.message.contains("helper"), "{}", err.message);
 }
 
+#[test]
+fn settings_reject_an_empty_trigger_bot_id() {
+    let config = parse(&format!(
+        r#"{{"on_message":["{HOOK}"],"default_workdir":"/tmp","trigger_bots":[""]}}"#
+    ));
+    let err = MessageTriggerSettings::from_config(&config).unwrap_err();
+    assert_eq!(err.kind, ErrorKind::Config);
+}
+
 #[tokio::test]
 async fn listed_bot_message_with_a_mention_publishes() {
     let runner = FakeRunner::new();
@@ -428,6 +437,23 @@ async fn listed_bot_thread_message_without_a_mention_is_ignored() {
 
     assert_eq!(outcome, None);
     assert!(runner.calls.borrow().is_empty());
+}
+
+#[tokio::test]
+async fn listed_bot_thread_message_with_a_mention_publishes_mention() {
+    let runner = FakeRunner::new();
+    let api = api_with_channels(vec![thread("t1", "c1")]);
+    let payload = authored_by_bot(message("t1", &[BOT]), OTHER_BOT);
+
+    let outcome = trigger_with(settings_trusting(&[OTHER_BOT]), &runner)
+        .handle(&api, &payload)
+        .await
+        .unwrap();
+
+    assert_eq!(outcome, Some(Trigger::Mention));
+    let event = sent_event(&runner, 0);
+    assert_eq!(event["is_thread"], true);
+    assert_eq!(event["author"]["id"], OTHER_BOT);
 }
 
 #[tokio::test]
