@@ -981,6 +981,7 @@ async fn multi_select_adopts_labels_as_json_array() {
     assert_eq!(record.value.as_deref(), Some(r#"["A","C"]"#));
     let calls = api.interaction_calls.borrow();
     assert_eq!(calls[0].2["type"], 7);
+    assert_eq!(calls[0].2["data"]["content"], "선택됨: A, C");
     assert_eq!(calls[0].2["data"]["components"], serde_json::json!([]));
 }
 
