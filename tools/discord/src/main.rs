@@ -58,20 +58,35 @@ async fn run(cli: Cli) -> Result<Payload, AppError> {
             text,
             reply_to,
             files,
+            split,
         } => {
             let (api, channels) = authenticated_api(&config_path, cli.token.as_deref())?;
             let channel_id = config::resolve_channel(&channel, &channels);
-            commands::run_send(
-                &api,
-                &channel_id,
-                body.as_deref(),
-                text.as_deref(),
-                reply_to.as_deref(),
-                &files,
-                read_stdin,
-                |p| std::fs::read(p),
-            )
-            .await
+            if split {
+                commands::run_send_split(
+                    &api,
+                    &channel_id,
+                    body.as_deref(),
+                    text.as_deref(),
+                    reply_to.as_deref(),
+                    &files,
+                    read_stdin,
+                    |p| std::fs::read(p),
+                )
+                .await
+            } else {
+                commands::run_send(
+                    &api,
+                    &channel_id,
+                    body.as_deref(),
+                    text.as_deref(),
+                    reply_to.as_deref(),
+                    &files,
+                    read_stdin,
+                    |p| std::fs::read(p),
+                )
+                .await
+            }
         }
         Command::Read {
             channel,

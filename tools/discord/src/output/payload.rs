@@ -12,6 +12,13 @@ pub struct SendData {
     pub attachments: Vec<Attachment>,
 }
 
+/// `send --split` result: one entry per message sent, in send order. Each
+/// entry has the same shape as a plain send's `data`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SendSplitData {
+    pub messages: Vec<SendData>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReadData {
     pub channel_id: String,
@@ -122,6 +129,7 @@ pub struct AskWaitData {
 #[serde(untagged)]
 pub enum Payload {
     Send(SendData),
+    SendSplit(SendSplitData),
     Init(InitData),
     Read(ReadData),
     Wait(WaitData),
@@ -146,6 +154,20 @@ impl Payload {
                 if !d.attachments.is_empty() {
                     text.push('\n');
                     text.push_str(&format_attachment_filenames(&d.attachments));
+                }
+                text
+            }
+            Payload::SendSplit(d) => {
+                let mut text = format!("sent {} messages", d.messages.len());
+                for m in &d.messages {
+                    text.push_str(&format!(
+                        "\n{} (channel {} at {})",
+                        m.message_id, m.channel_id, m.timestamp
+                    ));
+                    if !m.attachments.is_empty() {
+                        text.push('\n');
+                        text.push_str(&format_attachment_filenames(&m.attachments));
+                    }
                 }
                 text
             }

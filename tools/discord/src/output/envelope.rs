@@ -89,6 +89,26 @@ mod tests {
     }
 
     #[test]
+    fn send_split_success_lists_messages_in_send_order() {
+        let msg = |id: &str| SendData {
+            message_id: id.into(),
+            channel_id: "456".into(),
+            timestamp: "2024-01-01T00:00:00Z".into(),
+            attachments: vec![],
+        };
+        let payload = Payload::SendSplit(crate::output::SendSplitData {
+            messages: vec![msg("1"), msg("2")],
+        });
+        let (sink, json, code) = render("send", &Ok(payload), true);
+        assert_eq!(sink, Sink::Stdout);
+        assert_eq!(code, 0);
+        assert_eq!(
+            json,
+            r#"{"ok":true,"command":"send","data":{"messages":[{"message_id":"1","channel_id":"456","timestamp":"2024-01-01T00:00:00Z","attachments":[]},{"message_id":"2","channel_id":"456","timestamp":"2024-01-01T00:00:00Z","attachments":[]}]}}"#
+        );
+    }
+
+    #[test]
     fn send_success_with_attachments_includes_full_fields() {
         let payload = Payload::Send(SendData {
             message_id: "123".into(),

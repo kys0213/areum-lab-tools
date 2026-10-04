@@ -1,5 +1,5 @@
 use crate::common::api::{DiscordApi, FilePart, SendRequest};
-use crate::output::{AppError, ErrorKind, Payload, SendData};
+use crate::output::{AppError, ErrorKind, Payload, SendData, SendSplitData};
 
 /// Sends a message (optionally with file attachments) to a channel and reports
 /// the created message.
@@ -44,6 +44,65 @@ pub(crate) async fn run_send(
     }))
 }
 
+/// `send --split`: like [`run_send`] but bodies over the 2000-codepoint cap are
+/// cut into ordered chunks instead of rejected. Attachments and the reply
+/// reference ride on the first chunk only. A failure part-way stops the run and
+/// reports which chunk failed and which messages already went out.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn run_send_split(
+    api: &impl DiscordApi,
+    channel_id: &str,
+    body: Option<&str>,
+    text: Option<&str>,
+    reply_to: Option<&str>,
+    file_paths: &[String],
+    read_stdin: impl FnOnce() -> std::io::Result<String>,
+    read_file: impl Fn(&str) -> std::io::Result<Vec<u8>>,
+) -> Result<Payload, AppError> {
+    if reply_to == Some("") {
+        return Err(AppError::new(
+            ErrorKind::Usage,
+            "--reply-to must not be an empty string",
+        ));
+    }
+    let files = resolve_files(file_paths, read_file)?;
+    let content = resolve_raw_content(body, text, !files.is_empty(), read_stdin)?;
+    validate_not_empty(&content, !files.is_empty())?;
+    let chunks = split::split_message(&content, MAX_BODY_CHARS)?;
+
+    let total = chunks.len();
+    let mut files = Some(files);
+    let mut reply_to = reply_to;
+    let mut messages: Vec<SendData> = Vec::with_capacity(total);
+    for (index, chunk) in chunks.into_iter().enumerate() {
+        let req = SendRequest {
+            channel_id: channel_id.to_owned(),
+            content: chunk,
+            reply_to: reply_to.take().map(str::to_owned),
+            files: files.take().unwrap_or_default(),
+        };
+        match api.send_message(&req).await {
+            Ok(sent) => messages.push(SendData {
+                message_id: sent.id,
+                channel_id: sent.channel_id,
+                timestamp: sent.timestamp,
+                attachments: sent.attachments,
+            }),
+            Err(mut err) => {
+                let sent_ids: Vec<&str> = messages.iter().map(|m| m.message_id.as_str()).collect();
+                err.message = format!(
+                    "split send failed at chunk {}/{total} after sending [{}]: {}",
+                    index + 1,
+                    sent_ids.join(", "),
+                    err.message
+                );
+                return Err(err);
+            }
+        }
+    }
+    Ok(Payload::SendSplit(SendSplitData { messages }))
+}
+
 /// Discord rejects empty messages and caps content at 2000 codepoints.
 const MAX_BODY_CHARS: usize = 2000;
 
@@ -67,6 +126,19 @@ fn resolve_send_content(
     has_files: bool,
     read_stdin: impl FnOnce() -> std::io::Result<String>,
 ) -> Result<String, AppError> {
+    let content = resolve_raw_content(body, text, has_files, read_stdin)?;
+    validate_body(&content, has_files)?;
+    Ok(content)
+}
+
+/// Picks the caption source (BODY / --text / stdin) without any length or
+/// emptiness validation; shared by plain and `--split` sends.
+fn resolve_raw_content(
+    body: Option<&str>,
+    text: Option<&str>,
+    has_files: bool,
+    read_stdin: impl FnOnce() -> std::io::Result<String>,
+) -> Result<String, AppError> {
     if body.is_some() && text.is_some() {
         return Err(AppError::new(
             ErrorKind::Usage,
@@ -84,7 +156,6 @@ fn resolve_send_content(
         (Some(body), None) => body.to_owned(),
     };
 
-    validate_body(&content, has_files)?;
     Ok(content)
 }
 
@@ -97,13 +168,18 @@ pub(crate) fn read_stdin_to_string(
         .map_err(|e| AppError::new(ErrorKind::Internal, format!("failed to read stdin: {e}")))
 }
 
-fn validate_body(content: &str, has_files: bool) -> Result<(), AppError> {
+fn validate_not_empty(content: &str, has_files: bool) -> Result<(), AppError> {
     if content.is_empty() && !has_files {
         return Err(AppError::new(
             ErrorKind::Usage,
             "message body must not be empty",
         ));
     }
+    Ok(())
+}
+
+fn validate_body(content: &str, has_files: bool) -> Result<(), AppError> {
+    validate_not_empty(content, has_files)?;
     let len = content.chars().count();
     if len > MAX_BODY_CHARS {
         return Err(AppError::new(
@@ -176,6 +252,8 @@ fn file_name_of(path: &str) -> String {
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_else(|| path.to_owned())
 }
+
+mod split;
 
 #[cfg(test)]
 mod tests;

@@ -85,7 +85,7 @@ discord wait <channel_id> [--after <id>] [--timeout N]         # 새 메시지 �
 ```
 discord [--token <TOKEN>] [--config <PATH>] [--json] <COMMAND>
   init [--token <TOKEN>] [--force]                        # 로컬 config 셋업, 네트워크 무접촉
-  send <CHANNEL> [BODY] [--reply-to <MSG_ID>] [--file <PATH>]...   # BODY 생략/'-' → stdin. --text <TEXT>는 BODY와 상호배타. --file 최대 10회 반복
+  send <CHANNEL> [BODY] [--reply-to <MSG_ID>] [--file <PATH>]... [--split]   # BODY 생략/'-' → stdin. --text <TEXT>는 BODY와 상호배타. --file 최대 10회 반복. --split은 2000자 초과 본문을 여러 메시지로 분할
   read <CHANNEL> [--after <MSG_ID>] [--limit N]          # limit 기본 50, 1..=100
   wait <CHANNEL> [--after <MSG_ID>] [--timeout SECS] [--interval SECS] [--limit N]  # 기본 60/5/50
 ```
@@ -94,6 +94,15 @@ discord [--token <TOKEN>] [--config <PATH>] [--json] <COMMAND>
 - `--token`/`--config`/`--json`은 전역 플래그로, 서브커맨드 앞뒤 어디서나 지정 가능.
 - 긴 본문은 `echo "..." | discord send ops -` (셸 이스케이프 회피).
 - `--reply-to <MSG_ID>`는 같은 채널의 메시지에 답글을 단다. 대상 메시지가 삭제되었으면 Discord가 400을 반환해 `kind:"api"`/exit 4로 매핑된다. 빈 문자열(`--reply-to ""`)은 usage 오류(exit 2).
+
+#### 긴 본문 분할 (`--split`)
+
+- `--split` 없이 2000자(codepoint)를 넘기면 지금처럼 usage 오류(exit 2)로 거부한다.
+- `--split`이면 2000자 이하 조각으로 나눠 **순서대로** 보낸다. 줄 경계를 우선하고, 한 줄이 2000자를 넘으면 그 줄만 강제로 자른다.
+- 코드 블록(```) 안에서 잘리면 앞 조각 끝에 ```를 닫고 다음 조각 앞에 같은 언어 태그로 다시 연다. 닫고 여는 기호까지 포함해 조각마다 2000자 이하다. 원문에서 닫히지 않은 코드 블록은 닫지 않은 채로 둔다.
+- `--file`과 `--reply-to`는 첫 조각에만 붙는다.
+- 조각 전송이 중간에 실패하면 즉시 멈추고, 실패한 오류의 `kind`는 그대로 둔 채 `message`를 `split send failed at chunk N/M after sending [<보낸 message_id>, ...]: <원인>` 형태로 바꿔 돌려준다. 이미 보낸 조각은 회수하지 않는다.
+- `--split`이면 조각이 1개여도 `--json`의 `data`는 아래 `messages` 형태다.
 
 #### 파일 첨부 (`--file`)
 
@@ -130,6 +139,7 @@ discord [--token <TOKEN>] [--config <PATH>] [--json] <COMMAND>
 
 커맨드별 `data`:
 - `send.data` = `{message_id, channel_id, timestamp, attachments}`
+- `send --split`의 `data` = `{messages:[{message_id, channel_id, timestamp, attachments}, ...]}` — 보낸 순서대로이며 각 원소는 `--split` 없는 `send.data`와 같은 shape이다. 첨부는 첫 원소에만 담긴다.
 - `init.data` = `{path, created}` (토큰 값은 포함하지 않는다)
 - `read.data` = `{channel_id, count, cursor, messages}`
 - `wait.data` = `{channel_id, count, cursor, timed_out, messages}`

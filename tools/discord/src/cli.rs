@@ -46,6 +46,10 @@ pub enum Command {
         /// Attach a file by path; repeat up to 10 times.
         #[arg(long = "file")]
         files: Vec<String>,
+        /// Split a body over 2000 characters into several messages instead of
+        /// rejecting it. Files and --reply-to go on the first message only.
+        #[arg(long)]
+        split: bool,
     },
 
     /// Create the local config file with a bot token (local setup only, no
@@ -215,6 +219,7 @@ mod tests {
                 text,
                 reply_to,
                 files,
+                split: _,
             } => {
                 assert_eq!(channel, "123");
                 assert_eq!(body.as_deref(), Some("hello world"));
@@ -236,6 +241,7 @@ mod tests {
                 text,
                 reply_to,
                 files,
+                split: _,
             } => {
                 assert_eq!(channel, "123");
                 assert_eq!(body, None);
@@ -258,12 +264,26 @@ mod tests {
                 text,
                 reply_to,
                 files,
+                split: _,
             } => {
                 assert_eq!(channel, "123");
                 assert_eq!(body.as_deref(), Some("hello"));
                 assert_eq!(text, None);
                 assert_eq!(reply_to.as_deref(), Some("999"));
                 assert!(files.is_empty());
+            }
+            other => panic!("expected Send, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn send_split_flag_defaults_off_and_parses_on() {
+        let off = Cli::try_parse_from(["discord", "send", "123", "hi"]).unwrap();
+        let on = Cli::try_parse_from(["discord", "send", "123", "-", "--split", "--json"]).unwrap();
+        match (off.command, on.command) {
+            (Command::Send { split: off, .. }, Command::Send { split: on, .. }) => {
+                assert!(!off);
+                assert!(on);
             }
             other => panic!("expected Send, got {other:?}"),
         }
