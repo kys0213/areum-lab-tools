@@ -181,21 +181,24 @@ fn alias_and_id_keys_for_the_same_channel_are_rejected() {
     )
     .unwrap_err();
     assert_eq!(err.kind, ErrorKind::Config);
-    let msg = err.message.clone();
-    assert!(msg.contains("issues") && msg.contains("555"), "{msg}");
+    // "555" sorts before "issues", whatever order the map yields them in.
+    assert_eq!(
+        err.message,
+        "workdirs[555] and workdirs[issues] both resolve to channel 555: keep only one"
+    );
 }
 
 #[test]
 fn duplicate_keys_are_rejected_even_when_directories_match() {
     let err = workdirs(
-        r#"{"channels":{"a":"7","b":"7"},"workdirs":{"a":"/same","b":"/same"}}"#,
+        r#"{"channels":{"delta":"7","alpha":"7","charlie":"7","bravo":"7"},"workdirs":{"delta":"/same","alpha":"/same","charlie":"/same","bravo":"/same"}}"#,
         None,
     )
     .unwrap_err();
     assert_eq!(err.kind, ErrorKind::Config);
-    let msg = err.message.clone();
-    assert!(
-        msg.contains('a') && msg.contains('b') && msg.contains('7'),
-        "{msg}"
+    // The two smallest keys are reported, not whichever the map yields first.
+    assert_eq!(
+        err.message,
+        "workdirs[alpha] and workdirs[bravo] both resolve to channel 7: keep only one"
     );
 }
