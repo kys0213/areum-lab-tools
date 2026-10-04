@@ -17,8 +17,9 @@ pub(super) struct Workdirs {
 
 impl Workdirs {
     /// Aliases in `workdirs` keys resolve through `channels`. `home` is only
-    /// needed for `~/` entries. Rejects relative paths, several keys resolving to one channel, and a setup with no
-    /// directory at all, since no message could ever run.
+    /// needed for `~/` entries. Rejects relative paths, several keys resolving
+    /// to one channel, and a setup with no directory at all, since no message
+    /// could ever run.
     pub(super) fn from_config(config: &Config, home: Option<&Path>) -> Result<Self, AppError> {
         if config.workdirs.is_empty() && config.default_workdir.is_none() {
             return Err(AppError::new(
