@@ -116,6 +116,29 @@ mod tests {
         std::fs::remove_file(&out).ok();
     }
 
+    /// Pins the "no shell" contract: each argv element reaches the program as
+    /// one argument, so spaces and shell metacharacters are never re-parsed.
+    #[test]
+    fn run_passes_arguments_verbatim_without_shell_interpretation() {
+        let out = unique_path("verbatim-out");
+        let injected = unique_path("verbatim-injected");
+        let _ = std::fs::remove_file(&out);
+        let _ = std::fs::remove_file(&injected);
+        let script = format!("printf '%s\\n' \"$0\" > {}", out.display());
+        let hostile = format!("a b;touch {}", injected.display());
+
+        ProcessHookRunner
+            .run(&argv(&["sh", "-c", &script, &hostile]), String::new())
+            .expect("a valid command must start");
+
+        assert_eq!(wait_for_file(&out), format!("{hostile}\n"));
+        assert!(
+            !injected.exists(),
+            "a shell metacharacter inside an argument must not run a command"
+        );
+        std::fs::remove_file(&out).ok();
+    }
+
     #[test]
     fn run_returns_err_when_the_program_cannot_be_spawned() {
         let err = ProcessHookRunner
