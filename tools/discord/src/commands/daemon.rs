@@ -22,7 +22,7 @@ use std::process::Stdio;
 
 use std::os::unix::process::CommandExt;
 
-use crate::common::config::load_config;
+use crate::common::config::{Config, load_config};
 use crate::common::http::HttpDiscordApi;
 use crate::common::store::AskStore;
 use crate::daemon::MessageTriggerSettings;
@@ -71,10 +71,7 @@ async fn run_foreground(
     config_path: &Path,
     token: String,
 ) -> Result<Payload, AppError> {
-    let message_trigger = match load_config(config_path)? {
-        Some(config) => MessageTriggerSettings::from_config(&config)?,
-        None => None,
-    };
+    let message_trigger = message_trigger_settings(load_config(config_path)?.as_ref())?;
     acquire_pidfile(pid_path)?;
     let api = HttpDiscordApi::new(token.clone());
     let store = match AskStore::open(db_path) {
@@ -94,6 +91,17 @@ async fn run_foreground(
         pid: std::process::id(),
         foreground: true,
     }))
+}
+
+/// Derives the message-trigger settings from the loaded config. No config
+/// file means the feature is off, the same as a config without `on_message`.
+fn message_trigger_settings(
+    config: Option<&Config>,
+) -> Result<Option<MessageTriggerSettings>, AppError> {
+    match config {
+        Some(config) => MessageTriggerSettings::from_config(config),
+        None => Ok(None),
+    }
 }
 
 /// Spawns the detached child and waits for it to confirm it actually reached
@@ -481,6 +489,31 @@ fn remove_pidfile(path: &Path) -> Result<(), AppError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::common::config::parse_config;
+
+    #[test]
+    fn message_trigger_settings_come_from_the_config() {
+        let config =
+            parse_config(r#"{"issue_channels":["123"],"on_message":["/bin/hook"]}"#).unwrap();
+
+        let expected = MessageTriggerSettings::from_config(&config).unwrap();
+        assert!(expected.is_some());
+        assert_eq!(message_trigger_settings(Some(&config)).unwrap(), expected);
+    }
+
+    #[test]
+    fn message_trigger_settings_are_off_without_a_config_file() {
+        assert_eq!(message_trigger_settings(None).unwrap(), None);
+    }
+
+    #[test]
+    fn message_trigger_settings_reject_an_invalid_on_message() {
+        let config = parse_config(r#"{"on_message":[]}"#).unwrap();
+
+        let err = message_trigger_settings(Some(&config))
+            .expect_err("an empty on_message must fail before the daemon claims anything");
+        assert_eq!(err.kind, ErrorKind::Config);
+    }
 
     #[test]
     fn parse_pid_accepts_positive_trimmed_number() {
