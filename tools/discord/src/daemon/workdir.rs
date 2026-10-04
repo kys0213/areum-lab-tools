@@ -17,7 +17,7 @@ pub(super) struct Workdirs {
 
 impl Workdirs {
     /// Aliases in `workdirs` keys resolve through `channels`. `home` is only
-    /// needed for `~/` entries. Rejects relative paths and a setup with no
+    /// needed for `~/` entries. Rejects relative paths, several keys resolving to one channel, and a setup with no
     /// directory at all, since no message could ever run.
     pub(super) fn from_config(config: &Config, home: Option<&Path>) -> Result<Self, AppError> {
         if config.workdirs.is_empty() && config.default_workdir.is_none() {
@@ -26,12 +26,23 @@ impl Workdirs {
                 "on_message needs a directory to run in: set workdirs and/or default_workdir",
             ));
         }
+        // Sorted so validation (and the conflict message) never depends on
+        // HashMap iteration order.
+        let mut entries: Vec<_> = config.workdirs.iter().collect();
+        entries.sort();
         let mut by_channel = HashMap::new();
-        for (key, raw) in &config.workdirs {
-            by_channel.insert(
-                resolve_channel(key, &config.channels),
-                expand(raw, home, &format!("workdirs[{key}]"))?,
-            );
+        let mut key_of: HashMap<String, &str> = HashMap::new();
+        for (key, raw) in entries {
+            let channel = resolve_channel(key, &config.channels);
+            if let Some(first) = key_of.insert(channel.clone(), key) {
+                return Err(AppError::new(
+                    ErrorKind::Config,
+                    format!(
+                        "workdirs[{first}] and workdirs[{key}] both resolve to channel {channel}: keep only one"
+                    ),
+                ));
+            }
+            by_channel.insert(channel, expand(raw, home, &format!("workdirs[{key}]"))?);
         }
         let default = config
             .default_workdir

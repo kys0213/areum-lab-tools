@@ -1,13 +1,29 @@
 use super::*;
 use crate::common::config::parse_config;
 
-fn unique_dir(label: &str) -> PathBuf {
+/// Temp directory removed on drop so tests leave nothing behind.
+struct TempDir(PathBuf);
+
+impl std::ops::Deref for TempDir {
+    type Target = Path;
+    fn deref(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+fn unique_dir(label: &str) -> TempDir {
     let dir = std::env::temp_dir().join(format!(
         "areum-discord-workdir-{}-{label}",
         std::process::id()
     ));
     std::fs::create_dir_all(&dir).unwrap();
-    std::fs::canonicalize(&dir).unwrap()
+    TempDir(std::fs::canonicalize(&dir).unwrap())
 }
 
 fn workdirs(json: &str, home: Option<&Path>) -> Result<Workdirs, AppError> {
@@ -60,7 +76,7 @@ fn unmapped_channel_without_default_is_an_error() {
         None,
     )
     .unwrap();
-    assert!(w.resolve("c2", None).is_err());
+    assert_eq!(w.resolve("c2", None).unwrap_err().kind, ErrorKind::Config);
 }
 
 #[test]
@@ -103,7 +119,7 @@ fn existence_is_rechecked_on_every_resolve() {
     )
     .unwrap();
     assert!(w.resolve("c1", None).is_ok());
-    std::fs::remove_dir_all(&dir).unwrap();
+    std::fs::remove_dir_all(&*dir).unwrap();
     assert!(w.resolve("c1", None).is_err());
 }
 
@@ -125,7 +141,7 @@ fn alias_keys_resolve_through_channels() {
 fn tilde_slash_expands_to_home() {
     let home = unique_dir("home");
     std::fs::create_dir_all(home.join("proj")).unwrap();
-    let w = workdirs(r#"{"default_workdir":"~/proj"}"#, Some(&home)).unwrap();
+    let w = workdirs(r#"{"default_workdir":"~/proj"}"#, Some(&*home)).unwrap();
     assert_eq!(
         w.resolve("c1", None).unwrap(),
         home.join("proj").to_str().unwrap()
@@ -155,4 +171,31 @@ fn relative_and_tilde_user_paths_are_rejected() {
 fn no_directory_settings_at_all_is_rejected() {
     let err = workdirs(r#"{"on_message":["/bin/hook"]}"#, None).unwrap_err();
     assert_eq!(err.kind, ErrorKind::Config);
+}
+
+#[test]
+fn alias_and_id_keys_for_the_same_channel_are_rejected() {
+    let err = workdirs(
+        r#"{"channels":{"issues":"555"},"workdirs":{"issues":"/a","555":"/b"}}"#,
+        None,
+    )
+    .unwrap_err();
+    assert_eq!(err.kind, ErrorKind::Config);
+    let msg = err.message.clone();
+    assert!(msg.contains("issues") && msg.contains("555"), "{msg}");
+}
+
+#[test]
+fn duplicate_keys_are_rejected_even_when_directories_match() {
+    let err = workdirs(
+        r#"{"channels":{"a":"7","b":"7"},"workdirs":{"a":"/same","b":"/same"}}"#,
+        None,
+    )
+    .unwrap_err();
+    assert_eq!(err.kind, ErrorKind::Config);
+    let msg = err.message.clone();
+    assert!(
+        msg.contains('a') && msg.contains('b') && msg.contains('7'),
+        "{msg}"
+    );
 }
