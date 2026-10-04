@@ -374,6 +374,35 @@ async fn channel_lookup_failure_does_not_publish_and_is_not_cached() {
     assert_eq!(api.channel_calls.borrow().len(), 2);
 }
 
+/// A hung channel lookup must not stall the event loop: `handle` gives up on
+/// its own, publishes nothing, and does not cache, so the next message looks
+/// the channel up again. Paused time makes the timeout fire without waiting.
+#[tokio::test(start_paused = true)]
+async fn hung_channel_lookup_times_out_without_publishing_or_caching() {
+    let runner = FakeRunner::new();
+    let api = api_with_channels(vec![text_channel("c1")]);
+    api.channel_hangs.set(true);
+    let mut trigger = trigger(&runner);
+
+    let started = tokio::time::Instant::now();
+    let first = tokio::time::timeout(
+        std::time::Duration::from_secs(60),
+        trigger.handle(&api, &message("c1", &[BOT])),
+    )
+    .await
+    .expect("handle must give up on a hung lookup by itself");
+    let waited = started.elapsed();
+    api.channel_hangs.set(false);
+    let second = trigger.handle(&api, &message("c1", &[BOT])).await;
+
+    let err = first.expect_err("a timed-out lookup must not publish");
+    assert!(err.message.contains("timed out"), "{}", err.message);
+    assert_eq!(waited, CHANNEL_LOOKUP_TIMEOUT);
+    assert_eq!(second.unwrap(), Some(Trigger::Mention));
+    assert_eq!(runner.calls.borrow().len(), 1);
+    assert_eq!(api.channel_calls.borrow().len(), 2);
+}
+
 #[tokio::test]
 async fn channel_placement_is_cached_after_a_successful_lookup() {
     let runner = FakeRunner::new();

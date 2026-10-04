@@ -26,6 +26,10 @@ const USER_MESSAGE_TYPES: [u8; 2] = [0, 19];
 /// Channel types that are threads (announcement, public, private).
 const THREAD_CHANNEL_TYPES: [u8; 3] = [10, 11, 12];
 
+/// Upper bound for the REST channel lookup. The lookup runs on the gateway
+/// event loop, so a slow Discord response must not stall every other event.
+const CHANNEL_LOOKUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
 /// Validated message-trigger settings derived from config. Exists only when
 /// `on_message` is configured — its absence is how the feature is disabled.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -192,7 +196,22 @@ impl<R: HookRunner> MessageTrigger<R> {
         let placement = match self.placements.get(&message.channel_id) {
             Some(cached) => cached.clone(),
             None => {
-                let info = api.get_channel(&message.channel_id).await.map_err(|e| {
+                let info = tokio::time::timeout(
+                    CHANNEL_LOOKUP_TIMEOUT,
+                    api.get_channel(&message.channel_id),
+                )
+                .await
+                .map_err(|_| {
+                    AppError::new(
+                        ErrorKind::Network,
+                        format!(
+                            "channel lookup for {} timed out after {CHANNEL_LOOKUP_TIMEOUT:?}, \
+                             message {} not published",
+                            message.channel_id, message.id
+                        ),
+                    )
+                })?
+                .map_err(|e| {
                     AppError::new(
                         e.kind,
                         format!(

@@ -1,4 +1,4 @@
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::time::Duration;
 
@@ -42,6 +42,9 @@ pub(crate) struct MockDiscordApi {
     pub(crate) channel_responses: RefCell<VecDeque<Result<ChannelInfo, AppError>>>,
     /// `channel_id` per `get_channel`.
     pub(crate) channel_calls: RefCell<Vec<String>>,
+    /// When set, `get_channel` records the call and then never completes,
+    /// standing in for a lookup that hangs (tests drive it with paused time).
+    pub(crate) channel_hangs: Cell<bool>,
 }
 
 impl MockDiscordApi {
@@ -59,6 +62,7 @@ impl MockDiscordApi {
             edit_components_calls: RefCell::new(Vec::new()),
             channel_responses: RefCell::new(VecDeque::new()),
             channel_calls: RefCell::new(Vec::new()),
+            channel_hangs: Cell::new(false),
         }
     }
 
@@ -145,6 +149,9 @@ impl DiscordApi for MockDiscordApi {
 
     async fn get_channel(&self, channel_id: &str) -> Result<ChannelInfo, AppError> {
         self.channel_calls.borrow_mut().push(channel_id.to_owned());
+        if self.channel_hangs.get() {
+            std::future::pending::<()>().await;
+        }
         self.channel_responses
             .borrow_mut()
             .pop_front()
