@@ -22,6 +22,13 @@ pub struct Config {
     /// message detection entirely.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub on_message: Option<Vec<String>>,
+    /// Channel id or `channels` alias -> directory `on_message` runs in.
+    /// Absolute or `~/`-prefixed.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub workdirs: HashMap<String, String>,
+    /// Directory for channels without a `workdirs` entry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_workdir: Option<String>,
 }
 
 /// Resolves the bot token by precedence: flag > env > config. Fails fast when
@@ -257,6 +264,27 @@ mod tests {
             cfg.on_message,
             Some(vec!["/bin/run".to_owned(), "--x".to_owned()])
         );
+    }
+
+    #[test]
+    fn parse_config_reads_workdir_fields() {
+        let cfg = parse_config(
+            r#"{"workdirs":{"issues":"/srv/a","333":"~/b"},"default_workdir":"/srv/default"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.workdirs.get("issues").map(String::as_str),
+            Some("/srv/a")
+        );
+        assert_eq!(cfg.workdirs.get("333").map(String::as_str), Some("~/b"));
+        assert_eq!(cfg.default_workdir.as_deref(), Some("/srv/default"));
+    }
+
+    #[test]
+    fn parse_config_without_workdir_fields_leaves_them_empty() {
+        let cfg = parse_config(r#"{"token":"t","on_message":["/bin/run"]}"#).unwrap();
+        assert!(cfg.workdirs.is_empty());
+        assert!(cfg.default_workdir.is_none());
     }
 
     #[test]

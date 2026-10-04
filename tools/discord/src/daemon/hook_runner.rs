@@ -4,6 +4,7 @@
 //! and `wait()`s the child so finished hooks do not linger as zombies.
 
 use std::io::Write;
+use std::path::Path;
 use std::process::{Command, Stdio};
 
 use crate::common::error::{AppError, ErrorKind};
@@ -13,7 +14,7 @@ use crate::common::error::{AppError, ErrorKind};
 /// that goes wrong after a successful start (stdin write, non-zero exit) is
 /// reported asynchronously on stderr by the implementation.
 pub(super) trait HookRunner {
-    fn run(&self, argv: &[String], stdin_line: String) -> Result<(), AppError>;
+    fn run(&self, argv: &[String], workdir: &Path, stdin_line: String) -> Result<(), AppError>;
 }
 
 /// Real [`HookRunner`] backed by `std::process`. stdout is discarded so a
@@ -22,7 +23,7 @@ pub(super) trait HookRunner {
 pub(super) struct ProcessHookRunner;
 
 impl HookRunner for ProcessHookRunner {
-    fn run(&self, argv: &[String], stdin_line: String) -> Result<(), AppError> {
+    fn run(&self, argv: &[String], workdir: &Path, stdin_line: String) -> Result<(), AppError> {
         let (program, args) = argv.split_first().ok_or_else(|| {
             AppError::new(ErrorKind::Config, "on_message must not be an empty array")
         })?;
@@ -31,6 +32,7 @@ impl HookRunner for ProcessHookRunner {
         let mut child = Command::new(program)
             .args(args)
             .env_remove("DISCORD_BOT_TOKEN")
+            .current_dir(workdir)
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .stderr(Stdio::inherit())
@@ -101,6 +103,10 @@ mod tests {
         }
     }
 
+    fn here() -> std::path::PathBuf {
+        std::env::current_dir().unwrap()
+    }
+
     fn argv(parts: &[&str]) -> Vec<String> {
         parts.iter().map(|s| (*s).to_owned()).collect()
     }
@@ -112,7 +118,11 @@ mod tests {
         let script = format!("cat > {}", out.display());
 
         ProcessHookRunner
-            .run(&argv(&["sh", "-c", &script]), "{\"a\":1}\n".to_owned())
+            .run(
+                &argv(&["sh", "-c", &script]),
+                &here(),
+                "{\"a\":1}\n".to_owned(),
+            )
             .expect("a valid command must start");
 
         assert_eq!(wait_for_file(&out), "{\"a\":1}\n");
@@ -131,7 +141,11 @@ mod tests {
         let hostile = format!("a b;touch {}", injected.display());
 
         ProcessHookRunner
-            .run(&argv(&["sh", "-c", &script, &hostile]), String::new())
+            .run(
+                &argv(&["sh", "-c", &script, &hostile]),
+                &here(),
+                String::new(),
+            )
             .expect("a valid command must start");
 
         assert_eq!(wait_for_file(&out), format!("{hostile}\n"));
@@ -160,7 +174,7 @@ mod tests {
         // (including `Command::spawn`), and no test calls into C code that
         // reads the environment directly.
         unsafe { std::env::set_var("DISCORD_BOT_TOKEN", "leaked-token") };
-        let result = ProcessHookRunner.run(&argv(&["sh", "-c", &script]), String::new());
+        let result = ProcessHookRunner.run(&argv(&["sh", "-c", &script]), &here(), String::new());
         unsafe { std::env::remove_var("DISCORD_BOT_TOKEN") };
         result.expect("a valid command must start");
 
@@ -173,6 +187,7 @@ mod tests {
         let err = ProcessHookRunner
             .run(
                 &argv(&["/nonexistent/areum-discord-hook"]),
+                &here(),
                 "{}\n".to_owned(),
             )
             .expect_err("a missing program must be reported, not panic");
@@ -185,7 +200,7 @@ mod tests {
         // The non-zero exit is only logged by the reaper thread; the caller
         // (the event loop) sees a successful start and keeps going.
         ProcessHookRunner
-            .run(&argv(&["sh", "-c", "exit 3"]), "{}\n".to_owned())
+            .run(&argv(&["sh", "-c", "exit 3"]), &here(), "{}\n".to_owned())
             .expect("a started command is Ok even if it fails later");
     }
 
@@ -193,14 +208,36 @@ mod tests {
     fn run_does_not_block_on_a_long_running_command() {
         let started = std::time::Instant::now();
         ProcessHookRunner
-            .run(&argv(&["sleep", "2"]), "{}\n".to_owned())
+            .run(&argv(&["sleep", "2"]), &here(), "{}\n".to_owned())
             .unwrap();
         assert!(started.elapsed() < std::time::Duration::from_secs(1));
     }
 
     #[test]
     fn run_rejects_an_empty_argv() {
-        let err = ProcessHookRunner.run(&[], "{}\n".to_owned()).unwrap_err();
+        let err = ProcessHookRunner
+            .run(&[], &here(), "{}\n".to_owned())
+            .unwrap_err();
         assert_eq!(err.kind, ErrorKind::Config);
+    }
+
+    #[test]
+    fn run_executes_the_command_in_the_given_directory() {
+        let dir = unique_path("cwd-dir");
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir = std::fs::canonicalize(&dir).unwrap();
+        let out = unique_path("cwd-out");
+        let _ = std::fs::remove_file(&out);
+        let script = format!("pwd > {}", out.display());
+
+        ProcessHookRunner
+            .run(&argv(&["sh", "-c", &script]), &dir, String::new())
+            .expect("a valid command must start");
+
+        let printed = wait_for_file(&out);
+        let printed = std::fs::canonicalize(printed.trim_end()).unwrap();
+        assert_eq!(printed, dir);
+        std::fs::remove_file(&out).ok();
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

@@ -2,6 +2,7 @@ mod gateway;
 mod hook_runner;
 mod interactions;
 mod message_trigger;
+mod workdir;
 
 pub(crate) use gateway::run;
 pub(crate) use message_trigger::MessageTriggerSettings;

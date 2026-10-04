@@ -1,5 +1,6 @@
 use std::cell::RefCell;
 use std::collections::VecDeque;
+use std::path::{Path, PathBuf};
 
 use super::*;
 use crate::commands::testutil::MockDiscordApi;
@@ -13,6 +14,7 @@ const HOOK: &str = "/bin/hook";
 struct FakeRunner {
     results: RefCell<VecDeque<Result<(), AppError>>>,
     calls: RefCell<Vec<(Vec<String>, String)>>,
+    dirs: RefCell<Vec<PathBuf>>,
 }
 
 impl FakeRunner {
@@ -20,6 +22,7 @@ impl FakeRunner {
         Self {
             results: RefCell::new(VecDeque::new()),
             calls: RefCell::new(Vec::new()),
+            dirs: RefCell::new(Vec::new()),
         }
     }
 
@@ -34,19 +37,56 @@ impl FakeRunner {
 }
 
 impl HookRunner for &FakeRunner {
-    fn run(&self, argv: &[String], stdin_line: String) -> Result<(), AppError> {
+    fn run(&self, argv: &[String], workdir: &Path, stdin_line: String) -> Result<(), AppError> {
+        self.dirs.borrow_mut().push(workdir.to_path_buf());
         self.calls.borrow_mut().push((argv.to_vec(), stdin_line));
         self.results.borrow_mut().pop_front().unwrap_or(Ok(()))
     }
 }
 
-fn settings() -> MessageTriggerSettings {
+fn dir(label: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!(
+        "areum-discord-trigger-{}-{label}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::canonicalize(&dir).unwrap()
+}
+
+fn default_dir() -> PathBuf {
+    dir("default")
+}
+
+fn settings_from(extra: &str) -> MessageTriggerSettings {
     let config = parse(&format!(
-        r#"{{"issue_channels":["{ISSUE}"],"on_message":["{HOOK}"]}}"#
+        r#"{{"issue_channels":["{ISSUE}"],"on_message":["{HOOK}"]{extra}}}"#
     ));
     MessageTriggerSettings::from_config(&config)
         .unwrap()
         .expect("on_message is configured")
+}
+
+fn settings() -> MessageTriggerSettings {
+    settings_from(&format!(
+        r#","default_workdir":{}"#,
+        serde_json::to_string(default_dir().to_str().unwrap()).unwrap()
+    ))
+}
+
+fn trigger_with(
+    settings: MessageTriggerSettings,
+    runner: &FakeRunner,
+) -> MessageTrigger<&FakeRunner> {
+    let mut trigger = MessageTrigger::new(settings, runner);
+    trigger.set_bot_user_id(BOT.to_owned());
+    trigger
+}
+
+fn mapped_to(channel: &str, path: &Path) -> String {
+    format!(
+        r#","workdirs":{{"{channel}":{}}}"#,
+        serde_json::to_string(path.to_str().unwrap()).unwrap()
+    )
 }
 
 fn parse(json: &str) -> Config {
@@ -112,7 +152,7 @@ fn settings_are_absent_when_on_message_is_not_configured() {
 #[test]
 fn settings_resolve_issue_channel_aliases_through_channels() {
     let config = parse(
-        r#"{"channels":{"issues":"555"},"issue_channels":["issues","777"],"on_message":["/bin/hook"]}"#,
+        r#"{"channels":{"issues":"555"},"issue_channels":["issues","777"],"on_message":["/bin/hook"],"default_workdir":"/tmp"}"#,
     );
     let settings = MessageTriggerSettings::from_config(&config)
         .unwrap()
@@ -128,6 +168,134 @@ fn settings_reject_an_empty_on_message_array() {
     let config = parse(r#"{"on_message":[]}"#);
     let err = MessageTriggerSettings::from_config(&config).unwrap_err();
     assert_eq!(err.kind, ErrorKind::Config);
+}
+
+#[test]
+fn settings_reject_on_message_without_any_workdir() {
+    let config = parse(r#"{"on_message":["/bin/hook"]}"#);
+    let err = MessageTriggerSettings::from_config(&config).unwrap_err();
+    assert_eq!(err.kind, ErrorKind::Config);
+}
+
+#[test]
+fn settings_reject_a_relative_workdir() {
+    let config = parse(r#"{"on_message":["/bin/hook"],"default_workdir":"rel/dir"}"#);
+    let err = MessageTriggerSettings::from_config(&config).unwrap_err();
+    assert_eq!(err.kind, ErrorKind::Config);
+}
+
+// ---- workdir ----
+
+#[tokio::test]
+async fn top_level_message_runs_in_its_channel_workdir() {
+    let runner = FakeRunner::new();
+    let api = api_with_channels(vec![text_channel("c1")]);
+    let mapped = dir("top-level-mapped");
+
+    trigger_with(settings_from(&mapped_to("c1", &mapped)), &runner)
+        .handle(&api, &message("c1", &[BOT]))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        runner.dirs.borrow().as_slice(),
+        std::slice::from_ref(&mapped)
+    );
+    assert_eq!(sent_event(&runner, 0)["cwd"], mapped.to_str().unwrap());
+}
+
+#[tokio::test]
+async fn thread_message_runs_in_the_parent_channel_workdir() {
+    let runner = FakeRunner::new();
+    let api = api_with_channels(vec![thread("t1", "c1")]);
+    let mapped = dir("thread-mapped");
+
+    trigger_with(settings_from(&mapped_to("c1", &mapped)), &runner)
+        .handle(&api, &message("t1", &[BOT]))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        runner.dirs.borrow().as_slice(),
+        std::slice::from_ref(&mapped)
+    );
+    assert_eq!(sent_event(&runner, 0)["cwd"], mapped.to_str().unwrap());
+}
+
+#[tokio::test]
+async fn unmapped_channel_runs_in_the_default_workdir() {
+    let runner = FakeRunner::new();
+    let api = api_with_channels(vec![text_channel("c2")]);
+    let mapped = dir("unmapped-other");
+    let fallback = dir("unmapped-default");
+    let extra = format!(
+        r#"{},"default_workdir":{}"#,
+        mapped_to("c1", &mapped),
+        serde_json::to_string(fallback.to_str().unwrap()).unwrap()
+    );
+
+    trigger_with(settings_from(&extra), &runner)
+        .handle(&api, &message("c2", &[BOT]))
+        .await
+        .unwrap();
+
+    assert_eq!(runner.dirs.borrow().as_slice(), [fallback]);
+}
+
+#[tokio::test]
+async fn unmapped_channel_without_default_is_not_run() {
+    let runner = FakeRunner::new();
+    let api = api_with_channels(vec![text_channel("c2")]);
+    let mapped = dir("nodefault-other");
+
+    let result = trigger_with(settings_from(&mapped_to("c1", &mapped)), &runner)
+        .handle(&api, &message("c2", &[BOT]))
+        .await;
+
+    assert!(result.is_err());
+    assert!(runner.calls.borrow().is_empty());
+}
+
+#[tokio::test]
+async fn missing_mapped_directory_is_not_run_and_does_not_use_the_default() {
+    let runner = FakeRunner::new();
+    let api = api_with_channels(vec![text_channel("c1")]);
+    let gone =
+        std::env::temp_dir().join(format!("areum-discord-trigger-{}-gone", std::process::id()));
+    let _ = std::fs::remove_dir_all(&gone);
+    let extra = format!(
+        r#"{},"default_workdir":{}"#,
+        mapped_to("c1", &gone),
+        serde_json::to_string(default_dir().to_str().unwrap()).unwrap()
+    );
+
+    let result = trigger_with(settings_from(&extra), &runner)
+        .handle(&api, &message("c1", &[BOT]))
+        .await;
+
+    assert!(result.is_err());
+    assert!(runner.calls.borrow().is_empty());
+}
+
+#[tokio::test]
+async fn workdir_alias_keys_resolve_through_channels() {
+    let runner = FakeRunner::new();
+    let api = api_with_channels(vec![text_channel("555")]);
+    let mapped = dir("alias-mapped");
+    let config = parse(&format!(
+        r#"{{"channels":{{"proj":"555"}},"on_message":["{HOOK}"],"workdirs":{{"proj":{}}}}}"#,
+        serde_json::to_string(mapped.to_str().unwrap()).unwrap()
+    ));
+    let settings = MessageTriggerSettings::from_config(&config)
+        .unwrap()
+        .unwrap();
+
+    trigger_with(settings, &runner)
+        .handle(&api, &message("555", &[BOT]))
+        .await
+        .unwrap();
+
+    assert_eq!(runner.dirs.borrow().as_slice(), [mapped]);
 }
 
 // ---- filter ----
@@ -322,7 +490,8 @@ async fn stdin_payload_is_one_json_line_with_the_contract_fields() {
             "author": { "id": "u1", "username": "alice", "bot": false },
             "timestamp": "2026-10-04T01:02:03.000000+00:00",
             "bot_user_id": BOT,
-            "message_reference": null
+            "message_reference": null,
+            "cwd": default_dir().to_str().unwrap()
         })
     );
 }

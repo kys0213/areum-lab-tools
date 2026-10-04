@@ -493,8 +493,10 @@ mod tests {
 
     #[test]
     fn message_trigger_settings_come_from_the_config() {
-        let config =
-            parse_config(r#"{"issue_channels":["123"],"on_message":["/bin/hook"]}"#).unwrap();
+        let config = parse_config(
+            r#"{"issue_channels":["123"],"on_message":["/bin/hook"],"default_workdir":"/tmp"}"#,
+        )
+        .unwrap();
 
         let expected = MessageTriggerSettings::from_config(&config).unwrap();
         assert!(expected.is_some());
@@ -512,6 +514,15 @@ mod tests {
 
         let err = message_trigger_settings(Some(&config))
             .expect_err("an empty on_message must fail before the daemon claims anything");
+        assert_eq!(err.kind, ErrorKind::Config);
+    }
+
+    #[test]
+    fn message_trigger_settings_reject_on_message_without_a_workdir() {
+        let config = parse_config(r#"{"on_message":["/bin/hook"]}"#).unwrap();
+
+        let err = message_trigger_settings(Some(&config))
+            .expect_err("a hook with nowhere to run must fail at start");
         assert_eq!(err.kind, ErrorKind::Config);
     }
 

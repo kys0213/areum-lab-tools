@@ -8,25 +8,43 @@
 
 ## 설정
 
-`~/.areum/discord/config.json`에 두 필드를 더해요.
+`~/.areum/discord/config.json`에 네 필드를 더해요.
 
 | 필드 | 형식 | 설명 |
 |---|---|---|
 | `on_message` | 문자열 배열 (argv) | 메시지마다 실행할 명령. 첫 요소가 실행 파일, 나머지가 인자예요. 셸을 거치지 않아요. **없으면 감지 기능이 꺼져요.** 빈 배열은 데몬 시작 시 설정 오류로 끝나요. |
 | `issue_channels` | 문자열 배열 | 멘션 없이도 새 글을 발행할 채널. 채널 ID나 `channels`의 별칭을 써요. 생략하면 멘션만 감지해요. |
+| `workdirs` | `{ "<채널 ID 또는 별칭>": "<디렉토리>" }` | 채널별로 `on_message`를 실행할 디렉토리. 키의 별칭은 `channels`로 풀어요. |
+| `default_workdir` | 문자열 | `workdirs`에 없는 채널에서 쓸 디렉토리. |
 
 ```json
 {
   "token": "...",
-  "channels": { "issues": "123456789012345678" },
+  "channels": { "issues": "123456789012345678", "docs": "223456789012345678" },
   "issue_channels": ["issues"],
-  "on_message": ["/usr/local/bin/discord-run", "--verbose"]
+  "on_message": ["/usr/local/bin/discord-run", "--verbose"],
+  "workdirs": { "issues": "/Users/me/work/app", "docs": "~/work/docs" },
+  "default_workdir": "~/work/scratch"
 }
 ```
 
-- 두 필드가 없는 기존 config도 그대로 읽혀요. 이때 데몬은 예전과 똑같이 동작해요(메시지 인텐트를 요청하지 않음).
+- `on_message`가 없는 기존 config도 그대로 읽혀요. 이때 데몬은 예전과 똑같이 동작해요(메시지 인텐트를 요청하지 않음).
+- `on_message`를 설정했다면 `workdirs`와 `default_workdir` 중 하나는 있어야 해요. 둘 다 없으면 어떤 메시지도 실행할 수 없어서 데몬 시작 시 설정 오류로 끝나요.
+- 디렉토리는 절대경로이거나 `~/`로 시작해야 해요(`~/`는 홈 디렉토리로 펼쳐요). 상대경로와 `~user/...` 형식은 데몬 시작 시 설정 오류로 끝나요.
 - 설정은 데몬 시작 시 한 번 읽어요. 바꾼 뒤에는 `discord daemon stop` 후 `discord daemon start`로 다시 띄우세요.
-- `discord init --force`로 토큰을 바꿔도 두 필드는 보존돼요.
+- `discord init --force`로 토큰을 바꿔도 토큰 외 필드는 보존돼요.
+
+### 실행 디렉토리 결정
+
+메시지를 발행하기로 판정한 뒤에 정해요.
+
+1. 스레드 안의 글은 상위 채널 ID(`parent_channel_id`), 최상위 글은 채널 ID로 `workdirs`를 찾아요.
+2. 없으면 `default_workdir`를 써요.
+3. 정해진 디렉토리가 없거나 디렉토리가 아니면 명령을 실행하지 않고 데몬 stderr에 로그만 남겨요. Discord에는 아무것도 쓰지 않아요.
+
+- `workdirs`에서 찾은 디렉토리가 실제로 없을 때 `default_workdir`로 대신하지 않아요. 엉뚱한 저장소에서 작업이 실행되는 것을 막으려는 거예요.
+- 존재 여부는 발행할 때마다 확인해요. 데몬이 떠 있는 동안 디렉토리가 지워져도 놓치지 않아요.
+- 명령은 정해진 디렉토리를 현재 디렉토리로 해서 실행되고, 실제로 쓴 디렉토리(정규화된 절대경로)는 stdin JSON의 `cwd`로 넘어가요.
 
 ## Developer Portal 설정 (필수)
 
@@ -84,17 +102,18 @@ error [config]: gateway closed with 4014 (Disallowed Intents): message detection
 | `timestamp` | 문자열 | 메시지 작성 시각(ISO 8601) |
 | `bot_user_id` | 문자열 | 이 봇의 user ID. `content`에서 멘션 토큰을 걷어낼 때 써요 |
 | `message_reference` | 문자열 \| `null` | 답장이면 답장 대상 메시지 ID, 아니면 `null` |
+| `cwd` | 문자열 | 명령을 실행한 디렉토리. 심볼릭 링크를 풀어 정규화한 절대경로예요 |
 
 스레드 안에서 봇을 멘션한 예시(실제로는 한 줄):
 
 ```json
-{"trigger":"mention","guild_id":"111","channel_id":"333","parent_channel_id":"222","is_thread":true,"message_id":"444","content":"<@999> 이 에러 봐줘","author":{"id":"555","username":"alice","bot":false},"timestamp":"2026-10-04T01:02:03.000000+00:00","bot_user_id":"999","message_reference":null}
+{"trigger":"mention","guild_id":"111","channel_id":"333","parent_channel_id":"222","is_thread":true,"message_id":"444","content":"<@999> 이 에러 봐줘","author":{"id":"555","username":"alice","bot":false},"timestamp":"2026-10-04T01:02:03.000000+00:00","bot_user_id":"999","message_reference":null,"cwd":"/Users/me/work/app"}
 ```
 
 이슈 채널 최상위 글 예시:
 
 ```json
-{"trigger":"issue_channel","guild_id":"111","channel_id":"222","parent_channel_id":null,"is_thread":false,"message_id":"666","content":"로그인 버튼이 안 눌려요","author":{"id":"555","username":"alice","bot":false},"timestamp":"2026-10-04T01:05:00.000000+00:00","bot_user_id":"999","message_reference":null}
+{"trigger":"issue_channel","guild_id":"111","channel_id":"222","parent_channel_id":null,"is_thread":false,"message_id":"666","content":"로그인 버튼이 안 눌려요","author":{"id":"555","username":"alice","bot":false},"timestamp":"2026-10-04T01:05:00.000000+00:00","bot_user_id":"999","message_reference":null,"cwd":"/Users/me/work/app"}
 ```
 
 ## 실행 방식과 실패 시 동작
@@ -111,6 +130,8 @@ error [config]: gateway closed with 4014 (Disallowed Intents): message detection
 | 명령 실행 실패(파일 없음, 권한 없음) | `daemon: message handling failed: ...` 로그, 해당 메시지는 발행 안 됨 |
 | 명령이 0이 아닌 코드로 종료 | `daemon: on_message "..." exited with ...` 로그 |
 | 명령이 stdin을 읽지 않고 종료 | `failed to write stdin` 로그 |
+| 채널에 맞는 디렉토리가 없음(`workdirs`에도 `default_workdir`에도 없음) | 실행하지 않고 `no workdir for channel <id> ...` 로그 |
+| 정해진 디렉토리가 없거나 디렉토리가 아님 | 실행하지 않고 `workdir <path> for channel <id> is unusable ...` 또는 `... is not a directory` 로그. `default_workdir`로 대신하지 않음 |
 | 채널 조회(REST) 실패 | 발행하지 않고 로그. 추측으로 발행하지 않아요 |
 | 채널 조회가 3초를 넘김 | 발행하지 않고 `channel lookup for <channel> timed out after 3s, message <id> not published` 로그 |
 | 인텐트 거부 close(4013/4014) | 데몬이 위 오류로 종료(재시도 안 함) |
@@ -123,7 +144,7 @@ error [config]: gateway closed with 4014 (Disallowed Intents): message detection
 stdin을 파일에 쌓는 명령으로 설정하고 포그라운드로 띄워요.
 
 ```json
-{ "token": "...", "issue_channels": ["123456789012345678"], "on_message": ["sh", "-c", "cat >> /tmp/discord-trigger.log"] }
+{ "token": "...", "issue_channels": ["123456789012345678"], "on_message": ["sh", "-c", "cat >> /tmp/discord-trigger.log"], "default_workdir": "/tmp" }
 ```
 
 ```sh
@@ -146,4 +167,5 @@ tail -f /tmp/discord-trigger.log
 
 - **READY에서 봇 ID 기록**: 데몬을 띄운 직후 봇을 멘션했을 때 `"trigger":"mention"`이 쌓이고 `bot_user_id`가 봇 ID와 같은지 봐요. READY 처리가 빠지면 멘션 판정이 안 돼요.
 - **MESSAGE_CREATE 구독**: `on_message`를 설정했을 때 새 글이 데몬에 도착하는지 봐요. 이벤트 구독이 빠지면 아무 글도 쌓이지 않고 로그도 남지 않아요.
+- **채널별 실행 디렉토리**: 채널 2개를 서로 다른 디렉토리에 매핑하고 각 채널에서 멘션했을 때, 기록된 JSON의 `cwd`와 훅의 실제 현재 디렉토리(`pwd`)가 일치하는지 봐요. 매핑한 디렉토리를 지운 뒤 멘션하면 명령이 실행되지 않고 데몬 로그만 남는지도 봐요.
 - **4013/4014 close 처리**: Developer Portal에서 Message Content Intent를 끈 채 띄우면 데몬이 위 `4014 (Disallowed Intents)` 오류로 끝나고 재시도하지 않는지 봐요. 4013(Invalid Intents)은 데몬이 잘못된 인텐트 값을 보낼 때만 나서 수동 재현이 어렵고, close 코드 분류는 단위 테스트로 덮어요.

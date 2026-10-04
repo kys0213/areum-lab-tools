@@ -10,6 +10,7 @@
 //! mention triggers.
 
 use std::collections::{HashMap, HashSet};
+use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
@@ -18,6 +19,7 @@ use crate::common::config::{Config, resolve_channel};
 use crate::common::error::{AppError, ErrorKind};
 
 use super::hook_runner::HookRunner;
+use super::workdir::Workdirs;
 
 /// Discord message types a person produces by posting (`DEFAULT`, `REPLY`).
 /// System messages (thread created, pins, joins) never trigger.
@@ -36,12 +38,14 @@ const CHANNEL_LOOKUP_TIMEOUT: std::time::Duration = std::time::Duration::from_se
 pub(crate) struct MessageTriggerSettings {
     issue_channels: HashSet<String>,
     on_message: Vec<String>,
+    workdirs: Workdirs,
 }
 
 impl MessageTriggerSettings {
     /// `Ok(None)` when `on_message` is absent (feature off). Issue-channel
     /// aliases resolve through `channels` the same way `send`/`read` do. An
-    /// empty `on_message` array cannot be executed, so it fails fast.
+    /// empty `on_message` array, or no working directory setting at all,
+    /// cannot be executed, so both fail fast.
     pub(crate) fn from_config(config: &Config) -> Result<Option<Self>, AppError> {
         let Some(on_message) = &config.on_message else {
             return Ok(None);
@@ -57,9 +61,12 @@ impl MessageTriggerSettings {
             .iter()
             .map(|entry| resolve_channel(entry, &config.channels))
             .collect();
+        let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+        let workdirs = Workdirs::from_config(config, home.as_deref())?;
         Ok(Some(Self {
             issue_channels,
             on_message: on_message.clone(),
+            workdirs,
         }))
     }
 }
@@ -131,6 +138,8 @@ struct TriggerEvent<'a> {
     timestamp: &'a str,
     bot_user_id: &'a str,
     message_reference: Option<&'a str>,
+    /// Canonical absolute directory the hook was started in.
+    cwd: &'a str,
 }
 
 #[derive(Debug, Serialize)]
@@ -229,8 +238,23 @@ impl<R: HookRunner> MessageTrigger<R> {
         let Some(trigger) = decide(&message, bot_user_id, &placement, issue_channels) else {
             return Ok(None);
         };
-        let line = event_line(&message, trigger, &placement, bot_user_id);
-        self.runner.run(&self.settings.on_message, line)?;
+        let parent_id = match &placement {
+            Placement::TopLevel => None,
+            Placement::Thread { parent_id } => Some(parent_id.as_str()),
+        };
+        let cwd = self
+            .settings
+            .workdirs
+            .resolve(&message.channel_id, parent_id)
+            .map_err(|e| {
+                AppError::new(
+                    e.kind,
+                    format!("message {} not published: {}", message.id, e.message),
+                )
+            })?;
+        let line = event_line(&message, trigger, &placement, bot_user_id, &cwd);
+        self.runner
+            .run(&self.settings.on_message, Path::new(&cwd), line)?;
         Ok(Some(trigger))
     }
 }
@@ -287,6 +311,7 @@ fn event_line(
     trigger: Trigger,
     placement: &Placement,
     bot_user_id: &str,
+    cwd: &str,
 ) -> String {
     let parent_channel_id = match placement {
         Placement::TopLevel => None,
@@ -311,6 +336,7 @@ fn event_line(
             .message_reference
             .as_ref()
             .and_then(|r| r.message_id.as_deref()),
+        cwd,
     };
     // serde_json escapes control characters, so the output never contains a
     // raw newline and stays a single line.
