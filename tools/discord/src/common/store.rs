@@ -49,6 +49,18 @@ impl FromSql for OptionsJson {
     }
 }
 
+/// Decodes the `allowed_users` TEXT column (JSON array of user ids), same
+/// fail-fast contract as [`OptionsJson`].
+struct UserIdsJson(Vec<String>);
+
+impl FromSql for UserIdsJson {
+    fn column_result(value: ValueRef<'_>) -> FromSqlResult<Self> {
+        serde_json::from_str(value.as_str()?)
+            .map(UserIdsJson)
+            .map_err(|e| FromSqlError::Other(Box::new(e)))
+    }
+}
+
 /// A new ask to persist. Status always starts at `pending`; the response
 /// columns (`kind`/`value`/`answered_by`/`answered_at`) start NULL and are
 /// filled in later by `try_answer`/`try_timeout`.
@@ -59,6 +71,9 @@ pub(crate) struct NewAsk {
     pub(crate) question: String,
     pub(crate) options: Vec<String>,
     pub(crate) allow_text: bool,
+    /// Discord user ids allowed to answer; empty means anyone.
+    pub(crate) allowed_users: Vec<String>,
+    pub(crate) multi_select: bool,
     pub(crate) created_at: String,
     pub(crate) timeout_at: String,
 }
@@ -73,6 +88,8 @@ pub(crate) struct AskRecord {
     pub(crate) question: String,
     pub(crate) options: Vec<String>,
     pub(crate) allow_text: bool,
+    pub(crate) allowed_users: Vec<String>,
+    pub(crate) multi_select: bool,
     pub(crate) status: AskStatus,
     pub(crate) kind: Option<String>,
     pub(crate) value: Option<String>,
@@ -138,20 +155,29 @@ impl AskStore {
                 format!("failed to serialize ask options: {e}"),
             )
         })?;
+        let allowed_users_json = serde_json::to_string(&ask.allowed_users).map_err(|e| {
+            AppError::new(
+                ErrorKind::Internal,
+                format!("failed to serialize ask allowed users: {e}"),
+            )
+        })?;
         let created_at = normalize_utc(&self.conn, &ask.created_at)?;
         let timeout_at = normalize_utc(&self.conn, &ask.timeout_at)?;
         self.conn
             .execute(
                 "INSERT INTO asks (
                     ask_id, channel_id, question, options, allow_text,
+                    allowed_users, multi_select,
                     status, created_at, timeout_at
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, 'pending', ?6, ?7)",
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'pending', ?8, ?9)",
                 params![
                     ask.ask_id,
                     ask.channel_id,
                     ask.question,
                     options_json,
                     ask.allow_text,
+                    allowed_users_json,
+                    ask.multi_select,
                     created_at,
                     timeout_at,
                 ],
@@ -282,8 +308,8 @@ impl AskStore {
 /// Single source of the `asks` column list shared by every statement that
 /// yields full records (`get_ask` SELECT, `expire_due` RETURNING), so
 /// `row_to_record`'s named lookups always have every column available.
-const ASK_COLUMNS: &str = "ask_id, channel_id, question, options, allow_text, status, \
-    kind, value, answered_by, created_at, timeout_at, answered_at";
+const ASK_COLUMNS: &str = "ask_id, channel_id, question, options, allow_text, \
+    allowed_users, multi_select, status, kind, value, answered_by, created_at, timeout_at, answered_at";
 
 fn row_to_record(row: &Row<'_>) -> rusqlite::Result<AskRecord> {
     Ok(AskRecord {
@@ -292,6 +318,8 @@ fn row_to_record(row: &Row<'_>) -> rusqlite::Result<AskRecord> {
         question: row.get("question")?,
         options: row.get::<_, OptionsJson>("options")?.0,
         allow_text: row.get("allow_text")?,
+        allowed_users: row.get::<_, UserIdsJson>("allowed_users")?.0,
+        multi_select: row.get("multi_select")?,
         status: row.get("status")?,
         kind: row.get("kind")?,
         value: row.get("value")?,
@@ -333,7 +361,7 @@ fn is_busy(err: &rusqlite::Error) -> bool {
 }
 
 /// Version the migration blocks in [`migrate`] bring the schema up to.
-const LATEST_SCHEMA_VERSION: i64 = 1;
+const LATEST_SCHEMA_VERSION: i64 = 2;
 
 /// Applies pending schema migrations, tracked via a single-row
 /// `schema_version` table. Safe to call on every `open` — a database already
@@ -379,6 +407,12 @@ fn migrate(conn: &mut Connection) -> Result<(), AppError> {
         tx.execute_batch("INSERT INTO schema_version (version) VALUES (1)")
             .map_err(map_sqlite_err)?;
     }
+    if current < 2 {
+        tx.execute_batch(MIGRATE_ASKS_V2_SQL)
+            .map_err(map_sqlite_err)?;
+        tx.execute_batch("UPDATE schema_version SET version = 2")
+            .map_err(map_sqlite_err)?;
+    }
 
     tx.commit().map_err(map_sqlite_err)
 }
@@ -422,6 +456,13 @@ const CREATE_ASKS_SQL: &str = "CREATE TABLE IF NOT EXISTS asks (
     timeout_at TEXT NOT NULL,
     answered_at TEXT
 )";
+
+/// v2: per-ask answer allow-list (JSON array, `[]` = anyone) and the
+/// select-menu multi-choice flag. Defaults keep rows written by a v1 binary
+/// valid and behaving exactly as before.
+const MIGRATE_ASKS_V2_SQL: &str = "
+    ALTER TABLE asks ADD COLUMN allowed_users TEXT NOT NULL DEFAULT '[]';
+    ALTER TABLE asks ADD COLUMN multi_select INTEGER NOT NULL DEFAULT 0;";
 
 /// Normalizes a timestamp to canonical UTC (`YYYY-MM-DDTHH:MM:SSZ`, fixed
 /// width) via SQLite's own datetime parsing — offset forms like `+09:00`

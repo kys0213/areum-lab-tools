@@ -153,6 +153,8 @@ async fn run(cli: Cli) -> Result<Payload, AppError> {
             question,
             options,
             allow_text,
+            allowed_users,
+            multi_select,
             timeout,
         }) => {
             let (api, channels) = authenticated_api(&config_path, cli.token.as_deref())?;
@@ -164,6 +166,8 @@ async fn run(cli: Cli) -> Result<Payload, AppError> {
                 question,
                 options,
                 allow_text,
+                allowed_users,
+                multi_select,
                 timeout_secs: timeout,
             };
             commands::run_ask_create(

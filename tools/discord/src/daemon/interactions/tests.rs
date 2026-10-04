@@ -13,6 +13,8 @@ fn store_with_pending(ask_id: &str, options: &[&str], timeout_at: &str) -> AskSt
             question: "Proceed?".to_owned(),
             options: options.iter().map(|s| (*s).to_owned()).collect(),
             allow_text: true,
+            allowed_users: vec![],
+            multi_select: false,
             created_at: "2024-01-01T00:00:00Z".to_owned(),
             timeout_at: timeout_at.to_owned(),
         })
@@ -39,6 +41,8 @@ fn store_with_pending_no_text(ask_id: &str, options: &[&str], timeout_at: &str) 
             question: "Proceed?".to_owned(),
             options: options.iter().map(|s| (*s).to_owned()).collect(),
             allow_text: false,
+            allowed_users: vec![],
+            multi_select: false,
             created_at: "2024-01-01T00:00:00Z".to_owned(),
             timeout_at: timeout_at.to_owned(),
         })
@@ -197,6 +201,8 @@ async fn text_button_opens_modal_with_title_truncated_to_45_chars() {
             question: long_question.clone(),
             options: vec!["Yes".to_owned()],
             allow_text: true,
+            allowed_users: vec![],
+            multi_select: false,
             created_at: "2024-01-01T00:00:00Z".to_owned(),
             timeout_at: "2024-01-01T01:00:00Z".to_owned(),
         })
@@ -515,6 +521,8 @@ async fn expire_and_disable_transitions_due_asks_and_edits_messages() {
             question: "q".to_owned(),
             options: vec!["Yes".to_owned()],
             allow_text: false,
+            allowed_users: vec![],
+            multi_select: false,
             created_at: "2024-01-01T00:00:00Z".to_owned(),
             timeout_at: "2024-01-01T00:00:05Z".to_owned(),
         })
@@ -568,6 +576,8 @@ async fn expire_and_disable_isolates_failures_and_retries_transient_ones_next_ti
                 question: "q".to_owned(),
                 options: vec!["Yes".to_owned()],
                 allow_text: false,
+                allowed_users: vec![],
+                multi_select: false,
                 created_at: "2024-01-01T00:00:00Z".to_owned(),
                 timeout_at: "2024-01-01T00:00:05Z".to_owned(),
             })
@@ -808,4 +818,232 @@ fn extract_modal_text_finds_value_regardless_of_nesting() {
 
     let none = serde_json::json!({ "components": [] });
     assert_eq!(extract_modal_text(Some(&none)), None);
+}
+
+// --- allowed users + multi-select -------------------------------------------
+
+fn scoped_store(ask_id: &str, allowed: &[&str], multi: bool) -> AskStore {
+    let store = AskStore::open_in_memory().unwrap();
+    store
+        .insert_ask(NewAsk {
+            ask_id: ask_id.to_owned(),
+            channel_id: "chan1".to_owned(),
+            question: "Proceed?".to_owned(),
+            options: vec!["A".to_owned(), "B".to_owned(), "C".to_owned()],
+            allow_text: true,
+            allowed_users: allowed.iter().map(|s| (*s).to_owned()).collect(),
+            multi_select: multi,
+            created_at: "2024-01-01T00:00:00Z".to_owned(),
+            timeout_at: "2024-01-01T01:00:00Z".to_owned(),
+        })
+        .unwrap();
+    store
+}
+
+fn as_user(mut payload: serde_json::Value, user_id: &str) -> serde_json::Value {
+    payload["member"] = serde_json::json!({ "user": { "id": user_id } });
+    payload
+}
+
+fn select_payload(ask_id: &str, values: &[&str]) -> serde_json::Value {
+    serde_json::json!({
+        "id": "int4",
+        "token": "tok4",
+        "type": 3,
+        "data": {
+            "custom_id": format!("ask:{ask_id}:sel"),
+            "component_type": 3,
+            "values": values,
+        },
+        "member": { "user": { "id": "user1" } }
+    })
+}
+
+fn assert_ephemeral_rejection(api: &MockDiscordApi, store: &AskStore, ask_id: &str) {
+    let calls = api.interaction_calls.borrow();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].2["type"], 4);
+    assert_eq!(calls[0].2["data"]["flags"], 64);
+    let record = store.get_ask(ask_id).unwrap().unwrap();
+    assert_eq!(record.status, crate::common::store::AskStatus::Pending);
+}
+
+#[tokio::test]
+async fn allowed_user_click_is_adopted() {
+    let store = scoped_store("m", &["user1", "user9"], false);
+    let api = MockDiscordApi::new();
+    handle_interaction(&api, &store, &choice_payload("m", 1), NOW)
+        .await
+        .unwrap();
+    let record = store.get_ask("m").unwrap().unwrap();
+    assert_eq!(record.value.as_deref(), Some("B"));
+    assert_eq!(record.answered_by.as_deref(), Some("user1"));
+}
+
+#[tokio::test]
+async fn disallowed_user_click_is_not_adopted_and_gets_ephemeral() {
+    let store = scoped_store("m", &["user9"], false);
+    let api = MockDiscordApi::new();
+    handle_interaction(&api, &store, &choice_payload("m", 0), NOW)
+        .await
+        .unwrap();
+    assert_ephemeral_rejection(&api, &store, "m");
+    assert_eq!(
+        api.interaction_calls.borrow()[0].2["data"]["content"],
+        NOT_ALLOWED_USER
+    );
+}
+
+#[tokio::test]
+async fn disallowed_user_does_not_block_a_later_allowed_user() {
+    let store = scoped_store("m", &["user9"], false);
+    let api = MockDiscordApi::new();
+    handle_interaction(&api, &store, &choice_payload("m", 0), NOW)
+        .await
+        .unwrap();
+    handle_interaction(&api, &store, &as_user(choice_payload("m", 2), "user9"), NOW)
+        .await
+        .unwrap();
+    let record = store.get_ask("m").unwrap().unwrap();
+    assert_eq!(record.value.as_deref(), Some("C"));
+    assert_eq!(record.answered_by.as_deref(), Some("user9"));
+}
+
+#[tokio::test]
+async fn unrestricted_ask_accepts_anyone() {
+    let store = scoped_store("m", &[], false);
+    let api = MockDiscordApi::new();
+    handle_interaction(
+        &api,
+        &store,
+        &as_user(choice_payload("m", 0), "stranger"),
+        NOW,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        store.get_ask("m").unwrap().unwrap().answered_by.as_deref(),
+        Some("stranger")
+    );
+}
+
+#[tokio::test]
+async fn disallowed_user_cannot_open_modal() {
+    let store = scoped_store("m", &["user9"], false);
+    let api = MockDiscordApi::new();
+    handle_interaction(&api, &store, &text_button_payload("m"), NOW)
+        .await
+        .unwrap();
+    assert_ephemeral_rejection(&api, &store, "m");
+}
+
+#[tokio::test]
+async fn allowed_user_can_open_modal() {
+    let store = scoped_store("m", &["user1"], false);
+    let api = MockDiscordApi::new();
+    handle_interaction(&api, &store, &text_button_payload("m"), NOW)
+        .await
+        .unwrap();
+    assert_eq!(api.interaction_calls.borrow()[0].2["type"], 9);
+}
+
+#[tokio::test]
+async fn disallowed_user_modal_submit_is_not_adopted() {
+    let store = scoped_store("m", &["user9"], false);
+    let api = MockDiscordApi::new();
+    handle_interaction(&api, &store, &modal_submit_payload("m", "hi"), NOW)
+        .await
+        .unwrap();
+    assert_ephemeral_rejection(&api, &store, "m");
+}
+
+#[tokio::test]
+async fn allowed_user_modal_submit_is_adopted() {
+    let store = scoped_store("m", &["user1"], false);
+    let api = MockDiscordApi::new();
+    handle_interaction(&api, &store, &modal_submit_payload("m", "hi"), NOW)
+        .await
+        .unwrap();
+    let record = store.get_ask("m").unwrap().unwrap();
+    assert_eq!(record.kind.as_deref(), Some("text"));
+    assert_eq!(record.value.as_deref(), Some("hi"));
+}
+
+#[tokio::test]
+async fn multi_select_adopts_labels_as_json_array() {
+    let store = scoped_store("m", &[], true);
+    let api = MockDiscordApi::new();
+    handle_interaction(&api, &store, &select_payload("m", &["0", "2"]), NOW)
+        .await
+        .unwrap();
+    let record = store.get_ask("m").unwrap().unwrap();
+    assert_eq!(record.kind.as_deref(), Some("multi_choice"));
+    assert_eq!(record.value.as_deref(), Some(r#"["A","C"]"#));
+    let calls = api.interaction_calls.borrow();
+    assert_eq!(calls[0].2["type"], 7);
+    assert_eq!(calls[0].2["data"]["components"], serde_json::json!([]));
+}
+
+#[tokio::test]
+async fn disallowed_user_select_is_not_adopted() {
+    let store = scoped_store("m", &["user9"], true);
+    let api = MockDiscordApi::new();
+    handle_interaction(&api, &store, &select_payload("m", &["0"]), NOW)
+        .await
+        .unwrap();
+    assert_ephemeral_rejection(&api, &store, "m");
+}
+
+#[tokio::test]
+async fn select_with_out_of_range_or_empty_values_is_not_adopted() {
+    for values in [&["7"][..], &[][..], &["x"][..]] {
+        let store = scoped_store("m", &[], true);
+        let api = MockDiscordApi::new();
+        handle_interaction(&api, &store, &select_payload("m", values), NOW)
+            .await
+            .unwrap();
+        assert_ephemeral_rejection(&api, &store, "m");
+    }
+}
+
+#[tokio::test]
+async fn select_against_single_choice_ask_is_rejected() {
+    let store = scoped_store("m", &[], false);
+    let api = MockDiscordApi::new();
+    handle_interaction(&api, &store, &select_payload("m", &["0"]), NOW)
+        .await
+        .unwrap();
+    assert_ephemeral_rejection(&api, &store, "m");
+}
+
+#[tokio::test]
+async fn choice_button_against_multi_select_ask_is_rejected() {
+    let store = scoped_store("m", &[], true);
+    let api = MockDiscordApi::new();
+    handle_interaction(&api, &store, &choice_payload("m", 0), NOW)
+        .await
+        .unwrap();
+    assert_ephemeral_rejection(&api, &store, "m");
+}
+
+#[tokio::test]
+async fn select_without_values_fails_fast() {
+    let store = scoped_store("m", &[], true);
+    let api = MockDiscordApi::new();
+    let mut payload = select_payload("m", &["0"]);
+    payload["data"].as_object_mut().unwrap().remove("values");
+    let err = handle_interaction(&api, &store, &payload, NOW)
+        .await
+        .expect_err("a select payload without values is a contract violation");
+    assert_eq!(err.kind, crate::common::error::ErrorKind::Internal);
+}
+
+#[test]
+fn parse_custom_id_recognizes_select() {
+    assert_eq!(
+        parse_custom_id("ask:123:sel"),
+        Some(CustomId::Select {
+            ask_id: "123".to_owned()
+        })
+    );
 }

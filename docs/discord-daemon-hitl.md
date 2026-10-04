@@ -57,9 +57,11 @@ DB 파일: `~/.areum/discord/discord.db` (WAL 모드).
 | `question` | TEXT NOT NULL | 질문 본문 |
 | `options` | TEXT NOT NULL | 선택지 목록 (JSON 배열) |
 | `allow_text` | INTEGER NOT NULL | 자유 텍스트 응답 허용 여부 (0/1) |
+| `allowed_users` | TEXT NOT NULL | 답으로 채택할 Discord 유저 id 목록 (JSON 배열). `[]`이면 누구나 답할 수 있다 (스키마 v2) |
+| `multi_select` | INTEGER NOT NULL | 1이면 select menu로 복수 선택을 받는다 (0/1, 스키마 v2) |
 | `status` | TEXT NOT NULL | `pending` \| `answered` \| `timed_out` |
-| `kind` | TEXT NOT NULL | `choice` \| `text` — 실제로 채택된 응답의 종류 |
-| `value` | TEXT NULL | 채택된 응답 값 (선택지 텍스트 또는 자유 텍스트) |
+| `kind` | TEXT NULL | `choice` \| `multi_choice` \| `text` — 실제로 채택된 응답의 종류 |
+| `value` | TEXT NULL | 채택된 응답 값. `choice`는 선택지 텍스트, `text`는 자유 텍스트, `multi_choice`는 선택된 선택지 텍스트의 JSON 배열 문자열 (예: `["A","C"]`) |
 | `answered_by` | TEXT NULL | 응답한 Discord 유저 id |
 | `created_at` | TEXT NOT NULL | 생성 시각 (RFC3339) |
 | `timeout_at` | TEXT NOT NULL | 마감 시각 (RFC3339) |
@@ -69,9 +71,16 @@ DB 파일: `~/.areum/discord/discord.db` (WAL 모드).
 
 `status`/`kind`/`value`/`answered_by`/`answered_at`는 생성 시 `status='pending'`, 나머지 NULL로 시작해 첫 응답 또는 타임아웃 시 채워진다.
 
+허용 목록(`allowed_users`)은 클라이언트가 보낸 값이 아니라 이 저장된 레코드를 기준으로 데몬이 판정한다 (`allow_text` 판정과 같은 원칙).
+
 ### `schema_version` 테이블
 
-단일 행으로 현재 스키마 버전을 기록한다. 데몬 기동 시 이 값을 읽어 필요한 마이그레이션(있다면)을 적용한 뒤 갱신한다. SP3/SP4는 새 테이블을 추가하면서 이 버전을 올리는 방식으로 확장한다.
+단일 행으로 현재 스키마 버전을 기록한다. `AskStore::open`이 열 때마다 이 값을 읽어 필요한 마이그레이션을 적용한 뒤 갱신한다. SP3/SP4는 새 테이블을 추가하면서 이 버전을 올리는 방식으로 확장한다.
+
+| 버전 | 변경 |
+|---|---|
+| 1 | `asks` 테이블 생성 |
+| 2 | `asks.allowed_users TEXT NOT NULL DEFAULT '[]'`, `asks.multi_select INTEGER NOT NULL DEFAULT 0` 추가 (`ALTER TABLE`). v1 행은 "누구나 답할 수 있는 단일 선택"으로 그대로 동작한다 |
 
 ### 보존 정책 (retention)
 
@@ -87,8 +96,10 @@ DB 파일: `~/.areum/discord/discord.db` (WAL 모드).
    - 전송 성공 시 반환된 메시지 id를 `ask_id`로 `asks`에 `status='pending'` INSERT.
    - CLI는 결과를 기다리지 않고 `ask_id`를 즉시 반환한다(비동기 생성).
 2. **버튼 클릭**: 사람이 Discord 클라이언트에서 버튼을 누르면 Discord가 `INTERACTION_CREATE`를 게이트웨이로 데몬에 전달한다.
-   - `custom_id`를 파싱한다: `ask:<ask_id>:opt:<index>` (선택지 응답) 또는 `ask:<ask_id>:text` (자유 텍스트 모달 오픈 트리거).
+   - `custom_id`를 파싱한다: `ask:<ask_id>:opt:<index>` (선택지 응답), `ask:<ask_id>:sel` (multiSelect select menu), `ask:<ask_id>:text` (자유 텍스트 모달 오픈 트리거).
+   - **허용 사용자 판정**: 어떤 상호작용이든(버튼 클릭·select 선택·모달 열기·모달 제출) 레코드의 `allowed_users`가 비어 있지 않고 누른 사람의 id가 거기 없으면 채택하지 않는다. ephemeral로 "이 질문에 답할 수 있는 사용자가 아닙니다."를 안내하고 질문은 `pending`으로 남는다. 판정은 `try_answer`보다 먼저, 저장된 레코드만으로 한다.
    - **선택지 응답**: `daemon/interactions.rs`가 `UPDATE asks SET status='answered', kind='choice', value=<option>, answered_by=<user_id>, answered_at=<now> WHERE ask_id=? AND status='pending'` 조건부 UPDATE를 수행한다. 영향받은 행이 1이면 **첫 응답으로 채택**된 것 — 3초 내에 `UPDATE_MESSAGE`(interaction response type 7)로 버튼을 비활성화한 확인 메시지를 회신한다.
+   - **복수 선택**: `multi_select` 질문은 select menu 하나로 선택지를 보여 준다. 사람이 메뉴에서 선택을 확정하면(`values` = 선택지 인덱스 문자열 배열) 선택된 라벨을 JSON 배열로 직렬화해 `kind='multi_choice'`로 같은 조건부 UPDATE를 수행한다. 빈 선택이나 범위를 벗어난 인덱스는 채택하지 않고 ephemeral로 안내한다. 레코드가 `multi_select`가 아닌데 select가 오거나, `multi_select`인데 `opt:` 버튼이 오면 위조/오래된 컴포넌트로 보고 같은 방식으로 거부한다.
    - **자유 텍스트**: `ask:<ask_id>:text` 트리거를 받으면 `MODAL`(type 9) 응답으로 텍스트 입력 모달을 띄운다. 사용자가 제출하면 별도의 `MODAL_SUBMIT` interaction이 도착하고, 동일한 조건부 UPDATE(`kind='text'`)로 첫 제출을 채택한 뒤 확인 응답을 보낸다.
    - **마감 후 클릭**: 조건부 UPDATE의 영향 행이 0이면(이미 `answered` 또는 `timed_out`) 채택하지 않는다 — ephemeral 메시지(`flags: 64`)로 "이미 마감/응답됨"을 안내한다.
    - 이 조건부 UPDATE(`WHERE status='pending'`)가 동시 클릭에 대한 **유일한 동시성 해소 지점**이다 — 먼저 SQLite에 반영된 트랜잭션이 이긴다.
@@ -107,8 +118,9 @@ discord daemon start [--foreground]     # 데몬 기동 (기본: 백그라운드
 discord daemon stop                     # pidfile 기준으로 시그널을 보내 종료
 discord daemon status                   # pidfile + 프로세스 생존 여부 조회
 
-discord ask create <CHANNEL> <QUESTION> [--option <TEXT>]... [--allow-text] [--timeout <SECS>]
-                                         # 버튼 메시지 전송 + asks INSERT, ask_id 즉시 반환
+discord ask create <CHANNEL> <QUESTION> [--option <TEXT>]... [--allow-text]
+                   [--allowed-user <USER_ID>]... [--multi-select] [--timeout <SECS>]
+                                         # 버튼(또는 select menu) 메시지 전송 + asks INSERT, ask_id 즉시 반환
                                          # 데몬 미기동 시 즉시 에러(Fail Fast)
 discord ask result <ASK_ID>             # asks 1회 SELECT, 현재 상태 반환
 discord ask wait <ASK_ID> [--timeout <SECS>] [--interval <SECS>]
@@ -119,7 +131,22 @@ discord ask wait <ASK_ID> [--timeout <SECS>] [--interval <SECS>]
 - `<CHANNEL>`은 기존 `send`/`read`/`wait`와 동일하게 raw channel id 또는 config alias.
 - `--option`은 반복 지정해 선택지 목록(JSON 배열로 저장)을 구성한다.
 - `--allow-text`를 주면 버튼 응답 외에 자유 텍스트(모달) 응답도 허용한다.
-- `custom_id` 값은 100자 한도 내에서 `ask:<ask_id>:opt:<index>` 또는 `ask:<ask_id>:text` 규약을 따른다.
+- `--allowed-user`를 반복 지정하면 그 Discord 유저 id들만 답으로 채택한다(숫자 id만 허용, 아니면 생성 거부). 지정하지 않으면 누구나 답할 수 있다.
+- `--multi-select`를 주면 선택지를 버튼 대신 select menu(`min_values=1`, `max_values=선택지 수`)로 보여 준다. 선택지는 1~25개, 라벨은 100자 이하여야 하며 위반하면 메시지를 보내기 전에 거부한다(Fail Fast). 단일 선택(버튼)의 한도(1~4개, 라벨 80자)는 그대로다.
+- `--multi-select`와 `--allow-text`는 함께 쓸 수 있다. select는 action row 하나를 통째로 쓰므로 직접 입력 버튼은 둘째 row에 놓인다. 어느 쪽이든 먼저 채택된 답이 이긴다.
+- `custom_id` 값은 100자 한도 내에서 `ask:<ask_id>:opt:<index>`, `ask:<ask_id>:sel`, `ask:<ask_id>:text` 규약을 따른다.
+
+### 결과 `value` 형식 (`ask result` / `ask wait`)
+
+`kind`에 따라 `value`의 JSON 타입이 다르다. 단일 선택·텍스트의 기존 출력은 바뀌지 않는다.
+
+| `kind` | `value` | 예 |
+|---|---|---|
+| `choice` | 문자열 | `"yes"` |
+| `text` | 문자열 | `"직접 쓴 답"` |
+| `multi_choice` | 문자열 배열 (Discord가 보낸 `values` 순서 그대로 — 정렬 보장은 미확인) | `["A","C"]` |
+
+사람용 출력은 `multi_choice`를 `A, C`처럼 쉼표로 이어 붙인다.
 
 ---
 
@@ -157,6 +184,7 @@ tools/discord/src/
   - 이 상태 머신(Resume/재접속/backoff)은 `twilight-gateway` 라이브러리가 내부적으로 담당한다. 우리 코드(`daemon/gateway.rs`)는 재시도 불가 close code를 받았을 때 데몬을 종료 처리하는 부분만 책임진다.
 - `custom_id`는 1~100자, 하나의 action row에 버튼은 최대 5개까지 배치할 수 있다. — https://docs.discord.com/developers/components/reference
 - 모달의 Text Input은 현재 `Label`(component type 18)로 감싸는 방식이 표준이며, 구 Action Row로 감싸는 방식은 deprecated 상태다. **이 부분은 구현 중 실제 API 호출로 검증이 필요한 항목으로 별도 표시한다** (§9). — https://docs.discord.com/developers/components/reference
+- String select menu: 선택지 최대 25개, `min_values` 0~25(기본 1), `max_values` 최대 25(기본 1), 선택지 label·value 각 100자 이하, `custom_id` 1~100자. action row 하나에는 버튼 최대 5개 **또는** select 하나만 들어간다(select끼리·select와 버튼은 한 row에 못 둔다). select 상호작용 payload는 `component_type: 3`과 선택된 value 문자열 배열 `values`를 담는다. — https://docs.discord.com/developers/components/reference
 - 게이트웨이 명령 전송에는 60초당 120개의 rate limit이 적용된다. — https://docs.discord.com/developers/events/gateway
 
 ---
@@ -164,6 +192,9 @@ tools/discord/src/
 ## 8. 테스트 전략
 
 - **단위 테스트**: `daemon/interactions.rs`는 웹소켓 없이 순수 함수로 테스트한다 — INTERACTION_CREATE 이벤트에 대응하는 JSON(또는 그 파싱 결과 구조체)을 입력으로 주고, DB 상태 변화와 반환되는 REST 응답 페이로드를 검증한다. 조건부 UPDATE의 동시성 해소(먼저 온 요청만 채택)를 케이스로 다룬다.
+  - 허용 사용자: 허용 사용자 클릭 채택 / 비허용 사용자 클릭은 미채택 + ephemeral + `pending` 유지 / 미지정 시 누구나 / 모달 열기·제출에도 같은 규칙.
+  - multiSelect: select 선택이 JSON 배열로 저장됨 / 빈 선택·범위 밖 인덱스·단일 선택 질문에 온 select·multi 질문에 온 버튼은 미채택 / `ask result`·`ask wait`가 배열 `value`를 출력 / 선택지 25개 초과·라벨 100자 초과는 생성 시 거부.
+  - 스키마: v1 DB(컬럼 없음)를 열면 v2로 마이그레이션되고 기존 행이 보존된다.
 - **mock 웹소켓**: `daemon/gateway.rs`는 `twilight-gateway`의 Shard 루프를 감싸는 얇은 래퍼이므로, 실제 연결 대신 이벤트를 주입할 수 있는 목/페이크 소스로 이벤트 수신 → `daemon/interactions.rs` 호출 배선을 검증한다. 게이트웨이 연결·재접속 자체(twilight 라이브러리 책임)는 이 레벨에서 재검증하지 않는다.
 - **라이브 E2E**: 실제 Discord 앱/봇 토큰으로 데몬을 기동하고 `ask create` → 실제 버튼 클릭 → `ask result`/`ask wait`까지 왕복하는 시나리오를 수동 또는 별도 게이트로 분리해 실행한다. 단위/mock 테스트와는 디렉토리 또는 실행 방식으로 분리해, 일반 CI 실행에는 포함하지 않는다.
 
