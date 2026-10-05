@@ -9,6 +9,8 @@ fn sample_ask(ask_id: &str, timeout_at: &str) -> NewAsk {
         question: "proceed?".to_owned(),
         options: vec!["yes".to_owned(), "no".to_owned()],
         allow_text: true,
+        allowed_users: vec![],
+        multi_select: false,
         created_at: "2024-01-01T00:00:00Z".to_owned(),
         timeout_at: timeout_at.to_owned(),
     }
@@ -825,4 +827,62 @@ fn cleanup_rejects_malformed_now() {
         .cleanup(30, "garbage")
         .expect_err("malformed now must fail fast, not silently delete nothing");
     assert_eq!(err.kind, ErrorKind::Internal);
+}
+
+#[test]
+fn allowed_users_and_multi_select_roundtrip() {
+    let store = AskStore::open_in_memory().unwrap();
+    let mut ask = sample_ask("scoped", "2024-01-01T01:00:00Z");
+    ask.allowed_users = vec!["u1".to_owned(), "u2".to_owned()];
+    ask.multi_select = true;
+    store.insert_ask(ask).unwrap();
+
+    let record = store.get_ask("scoped").unwrap().unwrap();
+    assert_eq!(record.allowed_users, vec!["u1".to_owned(), "u2".to_owned()]);
+    assert!(record.multi_select);
+}
+
+/// A DB written by a binary that only knew schema v1 (no allow-list / multi
+/// columns) must open, keep its rows readable with "anyone / single choice"
+/// semantics, and accept new-style inserts.
+#[test]
+fn open_migrates_v1_database_preserving_rows() {
+    let dir = unique_store_dir("migrate-v1");
+    let db_path = dir.join("discord.db");
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let conn = Connection::open(&db_path).unwrap();
+    conn.execute_batch("CREATE TABLE schema_version (version INTEGER NOT NULL)")
+        .unwrap();
+    conn.execute_batch(CREATE_ASKS_SQL).unwrap();
+    conn.execute_batch("INSERT INTO schema_version (version) VALUES (1)")
+        .unwrap();
+    conn.execute_batch(
+        "INSERT INTO asks (
+            ask_id, channel_id, question, options, allow_text,
+            status, created_at, timeout_at
+         ) VALUES ('old', 'c', 'q', '[\"a\",\"b\"]', 1,
+            'pending', '2024-01-01T00:00:00Z', '2024-01-01T01:00:00Z')",
+    )
+    .unwrap();
+    drop(conn);
+
+    let store = AskStore::open(&db_path).unwrap();
+    let old = store.get_ask("old").unwrap().unwrap();
+    assert!(old.allowed_users.is_empty());
+    assert!(!old.multi_select);
+    assert_eq!(old.options, vec!["a".to_owned(), "b".to_owned()]);
+
+    let mut fresh = sample_ask("new", "2024-01-01T01:00:00Z");
+    fresh.allowed_users = vec!["u1".to_owned()];
+    store.insert_ask(fresh).unwrap();
+    assert_eq!(
+        store.get_ask("new").unwrap().unwrap().allowed_users,
+        vec!["u1".to_owned()]
+    );
+
+    drop(store);
+    // Re-opening a migrated DB is a no-op, not a second ALTER.
+    AskStore::open(&db_path).unwrap();
+    std::fs::remove_dir_all(&dir).ok();
 }

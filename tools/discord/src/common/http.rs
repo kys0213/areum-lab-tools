@@ -3,7 +3,8 @@ use std::time::Duration;
 use serde::de::DeserializeOwned;
 
 use crate::common::api::{
-    CreateThreadRequest, CreatedThread, DiscordApi, FilePart, Message, SendRequest, SentMessage,
+    ChannelInfo, CreateThreadRequest, CreatedThread, DiscordApi, FilePart, Message, SendRequest,
+    SentMessage,
 };
 use crate::common::error::{AppError, ErrorKind};
 
@@ -221,6 +222,16 @@ impl DiscordApi for HttpDiscordApi {
             .json(&serde_json::json!({ "components": components }));
         self.execute_unit(request).await
     }
+
+    async fn get_channel(&self, channel_id: &str) -> Result<ChannelInfo, AppError> {
+        let url = get_channel_url(&self.base_url, channel_id);
+        let request = self.authorized(self.client.get(url));
+        self.execute(request).await
+    }
+}
+
+fn get_channel_url(base_url: &str, channel_id: &str) -> String {
+    format!("{base_url}/channels/{channel_id}")
 }
 
 fn interaction_callback_url(base_url: &str, interaction_id: &str, token: &str) -> String {
@@ -704,6 +715,14 @@ mod tests {
         assert_eq!(
             create_thread_url(API_BASE, &req),
             "https://discord.com/api/v10/channels/123/messages/456/threads"
+        );
+    }
+
+    #[test]
+    fn get_channel_url_targets_channel_endpoint() {
+        assert_eq!(
+            get_channel_url("https://example.test/api", "123"),
+            "https://example.test/api/channels/123"
         );
     }
 

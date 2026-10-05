@@ -19,6 +19,8 @@ fn sample_request() -> AskCreateRequest {
         question: "proceed?".to_owned(),
         options: vec!["yes".to_owned(), "no".to_owned()],
         allow_text: true,
+        allowed_users: vec![],
+        multi_select: false,
         timeout_secs: 60,
     }
 }
@@ -297,6 +299,194 @@ fn create_accepts_four_options_with_allow_text() {
     assert!(validate_ask_create(&req).is_ok());
 }
 
+// --- allowed users + multi-select ---------------------------------------------
+
+fn many_options(count: usize) -> Vec<String> {
+    (0..count).map(|i| format!("opt{i}")).collect()
+}
+
+#[tokio::test]
+async fn create_persists_allowed_users_and_multi_flag() {
+    let db_path = unique_db_path("create-scoped");
+    let api = MockDiscordApi::new();
+    api.send_responses
+        .borrow_mut()
+        .push_back(Ok(sent_message("600", "chan-1")));
+    let mut req = sample_request();
+    req.allowed_users = vec!["111".to_owned(), "222".to_owned()];
+    req.multi_select = true;
+
+    run_ask_create(&api, &db_path, daemon_up, &req)
+        .await
+        .unwrap();
+
+    let record = AskStore::open(&db_path)
+        .unwrap()
+        .get_ask("600")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        record.allowed_users,
+        vec!["111".to_owned(), "222".to_owned()]
+    );
+    assert!(record.multi_select);
+
+    std::fs::remove_dir_all(db_path.parent().unwrap()).ok();
+}
+
+#[tokio::test]
+async fn create_multi_select_sends_select_menu_with_text_button_row() {
+    let db_path = unique_db_path("create-multi");
+    let api = MockDiscordApi::new();
+    api.send_responses
+        .borrow_mut()
+        .push_back(Ok(sent_message("601", "chan-1")));
+    let mut req = sample_request();
+    req.multi_select = true;
+    req.allow_text = true;
+
+    run_ask_create(&api, &db_path, daemon_up, &req)
+        .await
+        .unwrap();
+
+    let edits = api.edit_components_calls.borrow();
+    assert_eq!(
+        edits[0].2,
+        serde_json::json!([
+            {
+                "type": 1,
+                "components": [{
+                    "type": 3,
+                    "custom_id": "ask:601:sel",
+                    "options": [
+                        { "label": "yes", "value": "0" },
+                        { "label": "no", "value": "1" },
+                    ],
+                    "min_values": 1,
+                    "max_values": 2,
+                }]
+            },
+            {
+                "type": 1,
+                "components": [
+                    { "type": 2, "style": 2, "label": "✏️ 직접 입력", "custom_id": "ask:601:text" }
+                ]
+            }
+        ])
+    );
+
+    std::fs::remove_dir_all(db_path.parent().unwrap()).ok();
+}
+
+#[test]
+fn multi_select_accepts_up_to_25_options_and_rejects_26() {
+    let mut req = sample_request();
+    req.multi_select = true;
+    req.options = many_options(25);
+    assert!(validate_ask_create(&req).is_ok());
+    req.options = many_options(26);
+    assert_eq!(
+        validate_ask_create(&req).unwrap_err().kind,
+        ErrorKind::Usage
+    );
+}
+
+#[test]
+fn single_select_still_caps_at_four_options() {
+    let mut req = sample_request();
+    req.options = many_options(5);
+    assert_eq!(
+        validate_ask_create(&req).unwrap_err().kind,
+        ErrorKind::Usage
+    );
+}
+
+#[test]
+fn multi_select_label_cap_is_100_chars() {
+    let mut req = sample_request();
+    req.multi_select = true;
+    req.options = vec!["x".repeat(100)];
+    assert!(validate_ask_create(&req).is_ok());
+    req.options = vec!["x".repeat(101)];
+    assert_eq!(
+        validate_ask_create(&req).unwrap_err().kind,
+        ErrorKind::Usage
+    );
+}
+
+#[test]
+fn allowed_user_must_be_numeric_id() {
+    let mut req = sample_request();
+    req.allowed_users = vec!["123".to_owned()];
+    assert!(validate_ask_create(&req).is_ok());
+    for bad in ["", "abc", "12 3", "<@123>"] {
+        req.allowed_users = vec![bad.to_owned()];
+        assert_eq!(
+            validate_ask_create(&req).unwrap_err().kind,
+            ErrorKind::Usage
+        );
+    }
+}
+
+#[tokio::test]
+async fn rejected_multi_select_request_sends_nothing() {
+    let db_path = unique_db_path("create-multi-too-many");
+    let api = MockDiscordApi::new();
+    let mut req = sample_request();
+    req.multi_select = true;
+    req.options = many_options(26);
+
+    let err = run_ask_create(&api, &db_path, daemon_up, &req)
+        .await
+        .unwrap_err();
+    assert_eq!(err.kind, ErrorKind::Usage);
+    assert_eq!(api.send_calls.borrow().len(), 0);
+}
+
+#[tokio::test]
+async fn multi_choice_answer_surfaces_as_array_in_result_and_wait() {
+    let db_path = unique_db_path("multi-result");
+    let store = AskStore::open(&db_path).unwrap();
+    let mut ask = sample_ask("ask-m", "2999-01-01T00:00:00Z");
+    ask.multi_select = true;
+    store.insert_ask(ask).unwrap();
+    store
+        .try_answer(
+            "ask-m",
+            "multi_choice",
+            r#"["yes","no"]"#,
+            "u1",
+            "2024-01-01T00:00:10Z",
+        )
+        .unwrap();
+    drop(store);
+
+    let expected = AskResultData::Answered {
+        ask_id: "ask-m".into(),
+        kind: "multi_choice".into(),
+        value: serde_json::json!(["yes", "no"]),
+        answered_by: "u1".into(),
+        answered_at: "2024-01-01T00:00:10Z".into(),
+    };
+    assert_eq!(
+        run_ask_result(&db_path, "ask-m").unwrap(),
+        Payload::AskResult(expected.clone())
+    );
+    let sleeper = FakeSleeper::new();
+    match run_ask_wait(&db_path, &sleeper, "ask-m", 10, 1)
+        .await
+        .unwrap()
+    {
+        Payload::AskWait(d) => {
+            assert!(!d.timed_out);
+            assert_eq!(d.result, expected);
+        }
+        other => panic!("expected AskWait, got {other:?}"),
+    }
+
+    std::fs::remove_dir_all(db_path.parent().unwrap()).ok();
+}
+
 // --- ask result ----------------------------------------------------------
 
 #[test]
@@ -382,6 +572,8 @@ fn sample_ask(ask_id: &str, timeout_at: &str) -> NewAsk {
         question: "proceed?".to_owned(),
         options: vec!["yes".to_owned(), "no".to_owned()],
         allow_text: true,
+        allowed_users: vec![],
+        multi_select: false,
         created_at: "2024-01-01T00:00:00Z".to_owned(),
         timeout_at: timeout_at.to_owned(),
     }

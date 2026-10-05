@@ -49,6 +49,8 @@ enum CustomId {
     /// `ask:<ask_id>:text` — the free-text button (opens a modal) and the
     /// modal's own custom_id (arrives again on submit).
     Text { ask_id: String },
+    /// `ask:<ask_id>:sel` — the multi-select menu.
+    Select { ask_id: String },
 }
 
 /// Parses the `ask:` custom_id convention. Returns `None` for any id that is
@@ -60,6 +62,11 @@ fn parse_custom_id(custom_id: &str) -> Option<CustomId> {
     let (ask_id, tail) = rest.split_once(':')?;
     if ask_id.is_empty() {
         return None;
+    }
+    if tail == "sel" {
+        return Some(CustomId::Select {
+            ask_id: ask_id.to_owned(),
+        });
     }
     if tail == "text" {
         return Some(CustomId::Text {
@@ -106,6 +113,9 @@ pub(crate) async fn handle_interaction(
     match (kind, parsed) {
         (TYPE_MESSAGE_COMPONENT, CustomId::Choice { ask_id, index }) => {
             handle_choice(api, store, &ctx, &ask_id, index).await
+        }
+        (TYPE_MESSAGE_COMPONENT, CustomId::Select { ask_id }) => {
+            handle_select(api, store, &ctx, &ask_id).await
         }
         (TYPE_MESSAGE_COMPONENT, CustomId::Text { ask_id }) => {
             handle_open_modal(api, store, &ctx, &ask_id).await
@@ -242,10 +252,16 @@ async fn handle_choice(
     let Some(record) = store.get_ask(ask_id)? else {
         return respond(api, ctx, &ephemeral("존재하지 않는 질문입니다.")).await;
     };
+    let user_id = interaction_user_id(ctx.payload)?;
+    if let Some(rejection) = reject_unauthorized(&record, &user_id) {
+        return respond(api, ctx, &rejection).await;
+    }
+    if record.multi_select {
+        return respond(api, ctx, &ephemeral(NOT_SINGLE_CHOICE)).await;
+    }
     let Some(label) = record.options.get(index) else {
         return respond(api, ctx, &ephemeral("알 수 없는 선택지입니다.")).await;
     };
-    let user_id = interaction_user_id(ctx.payload)?;
     // 3-second rule: the local winner check happens before the callback.
     let won = store.try_answer(ask_id, "choice", label, &user_id, ctx.now)?;
     let response = if won {
@@ -254,6 +270,72 @@ async fn handle_choice(
         ephemeral("이미 마감된 질문입니다.")
     };
     respond(api, ctx, &response).await
+}
+
+async fn handle_select(
+    api: &impl DiscordApi,
+    store: &AskStore,
+    ctx: &Ctx<'_>,
+    ask_id: &str,
+) -> Result<(), AppError> {
+    let Some(record) = store.get_ask(ask_id)? else {
+        return respond(api, ctx, &ephemeral("존재하지 않는 질문입니다.")).await;
+    };
+    let user_id = interaction_user_id(ctx.payload)?;
+    if let Some(rejection) = reject_unauthorized(&record, &user_id) {
+        return respond(api, ctx, &rejection).await;
+    }
+    // The menu is only attached to multi-select asks; the record, not the
+    // client's component set, decides.
+    if !record.multi_select {
+        return respond(api, ctx, &ephemeral(NOT_MULTI_SELECT)).await;
+    }
+    let Some(labels) = selected_labels(ctx.payload, &record.options)? else {
+        return respond(api, ctx, &ephemeral("알 수 없는 선택지입니다.")).await;
+    };
+    let value = serde_json::to_string(&labels).map_err(|e| {
+        AppError::new(
+            ErrorKind::Internal,
+            format!("failed to serialize selected options: {e}"),
+        )
+    })?;
+    let won = store.try_answer(ask_id, "multi_choice", &value, &user_id, ctx.now)?;
+    let response = if won {
+        update_message_resolved(&format!("선택됨: {}", labels.join(", ")))
+    } else {
+        ephemeral("이미 마감된 질문입니다.")
+    };
+    respond(api, ctx, &response).await
+}
+
+/// Maps the submitted select `values` (option indices as strings) to labels.
+/// A missing/non-array `values` is a payload contract violation (fail fast);
+/// an empty selection or an index outside the record's options is a not-adopted
+/// outcome (`None`) — it can only come from a forged or stale component.
+fn selected_labels(
+    payload: &serde_json::Value,
+    options: &[String],
+) -> Result<Option<Vec<String>>, AppError> {
+    let values = payload
+        .get("data")
+        .and_then(|d| d.get("values"))
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| AppError::new(ErrorKind::Internal, "select payload missing values"))?;
+    if values.is_empty() {
+        return Ok(None);
+    }
+    let mut labels = Vec::with_capacity(values.len());
+    for raw in values {
+        let label = raw
+            .as_str()
+            .and_then(|v| v.parse::<usize>().ok())
+            .and_then(|index| options.get(index));
+        match label {
+            Some(label) => labels.push(label.clone()),
+            None => return Ok(None),
+        }
+    }
+    Ok(Some(labels))
 }
 
 async fn handle_open_modal(
@@ -278,6 +360,10 @@ async fn handle_open_modal(
             &ephemeral("텍스트 응답이 허용되지 않는 질문입니다."),
         )
         .await;
+    }
+    let user_id = interaction_user_id(ctx.payload)?;
+    if let Some(rejection) = reject_unauthorized(&record, &user_id) {
+        return respond(api, ctx, &rejection).await;
     }
     // Opening the modal adopts no answer; the MODAL_SUBMIT `try_answer` is the
     // authoritative concurrency point, so a race that resolves the ask between
@@ -305,13 +391,16 @@ async fn handle_modal_submit(
         )
         .await;
     }
+    let user_id = interaction_user_id(ctx.payload)?;
+    if let Some(rejection) = reject_unauthorized(&record, &user_id) {
+        return respond(api, ctx, &rejection).await;
+    }
     let value = extract_modal_text(ctx.payload.get("data")).ok_or_else(|| {
         AppError::new(
             ErrorKind::Internal,
             "modal submit payload missing text input value",
         )
     })?;
-    let user_id = interaction_user_id(ctx.payload)?;
     let won = store.try_answer(ask_id, "text", &value, &user_id, ctx.now)?;
     let response = if won {
         // A modal opened from a message component can UPDATE_MESSAGE the
@@ -322,6 +411,26 @@ async fn handle_modal_submit(
         ephemeral("이미 마감된 질문입니다.")
     };
     respond(api, ctx, &response).await
+}
+
+const NOT_ALLOWED_USER: &str = "이 질문에 답할 수 있는 사용자가 아닙니다.";
+const NOT_SINGLE_CHOICE: &str = "복수 선택 질문입니다. 선택 메뉴를 사용해 주세요.";
+const NOT_MULTI_SELECT: &str = "복수 선택이 허용되지 않는 질문입니다.";
+
+/// Ephemeral rejection when the ask carries an allow-list that excludes
+/// `user_id`. Judged from the stored record only — never from anything the
+/// client sent. An empty list means anyone may answer.
+fn reject_unauthorized(
+    record: &crate::common::store::AskRecord,
+    user_id: &str,
+) -> Option<serde_json::Value> {
+    let restricted = !record.allowed_users.is_empty();
+    (restricted
+        && !record
+            .allowed_users
+            .iter()
+            .any(|allowed| allowed == user_id))
+    .then(|| ephemeral(NOT_ALLOWED_USER))
 }
 
 /// Sends the interaction-response callback. By design this runs *after* any

@@ -40,6 +40,11 @@ pub(crate) trait DiscordApi {
         message_id: &str,
         components: &serde_json::Value,
     ) -> Result<(), AppError>;
+
+    /// Fetches a channel via `GET /channels/{channel_id}` — the daemon's
+    /// message trigger uses it to tell a thread from a top-level channel,
+    /// which a gateway `MESSAGE_CREATE` payload does not say.
+    async fn get_channel(&self, channel_id: &str) -> Result<ChannelInfo, AppError>;
 }
 
 /// A file to upload as a message attachment. `bytes` is [`bytes::Bytes`] (an
@@ -133,9 +138,35 @@ pub struct CreatedThread {
     pub name: String,
 }
 
+/// A Discord channel object narrowed to what thread detection needs. `kind`
+/// is the raw channel type number (`type` on the wire); `parent_id` is the
+/// parent channel of a thread, absent or null for many top-level channels.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct ChannelInfo {
+    pub id: String,
+    #[serde(rename = "type")]
+    pub kind: u8,
+    #[serde(default)]
+    pub parent_id: Option<String>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn channel_info_deserializes_thread_with_parent() {
+        let json = r#"{"id": "t1", "type": 11, "parent_id": "c1", "name": "x"}"#;
+        let info: ChannelInfo = serde_json::from_str(json).unwrap();
+        assert_eq!(info.kind, 11);
+        assert_eq!(info.parent_id.as_deref(), Some("c1"));
+    }
+
+    #[test]
+    fn channel_info_deserializes_without_parent_id() {
+        let info: ChannelInfo = serde_json::from_str(r#"{"id": "c1", "type": 0}"#).unwrap();
+        assert_eq!(info.parent_id, None);
+    }
 
     #[test]
     fn message_deserializes_with_empty_content() {

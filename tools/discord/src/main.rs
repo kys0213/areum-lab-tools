@@ -58,20 +58,35 @@ async fn run(cli: Cli) -> Result<Payload, AppError> {
             text,
             reply_to,
             files,
+            split,
         } => {
             let (api, channels) = authenticated_api(&config_path, cli.token.as_deref())?;
             let channel_id = config::resolve_channel(&channel, &channels);
-            commands::run_send(
-                &api,
-                &channel_id,
-                body.as_deref(),
-                text.as_deref(),
-                reply_to.as_deref(),
-                &files,
-                read_stdin,
-                |p| std::fs::read(p),
-            )
-            .await
+            if split {
+                commands::run_send_split(
+                    &api,
+                    &channel_id,
+                    body.as_deref(),
+                    text.as_deref(),
+                    reply_to.as_deref(),
+                    &files,
+                    read_stdin,
+                    |p| std::fs::read(p),
+                )
+                .await
+            } else {
+                commands::run_send(
+                    &api,
+                    &channel_id,
+                    body.as_deref(),
+                    text.as_deref(),
+                    reply_to.as_deref(),
+                    &files,
+                    read_stdin,
+                    |p| std::fs::read(p),
+                )
+                .await
+            }
         }
         Command::Read {
             channel,
@@ -123,6 +138,7 @@ async fn run(cli: Cli) -> Result<Payload, AppError> {
                     commands::run_daemon_start(
                         &db_path,
                         &pid_path,
+                        &config_path,
                         cli.config.as_deref(),
                         token,
                         foreground,
@@ -133,24 +149,11 @@ async fn run(cli: Cli) -> Result<Payload, AppError> {
                 DaemonCommand::Status => commands::run_daemon_status(&pid_path, &db_path),
             }
         }
-        Command::Ask(AskCommand::Create {
-            channel,
-            question,
-            options,
-            allow_text,
-            timeout,
-        }) => {
+        Command::Ask(cmd @ AskCommand::Create { .. }) => {
             let (api, channels) = authenticated_api(&config_path, cli.token.as_deref())?;
-            let channel_id = config::resolve_channel(&channel, &channels);
+            let req = ask_create_request(cmd, &channels);
             let db_path = config::default_db_path()?;
             let pid_path = config::default_pid_path()?;
-            let req = commands::AskCreateRequest {
-                channel_id,
-                question,
-                options,
-                allow_text,
-                timeout_secs: timeout,
-            };
             commands::run_ask_create(
                 &api,
                 &db_path,
@@ -172,6 +175,35 @@ async fn run(cli: Cli) -> Result<Payload, AppError> {
             let sleeper = TokioSleeper;
             commands::run_ask_wait(&db_path, &sleeper, &ask_id, timeout, interval).await
         }
+    }
+}
+
+/// Maps the parsed `ask create` arguments onto the command-layer request,
+/// resolving the channel alias. Kept pure so tests can pin every flag's path.
+fn ask_create_request(
+    cmd: AskCommand,
+    channels: &std::collections::HashMap<String, String>,
+) -> commands::AskCreateRequest {
+    let AskCommand::Create {
+        channel,
+        question,
+        options,
+        allow_text,
+        allowed_users,
+        multi_select,
+        timeout,
+    } = cmd
+    else {
+        unreachable!("caller matches AskCommand::Create before delegating");
+    };
+    commands::AskCreateRequest {
+        channel_id: config::resolve_channel(&channel, channels),
+        question,
+        options,
+        allow_text,
+        allowed_users,
+        multi_select,
+        timeout_secs: timeout,
     }
 }
 
@@ -247,5 +279,48 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn ask_create_request_carries_every_cli_flag() {
+        let cli = Cli::try_parse_from([
+            "discord",
+            "ask",
+            "create",
+            "alias",
+            "배포할까요?",
+            "--option",
+            "A",
+            "--option",
+            "B",
+            "--allow-text",
+            "--allowed-user",
+            "111",
+            "--allowed-user",
+            "222",
+            "--multi-select",
+            "--timeout",
+            "90",
+        ])
+        .unwrap();
+        let Command::Ask(cmd) = cli.command else {
+            panic!("expected ask command");
+        };
+        let channels = std::collections::HashMap::from([("alias".to_owned(), "999".to_owned())]);
+
+        let req = ask_create_request(cmd, &channels);
+
+        assert_eq!(
+            req,
+            commands::AskCreateRequest {
+                channel_id: "999".to_owned(),
+                question: "배포할까요?".to_owned(),
+                options: vec!["A".to_owned(), "B".to_owned()],
+                allow_text: true,
+                allowed_users: vec!["111".to_owned(), "222".to_owned()],
+                multi_select: true,
+                timeout_secs: 90,
+            }
+        );
     }
 }

@@ -1,9 +1,10 @@
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::time::Duration;
 
 use crate::common::api::{
-    Author, CreateThreadRequest, CreatedThread, DiscordApi, Message, SendRequest, SentMessage,
+    Author, ChannelInfo, CreateThreadRequest, CreatedThread, DiscordApi, Message, SendRequest,
+    SentMessage,
 };
 use crate::output::AppError;
 
@@ -38,6 +39,12 @@ pub(crate) struct MockDiscordApi {
     pub(crate) edit_components_responses: RefCell<VecDeque<Result<(), AppError>>>,
     /// `(channel_id, message_id, components)` per `edit_message_components`.
     pub(crate) edit_components_calls: RefCell<Vec<InteractionCall>>,
+    pub(crate) channel_responses: RefCell<VecDeque<Result<ChannelInfo, AppError>>>,
+    /// `channel_id` per `get_channel`.
+    pub(crate) channel_calls: RefCell<Vec<String>>,
+    /// When set, `get_channel` records the call and then never completes,
+    /// standing in for a lookup that hangs (tests drive it with paused time).
+    pub(crate) channel_hangs: Cell<bool>,
 }
 
 impl MockDiscordApi {
@@ -53,6 +60,9 @@ impl MockDiscordApi {
             interaction_calls: RefCell::new(Vec::new()),
             edit_components_responses: RefCell::new(VecDeque::new()),
             edit_components_calls: RefCell::new(Vec::new()),
+            channel_responses: RefCell::new(VecDeque::new()),
+            channel_calls: RefCell::new(Vec::new()),
+            channel_hangs: Cell::new(false),
         }
     }
 
@@ -135,6 +145,17 @@ impl DiscordApi for MockDiscordApi {
             .borrow_mut()
             .pop_front()
             .unwrap_or(Ok(()))
+    }
+
+    async fn get_channel(&self, channel_id: &str) -> Result<ChannelInfo, AppError> {
+        self.channel_calls.borrow_mut().push(channel_id.to_owned());
+        if self.channel_hangs.get() {
+            std::future::pending::<()>().await;
+        }
+        self.channel_responses
+            .borrow_mut()
+            .pop_front()
+            .expect("test must queue a channel response before calling get_channel")
     }
 }
 

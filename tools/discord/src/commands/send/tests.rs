@@ -499,3 +499,164 @@ async fn run_send_passes_resolved_files_into_send_request() {
     // Files present with no BODY/--text yields an empty caption.
     assert_eq!(calls[0].content, "");
 }
+
+// ---- run_send_split ----
+
+fn sent(id: &str) -> Result<SentMessage, AppError> {
+    Ok(SentMessage {
+        id: id.into(),
+        channel_id: "c".into(),
+        timestamp: "2024-01-01T00:00:00Z".into(),
+        attachments: vec![],
+    })
+}
+
+async fn split_send(
+    api: &MockDiscordApi,
+    text: &str,
+    reply_to: Option<&str>,
+    files: &[String],
+) -> Result<Payload, AppError> {
+    run_send_split(
+        api,
+        "c",
+        None,
+        Some(text),
+        reply_to,
+        files,
+        unreachable_stdin,
+        |_| Ok(vec![1, 2, 3]),
+    )
+    .await
+}
+
+fn split_messages(payload: Payload) -> Vec<SendData> {
+    match payload {
+        Payload::SendSplit(data) => data.messages,
+        other => panic!("expected SendSplit, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn run_send_split_short_body_sends_one_message() {
+    let api = MockDiscordApi::new();
+    api.send_responses.borrow_mut().push_back(sent("1"));
+
+    let messages = split_messages(split_send(&api, "hi", None, &[]).await.unwrap());
+
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0].message_id, "1");
+    assert_eq!(api.send_calls.borrow()[0].content, "hi");
+}
+
+#[tokio::test]
+async fn run_send_split_exactly_2000_chars_is_not_split() {
+    let api = MockDiscordApi::new();
+    api.send_responses.borrow_mut().push_back(sent("1"));
+
+    split_send(&api, &"a".repeat(2000), None, &[])
+        .await
+        .unwrap();
+
+    assert_eq!(api.send_calls.borrow().len(), 1);
+}
+
+#[tokio::test]
+async fn run_send_split_sends_chunks_in_order_and_lists_them() {
+    let api = MockDiscordApi::new();
+    for id in ["1", "2", "3"] {
+        api.send_responses.borrow_mut().push_back(sent(id));
+    }
+    let line = format!("{}\n", "a".repeat(999));
+
+    let messages = split_messages(split_send(&api, &line.repeat(5), None, &[]).await.unwrap());
+
+    let ids: Vec<_> = messages.iter().map(|m| m.message_id.as_str()).collect();
+    assert_eq!(ids, ["1", "2", "3"]);
+    let calls = api.send_calls.borrow();
+    assert_eq!(calls.len(), 3);
+    assert!(calls.iter().all(|c| c.content.chars().count() <= 2000));
+    assert_eq!(
+        calls.iter().map(|c| c.content.as_str()).collect::<String>(),
+        line.repeat(5)
+    );
+}
+
+#[tokio::test]
+async fn run_send_split_attaches_files_and_reply_to_first_chunk_only() {
+    let api = MockDiscordApi::new();
+    api.send_responses.borrow_mut().push_back(sent("1"));
+    api.send_responses.borrow_mut().push_back(sent("2"));
+
+    split_send(
+        &api,
+        &"a".repeat(2500),
+        Some("999"),
+        &["/tmp/photo.png".to_owned()],
+    )
+    .await
+    .unwrap();
+
+    let calls = api.send_calls.borrow();
+    assert_eq!(calls.len(), 2);
+    assert_eq!(calls[0].files.len(), 1);
+    assert_eq!(calls[0].reply_to.as_deref(), Some("999"));
+    assert!(calls[1].files.is_empty());
+    assert_eq!(calls[1].reply_to, None);
+}
+
+#[tokio::test]
+async fn run_send_split_reopens_code_block_with_language_tag() {
+    let api = MockDiscordApi::new();
+    api.send_responses.borrow_mut().push_back(sent("1"));
+    api.send_responses.borrow_mut().push_back(sent("2"));
+    let text = format!("```rust\n{}```\n", "let x = 1;\n".repeat(250));
+
+    split_send(&api, &text, None, &[]).await.unwrap();
+
+    let calls = api.send_calls.borrow();
+    assert_eq!(calls.len(), 2);
+    assert!(calls[0].content.ends_with("\n```"));
+    assert!(calls[1].content.starts_with("```rust\n"));
+    assert!(calls.iter().all(|c| c.content.chars().count() <= 2000));
+}
+
+#[tokio::test]
+async fn run_send_split_failure_reports_chunk_and_already_sent_ids() {
+    let api = MockDiscordApi::new();
+    api.send_responses.borrow_mut().push_back(sent("1"));
+    api.send_responses
+        .borrow_mut()
+        .push_back(Err(AppError::new(ErrorKind::Api, "boom")));
+
+    let err = split_send(&api, &"a".repeat(4500), None, &[])
+        .await
+        .unwrap_err();
+
+    assert_eq!(err.kind, ErrorKind::Api);
+    assert!(err.message.contains("chunk 2/3"), "{}", err.message);
+    assert!(err.message.contains("[1]"), "{}", err.message);
+    assert!(err.message.contains("boom"), "{}", err.message);
+    assert_eq!(api.send_calls.borrow().len(), 2, "must stop at the failure");
+}
+
+#[tokio::test]
+async fn run_send_without_split_still_rejects_over_2000_chars() {
+    let api = MockDiscordApi::new();
+
+    let err = run_send(
+        &api,
+        "c",
+        None,
+        Some(&"a".repeat(2001)),
+        None,
+        &[],
+        unreachable_stdin,
+        unreachable_read_file,
+    )
+    .await
+    .unwrap_err();
+
+    assert_eq!(err.kind, ErrorKind::Usage);
+    assert!(api.send_calls.borrow().is_empty());
+}

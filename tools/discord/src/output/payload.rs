@@ -12,6 +12,13 @@ pub struct SendData {
     pub attachments: Vec<Attachment>,
 }
 
+/// `send --split` result: one entry per message sent, in send order. Each
+/// entry has the same shape as a plain send's `data`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SendSplitData {
+    pub messages: Vec<SendData>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReadData {
     pub channel_id: String,
@@ -95,7 +102,9 @@ pub enum AskResultData {
     Answered {
         ask_id: String,
         kind: String,
-        value: String,
+        /// A string, except `kind = "multi_choice"` where it is an array of
+        /// the selected labels.
+        value: serde_json::Value,
         answered_by: String,
         answered_at: String,
     },
@@ -122,6 +131,7 @@ pub struct AskWaitData {
 #[serde(untagged)]
 pub enum Payload {
     Send(SendData),
+    SendSplit(SendSplitData),
     Init(InitData),
     Read(ReadData),
     Wait(WaitData),
@@ -146,6 +156,20 @@ impl Payload {
                 if !d.attachments.is_empty() {
                     text.push('\n');
                     text.push_str(&format_attachment_filenames(&d.attachments));
+                }
+                text
+            }
+            Payload::SendSplit(d) => {
+                let mut text = format!("sent {} messages", d.messages.len());
+                for m in &d.messages {
+                    text.push_str(&format!(
+                        "\n{} (channel {} at {})",
+                        m.message_id, m.channel_id, m.timestamp
+                    ));
+                    if !m.attachments.is_empty() {
+                        text.push('\n');
+                        text.push_str(&format_attachment_filenames(&m.attachments));
+                    }
                 }
                 text
             }
@@ -205,8 +229,27 @@ fn format_ask_result(result: &AskResultData) -> String {
             value,
             answered_by,
             answered_at,
-        } => format!("ask {ask_id}: answered by {answered_by} ({kind}): {value} at {answered_at}"),
+        } => format!(
+            "ask {ask_id}: answered by {answered_by} ({kind}): {} at {answered_at}",
+            format_answer_value(value)
+        ),
         AskResultData::TimedOut { ask_id } => format!("ask {ask_id}: timed out, no answer"),
+    }
+}
+
+/// Strings print bare; a multi-choice array prints its labels comma-joined.
+fn format_answer_value(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::String(text) => text.clone(),
+        serde_json::Value::Array(items) => items
+            .iter()
+            .map(|item| {
+                item.as_str()
+                    .map_or_else(|| item.to_string(), str::to_owned)
+            })
+            .collect::<Vec<_>>()
+            .join(", "),
+        other => other.to_string(),
     }
 }
 
@@ -453,6 +496,22 @@ mod tests {
         });
         let (_, text, _) = render("ask", &Ok(payload), false);
         assert_eq!(text, "ask 111: pending");
+    }
+
+    #[test]
+    fn human_ask_result_multi_choice_joins_labels() {
+        let payload = Payload::AskResult(AskResultData::Answered {
+            ask_id: "111".into(),
+            kind: "multi_choice".into(),
+            value: serde_json::json!(["a", "b"]),
+            answered_by: "u1".into(),
+            answered_at: "2024-01-01T00:00:00Z".into(),
+        });
+        let (_, text, _) = render("ask", &Ok(payload), false);
+        assert_eq!(
+            text,
+            "ask 111: answered by u1 (multi_choice): a, b at 2024-01-01T00:00:00Z"
+        );
     }
 
     #[test]

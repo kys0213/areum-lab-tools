@@ -46,6 +46,10 @@ pub enum Command {
         /// Attach a file by path; repeat up to 10 times.
         #[arg(long = "file")]
         files: Vec<String>,
+        /// Split a body over 2000 characters into several messages instead of
+        /// rejecting it. Files and --reply-to go on the first message only.
+        #[arg(long)]
+        split: bool,
     },
 
     /// Create the local config file with a bot token (local setup only, no
@@ -143,6 +147,14 @@ pub enum AskCommand {
         /// Also accept a free-text answer via a modal.
         #[arg(long = "allow-text")]
         allow_text: bool,
+        /// Only this Discord user id may answer; repeat to allow several.
+        /// Omit to let anyone answer.
+        #[arg(long = "allowed-user")]
+        allowed_users: Vec<String>,
+        /// Show the options as a multi-choice select menu (1-25 options);
+        /// the answer's `value` is an array of the selected labels.
+        #[arg(long = "multi-select")]
+        multi_select: bool,
         /// Seconds until the ask expires unanswered (default 3600).
         #[arg(long, default_value_t = 3600)]
         timeout: u64,
@@ -215,6 +227,7 @@ mod tests {
                 text,
                 reply_to,
                 files,
+                split: _,
             } => {
                 assert_eq!(channel, "123");
                 assert_eq!(body.as_deref(), Some("hello world"));
@@ -236,6 +249,7 @@ mod tests {
                 text,
                 reply_to,
                 files,
+                split: _,
             } => {
                 assert_eq!(channel, "123");
                 assert_eq!(body, None);
@@ -258,12 +272,26 @@ mod tests {
                 text,
                 reply_to,
                 files,
+                split: _,
             } => {
                 assert_eq!(channel, "123");
                 assert_eq!(body.as_deref(), Some("hello"));
                 assert_eq!(text, None);
                 assert_eq!(reply_to.as_deref(), Some("999"));
                 assert!(files.is_empty());
+            }
+            other => panic!("expected Send, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn send_split_flag_defaults_off_and_parses_on() {
+        let off = Cli::try_parse_from(["discord", "send", "123", "hi"]).unwrap();
+        let on = Cli::try_parse_from(["discord", "send", "123", "-", "--split", "--json"]).unwrap();
+        match (off.command, on.command) {
+            (Command::Send { split: off, .. }, Command::Send { split: on, .. }) => {
+                assert!(!off);
+                assert!(on);
             }
             other => panic!("expected Send, got {other:?}"),
         }
@@ -609,12 +637,16 @@ mod tests {
                 question,
                 options,
                 allow_text,
+                allowed_users,
+                multi_select,
                 timeout,
             }) => {
                 assert_eq!(channel, "123");
                 assert_eq!(question, "proceed?");
                 assert_eq!(options, vec!["yes".to_owned(), "no".to_owned()]);
                 assert!(!allow_text);
+                assert!(allowed_users.is_empty());
+                assert!(!multi_select);
                 assert_eq!(timeout, 3600);
             }
             other => panic!("expected Ask(Create), got {other:?}"),
@@ -653,6 +685,38 @@ mod tests {
             }) => {
                 assert!(allow_text);
                 assert_eq!(timeout, 30);
+            }
+            other => panic!("expected Ask(Create), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ask_create_parses_repeated_allowed_user_and_multi_select() {
+        let cli = Cli::try_parse_from([
+            "discord",
+            "ask",
+            "create",
+            "123",
+            "pick",
+            "--option",
+            "a",
+            "--option",
+            "b",
+            "--allowed-user",
+            "111",
+            "--allowed-user",
+            "222",
+            "--multi-select",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Ask(AskCommand::Create {
+                allowed_users,
+                multi_select,
+                ..
+            }) => {
+                assert_eq!(allowed_users, vec!["111".to_owned(), "222".to_owned()]);
+                assert!(multi_select);
             }
             other => panic!("expected Ask(Create), got {other:?}"),
         }

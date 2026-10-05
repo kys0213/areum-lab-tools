@@ -5,15 +5,34 @@ use serde::{Deserialize, Serialize};
 
 use crate::common::error::{AppError, ErrorKind};
 
-/// On-disk config at `~/.areum/discord/config.json`. Both fields optional.
+/// On-disk config at `~/.areum/discord/config.json`. Every field is optional.
 /// `skip_serializing_if` keeps a fresh `init` write minimal (`{"token":"..."}`)
-/// rather than always emitting an empty `channels` map.
+/// rather than always emitting empty collections.
 #[derive(Debug, Default, Deserialize, Serialize)]
 pub struct Config {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token: Option<String>,
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub channels: HashMap<String, String>,
+    /// Channel ids or `channels` aliases whose top-level posts trigger
+    /// `on_message` without a bot mention.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub issue_channels: Vec<String>,
+    /// argv the daemon runs (no shell) per detected message; absent disables
+    /// message detection entirely.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on_message: Option<Vec<String>>,
+    /// Channel id or `channels` alias -> directory `on_message` runs in.
+    /// Absolute or `~/`-prefixed.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub workdirs: HashMap<String, String>,
+    /// Numeric user ids of bots (this bot included) whose messages go through
+    /// the same trigger filter as a person's. Empty keeps every bot ignored.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub trigger_bots: Vec<String>,
+    /// Directory for channels without a `workdirs` entry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_workdir: Option<String>,
 }
 
 /// Resolves the bot token by precedence: flag > env > config. Fails fast when
@@ -232,6 +251,59 @@ mod tests {
     }
 
     #[test]
+    fn parse_config_without_trigger_fields_leaves_them_empty() {
+        let cfg = parse_config(r#"{"token":"t","channels":{"a":"1"}}"#).unwrap();
+        assert!(cfg.issue_channels.is_empty());
+        assert!(cfg.on_message.is_none());
+    }
+
+    #[test]
+    fn parse_config_reads_trigger_fields() {
+        let cfg = parse_config(
+            r#"{"token":"t","issue_channels":["issues","222"],"on_message":["/bin/run","--x"]}"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.issue_channels, vec!["issues", "222"]);
+        assert_eq!(
+            cfg.on_message,
+            Some(vec!["/bin/run".to_owned(), "--x".to_owned()])
+        );
+    }
+
+    #[test]
+    fn parse_config_reads_workdir_fields() {
+        let cfg = parse_config(
+            r#"{"workdirs":{"issues":"/srv/a","333":"~/b"},"default_workdir":"/srv/default"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.workdirs.get("issues").map(String::as_str),
+            Some("/srv/a")
+        );
+        assert_eq!(cfg.workdirs.get("333").map(String::as_str), Some("~/b"));
+        assert_eq!(cfg.default_workdir.as_deref(), Some("/srv/default"));
+    }
+
+    #[test]
+    fn parse_config_without_workdir_fields_leaves_them_empty() {
+        let cfg = parse_config(r#"{"token":"t","on_message":["/bin/run"]}"#).unwrap();
+        assert!(cfg.workdirs.is_empty());
+        assert!(cfg.default_workdir.is_none());
+    }
+
+    #[test]
+    fn parse_config_reads_trigger_bots() {
+        let cfg = parse_config(r#"{"trigger_bots":["123","456"]}"#).unwrap();
+        assert_eq!(cfg.trigger_bots, vec!["123", "456"]);
+    }
+
+    #[test]
+    fn parse_config_without_trigger_bots_leaves_it_empty() {
+        let cfg = parse_config(r#"{"token":"t"}"#).unwrap();
+        assert!(cfg.trigger_bots.is_empty());
+    }
+
+    #[test]
     fn parse_config_rejects_malformed_json() {
         let err = parse_config("{not json").unwrap_err();
         assert_eq!(err.kind, ErrorKind::Config);
@@ -263,6 +335,7 @@ mod tests {
         let cfg = Config {
             token: Some("t".to_owned()),
             channels: HashMap::new(),
+            ..Default::default()
         };
         assert_eq!(serde_json::to_string(&cfg).unwrap(), r#"{"token":"t"}"#);
     }
@@ -272,6 +345,7 @@ mod tests {
         let cfg = Config {
             token: Some("t".to_owned()),
             channels: channels(),
+            ..Default::default()
         };
         assert_eq!(
             serde_json::to_string(&cfg).unwrap(),
@@ -289,6 +363,7 @@ mod tests {
         let cfg = Config {
             token: Some("mytoken".to_owned()),
             channels: HashMap::new(),
+            ..Default::default()
         };
         write_config_file(&path, &cfg).unwrap();
 
@@ -310,6 +385,7 @@ mod tests {
         let cfg = Config {
             token: Some("mytoken".to_owned()),
             channels: HashMap::new(),
+            ..Default::default()
         };
         write_config_file(&path, &cfg).unwrap();
 
