@@ -111,28 +111,59 @@
 
 ---
 
-## 5. 브리프와 평가 (P1)
+## 5. 브리프와 평가
 
 ### 브리프
 
-결정 지점마다 한 장.
+결정 지점마다 한 장. 데몬이 `--brief` 로 켜져 있으면 ask 가 열릴 때 만든다.
 
 - 무엇을 결정해야 하나 (질문, 선택지)
-- 배경 (세션이 하던 일, 지금까지 흐름, 관련 파일·PR·이슈)
-- 과거 유사 판단 (검색 번들 상위 판례와 그때의 답·근거, 서로 다른 답이 섞이면 표시)
-- 의견: 판례와 가장 가까운 선택을 추천하거나, 판례가 맞지 않으면 "새 의견" 으로 표시해
-  제시한다. 확신도와 가역성을 함께 적는다.
+- 배경 (세션이 하던 일, 지금까지 흐름)
+- 과거 유사 판단 (검색 번들 상위 판례와 그때의 답·근거)
+- 의견: 판례와 가장 가까운 선택을 추천하거나, 판례가 맞지 않으면 "새 의견" 으로 제시한다.
+  확신도와 가역성을 함께 적는다.
 
-브리프 레코드는 사용한 골든셋 상태와 브리프 프롬프트 버전을 남긴다.
+데몬은 아래 번들을 설정된 명령(기본 `claude -p --output-format json --model sonnet
+/doppel:brief`)의 stdin 으로 넘긴다. 판단의 내용은 그 명령(plugin 의 `brief` skill)이
+정한다. 명령에는 `DOPPEL_DISABLE=1` 을 넣어 브리프 세션이 doppel 에 붙지 않게 한다.
+
+```jsonc
+// 번들 (stdin)
+{
+  "v": 1,
+  "ask": { "ask_id", "kind", "questions" },
+  "session": { "session_id", "cwd", "last_summary" },
+  "precedents": [                     // 확정 판례, 검색 점수 순 최대 5개
+    { "golden_id", "category", "question", "options", "answers", "rationale", "decided_at", "score" }
+  ]
+}
+```
+
+```jsonc
+// 브리프 (명령의 출력: JSON 객체 하나, `claude -p --output-format json` 이면 그 `result`)
+{
+  "background": "세션이 하던 일 1~2문장",
+  "recommendation": { "<question>": "<label>" | ["<label>", …] } | null,
+  "new_opinion": "판례가 맞지 않을 때의 의견" | null,   // 둘 중 하나는 있어야 한다
+  "confidence": "low" | "medium" | "high",
+  "reversible": true | false | null,
+  "rationale": "왜 그 추천인가 1~3문장",
+  "cited": ["gld-000003"]                                 // 번들의 판례 id 만
+}
+```
+
+- 출력이 JSON 객체 하나가 아니면(코드 펜스 한 겹은 벗긴다), 번들에 없는 판례를 인용하면,
+  추천이 질문에 맞지 않으면 브리프는 `failed` 로 남고 이유를 적는다.
+- 브리프는 사용한 판례 id 목록과 명령 문자열(프롬프트 버전의 대리값)을 함께 남긴다.
 
 ### 평가
 
 모든 브리프가 곧 예측이다. 따로 shadow 모드를 두지 않는다.
 
-- 카테고리별 추천 수락률을 다수 답 baseline 대비 향상폭(lift)으로 본다. 늘 같은 답을
-  추천하는 분신이 높은 점수를 얻지 못하게.
-- 거절·정정 사례와 "새 의견" 채택률은 따로 센다.
-- 골든셋 leave-one-out 재현으로 프롬프트·골든셋 변경의 회귀를 잰다.
+- ask 가 확정될 때 최종 답이 추천과 같으면 수락이다. 새 의견만 낸 브리프는 수락 판정에서
+  뺀다. `doppel stats` 가 전체와 카테고리별 수락률을 낸다.
+- 카테고리별 다수 답 baseline 대비 향상폭(lift), 거절·정정 사례와 "새 의견" 채택률, 골든셋
+  leave-one-out 재현은 분류가 쌓인 뒤 더한다.
 
 ### 자동 처리
 
@@ -207,6 +238,8 @@ CREATE VIRTUAL TABLE golden_fts USING fts5(
   tokenize = 'unicode61'
 );
 ```
+
+`briefs` 는 ask 하나에 하나다 (스키마는 [doppel-protocol.md §6](./doppel-protocol.md)).
 
 `golden_fts` 는 골든을 만들 때 함께 쓴다. 골든의 검색 대상 텍스트는 바뀌지 않으므로
 갱신 경로가 없다.

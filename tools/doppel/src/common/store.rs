@@ -16,6 +16,7 @@
 //! share — the connection, the clock, id minting and error mapping.
 
 mod asks;
+mod briefs;
 mod categories;
 mod decisions;
 mod golden;
@@ -29,7 +30,8 @@ use rusqlite::{Connection, ErrorCode};
 use crate::common::error::{AppError, ErrorKind};
 use crate::common::time::now_rfc3339;
 
-pub(crate) use asks::AskRecord;
+pub(crate) use asks::{AskRecord, validate_answers};
+pub(crate) use briefs::{BriefDraft, BriefRecord};
 pub(crate) use categories::CategoryRecord;
 pub(crate) use decisions::{ChoiceOption, DecisionFilter, DecisionRecord, NewDecision};
 pub(crate) use golden::{GoldenFilter, GoldenRecord};
@@ -272,6 +274,34 @@ CREATE TABLE IF NOT EXISTS asks (
   CHECK (state <> 'answered' OR (answers IS NOT NULL AND answered_by IS NOT NULL)),
   CHECK ((state = 'closed') = (closed_at IS NOT NULL)),
   CHECK (state <> 'deferred' OR deferred_at IS NOT NULL)
+);
+
+CREATE TABLE IF NOT EXISTS briefs (
+  ask_id         TEXT PRIMARY KEY REFERENCES asks(id),
+  state          TEXT NOT NULL,
+  background     TEXT,
+  recommendation TEXT,
+  new_opinion    TEXT,
+  confidence     TEXT,
+  reversible     INTEGER,
+  rationale      TEXT,
+  cited          TEXT NOT NULL DEFAULT '[]',
+  precedents     TEXT NOT NULL DEFAULT '[]',
+  command        TEXT NOT NULL,
+  error          TEXT,
+  accepted       INTEGER,
+  created_at     TEXT NOT NULL,
+  finished_at    TEXT,
+
+  CHECK (state IN ('pending','ready','failed')),
+  CHECK (confidence IS NULL OR confidence IN ('low','medium','high')),
+  CHECK (reversible IS NULL OR reversible IN (0,1)),
+  CHECK (accepted IS NULL OR accepted IN (0,1)),
+  CHECK ((state = 'pending') = (finished_at IS NULL)),
+  CHECK (state <> 'ready' OR (confidence IS NOT NULL AND rationale IS NOT NULL
+                              AND (recommendation IS NOT NULL OR new_opinion IS NOT NULL))),
+  CHECK (state <> 'failed' OR error IS NOT NULL),
+  CHECK (accepted IS NULL OR (state = 'ready' AND recommendation IS NOT NULL))
 );
 ";
 

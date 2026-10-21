@@ -138,6 +138,7 @@ fn run(cli: Cli) -> Result<Payload, AppError> {
             ref answers,
         }) => commands::run_ask_answer(&socket()?, id, labels, answers),
         Command::Session(SessionCommand::List) => commands::run_session_list(&socket()?),
+        Command::Stats => commands::run_stats(db),
     }
 }
 

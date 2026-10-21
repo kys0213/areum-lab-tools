@@ -231,6 +231,7 @@ doppel daemon run | start | stop | status      # --ui-port · --no-ui · 상태 
 doppel attach --session <id>                   # plugin 이 띄우는 세션별 연결
 doppel ask list | wait | answer                # 질문 inbox (doppel-protocol.md §6)
 doppel session list
+doppel stats                                   # 브리프 추천 수락률 (전체·카테고리별)
 doppel card add | list | triage | claim | done | release   # P3
 ```
 
@@ -285,6 +286,6 @@ discord·kanban 과 공유하는 kind 는 같은 번호를 쓴다.
 | 단계 | 내용 |
 |---|---|
 | P0 | 판단 원장, `ingest`(세션 JSONL·plans), 카테고리, 골든 묶음 리뷰, 판례 검색 |
-| P1 | 데몬, 세션 연결·상태, 결정 지점, 브리프, 웹 UI inbox, doppel 채널의 질문 경주, 수락률 |
+| P1 | 데몬, 세션 연결·상태, 결정 지점, 웹 UI inbox, doppel 채널의 질문 경주 (P1a) · 브리프, 수락률 (P1b) |
 | P2 | 채널 plugin (Slack 먼저) — 채널별 로컬 연결 프로세스 + 세션 plugin, 공유 relay 계약 |
 | P3 | 칸반 유입·라벨링·분배, 카테고리별 opt-in 자동 처리 |

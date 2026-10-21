@@ -9,7 +9,7 @@ clap = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 rusqlite = { workspace = true }
-tokio = { workspace = true, features = ["net", "sync", "io-util"] }
+tokio = { workspace = true, features = ["net", "sync", "io-util", "process"] }
 axum = { workspace = true }
 hyper = { workspace = true }
 hyper-util = { workspace = true }

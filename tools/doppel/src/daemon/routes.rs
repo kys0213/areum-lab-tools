@@ -16,12 +16,13 @@ use serde_json::{Value, json};
 use tokio::sync::{broadcast, watch};
 
 use crate::common::error::{AppError, ErrorKind};
-use crate::common::store::{SessionEvent, Store};
+use crate::common::store::{AskRecord, SessionEvent, Store};
 use crate::common::time::now_epoch_secs;
 use crate::daemon::api::{
     AnswerBody, AskList, AskView, AttachMessage, CloseBody, EventBody, Health, OpenAskBody,
     SessionList, SessionView,
 };
+use crate::daemon::brief::{self, BriefConfig};
 use crate::daemon::hub::Hub;
 use crate::daemon::state::Thresholds;
 
@@ -36,22 +37,29 @@ pub(super) struct AppState {
     pub(super) store: Arc<Mutex<Store>>,
     pub(super) hub: Hub,
     pub(super) thresholds: Thresholds,
+    /// `None` writes no briefs.
+    pub(super) brief: Option<BriefConfig>,
     /// Flips to `true` once to stop the daemon: both listeners drain and
     /// every WebSocket loop returns so the drain can finish.
     pub(super) stop: watch::Sender<bool>,
 }
 
 impl AppState {
-    pub(super) fn new(store: Store, thresholds: Thresholds) -> AppState {
+    pub(super) fn new(
+        store: Store,
+        thresholds: Thresholds,
+        brief: Option<BriefConfig>,
+    ) -> AppState {
         AppState {
             store: Arc::new(Mutex::new(store)),
             hub: Hub::new(),
             thresholds,
+            brief,
             stop: watch::channel(false).0,
         }
     }
 
-    fn store(&self) -> MutexGuard<'_, Store> {
+    pub(super) fn store(&self) -> MutexGuard<'_, Store> {
         // A handler that panicked while holding the lock left no partial
         // write behind (every write is one statement or one transaction),
         // so the data is still consistent.
@@ -86,6 +94,17 @@ impl IntoResponse for ApiError {
 }
 
 type ApiResult<T> = Result<Json<T>, ApiError>;
+
+fn view(store: &Store, ask: AskRecord) -> Result<AskView, AppError> {
+    let brief = store.get_brief(&ask.id)?;
+    Ok(AskView::with_brief(ask, brief))
+}
+
+/// The ask as the API shows it, read fresh so its brief is current.
+fn current(app: &AppState, ask: AskRecord) -> ApiResult<AskView> {
+    let store = app.store();
+    Ok(Json(view(&store, ask)?))
+}
 
 /// Routes both listeners serve.
 pub(super) fn shared_routes() -> Router<AppState> {
@@ -205,12 +224,12 @@ async fn list_asks(
     State(app): State<AppState>,
     Query(query): Query<StateQuery>,
 ) -> ApiResult<AskList> {
-    let asks = app
-        .store()
+    let store = app.store();
+    let asks = store
         .list_asks(query.state.as_deref())?
         .into_iter()
-        .map(AskView::from)
-        .collect();
+        .map(|ask| view(&store, ask))
+        .collect::<Result<_, _>>()?;
     Ok(Json(AskList { asks }))
 }
 
@@ -225,11 +244,15 @@ async fn open_ask(
         &body.questions,
     )?;
     app.hub.ask_changed(&ask.id);
-    Ok(Json(ask.into()))
+    if app.brief.is_some() && ask.state == "open" {
+        tokio::spawn(brief::run(app.clone(), ask.id.clone()));
+    }
+    current(&app, ask)
 }
 
 async fn get_ask(State(app): State<AppState>, Path(id): Path<String>) -> ApiResult<AskView> {
-    Ok(Json(app.store().get_ask(&id)?.into()))
+    let ask = app.store().get_ask(&id)?;
+    current(&app, ask)
 }
 
 #[derive(Deserialize)]
@@ -255,12 +278,12 @@ async fn wait_ask(
     loop {
         let ask = app.store().get_ask(&id)?;
         if ask.state != "open" {
-            return Ok(Json(ask.into()));
+            return current(&app, ask);
         }
         match tokio::time::timeout_at(deadline, changes.recv()).await {
-            Err(_elapsed) => return Ok(Json(ask.into())),
+            Err(_elapsed) => return current(&app, ask),
             Ok(Ok(_)) | Ok(Err(broadcast::error::RecvError::Lagged(_))) => continue,
-            Ok(Err(broadcast::error::RecvError::Closed)) => return Ok(Json(ask.into())),
+            Ok(Err(broadcast::error::RecvError::Closed)) => return current(&app, ask),
         }
     }
 }
@@ -282,7 +305,7 @@ async fn answer_ask(
             deferred_answer(&ask.id, &ask.tool_use_id, &body.answers, &body.answered_by),
         );
     }
-    Ok(Json(ask.into()))
+    current(&app, ask)
 }
 
 fn deferred_answer(ask_id: &str, tool_use_id: &str, answers: &Value, answered_by: &str) -> Value {
@@ -298,7 +321,7 @@ fn deferred_answer(ask_id: &str, tool_use_id: &str, answers: &Value, answered_by
 async fn defer_ask(State(app): State<AppState>, Path(id): Path<String>) -> ApiResult<AskView> {
     let ask = app.store().defer_ask(&id)?;
     app.hub.ask_changed(&ask.id);
-    Ok(Json(ask.into()))
+    current(&app, ask)
 }
 
 async fn close_ask(
@@ -310,7 +333,7 @@ async fn close_ask(
         .store()
         .close_ask(&id, body.answers.as_ref(), &body.answered_by)?;
     app.hub.ask_changed(&ask.id);
-    Ok(Json(ask.into()))
+    current(&app, ask)
 }
 
 async fn attach(

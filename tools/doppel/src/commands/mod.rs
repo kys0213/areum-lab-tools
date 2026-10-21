@@ -20,6 +20,7 @@ mod review;
 mod runtime;
 mod search;
 mod session;
+mod stats;
 
 #[cfg(test)]
 pub(crate) mod testutil;
@@ -37,3 +38,4 @@ pub(crate) use init::run_init;
 pub(crate) use review::run_review;
 pub(crate) use search::run_search;
 pub(crate) use session::run_session_list;
+pub(crate) use stats::run_stats;

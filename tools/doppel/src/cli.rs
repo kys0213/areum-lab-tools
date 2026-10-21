@@ -92,6 +92,10 @@ pub enum Command {
     /// Sessions connected to the daemon.
     #[command(subcommand)]
     Session(SessionCommand),
+
+    /// How often briefs' recommendations were taken, overall and per
+    /// category. Reads the database; no daemon needed.
+    Stats,
 }
 
 /// Daemon settings shared by `run` and `start`. The thresholds decide the
@@ -113,6 +117,17 @@ pub struct DaemonOptions {
     /// No sign of life for this long is `disconnected`.
     #[arg(long = "heartbeat-timeout-secs", default_value_t = 90)]
     pub heartbeat_timeout_secs: u64,
+    /// Write a brief for every new ask with the default brief command
+    /// (`claude -p --output-format json --model sonnet /doppel:brief`).
+    #[arg(long)]
+    pub brief: bool,
+    /// Write briefs with this command instead (split on whitespace, no
+    /// shell). The bundle arrives on its stdin.
+    #[arg(long = "brief-command")]
+    pub brief_command: Option<String>,
+    /// How long one brief may take before it is marked failed.
+    #[arg(long = "brief-timeout-secs", default_value_t = 180)]
+    pub brief_timeout_secs: u64,
 }
 
 #[derive(Subcommand, Debug)]
@@ -379,6 +394,7 @@ impl Command {
             Command::Ask(AskCommand::Wait { .. }) => "ask wait",
             Command::Ask(AskCommand::Answer { .. }) => "ask answer",
             Command::Session(SessionCommand::List) => "session list",
+            Command::Stats => "stats",
         }
     }
 }

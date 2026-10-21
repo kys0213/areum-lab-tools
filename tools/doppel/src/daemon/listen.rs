@@ -12,6 +12,7 @@ use tokio::sync::oneshot;
 
 use crate::common::error::{AppError, ErrorKind};
 use crate::common::store::Store;
+use crate::daemon::brief::BriefConfig;
 use crate::daemon::guard::loopback_only;
 use crate::daemon::routes::{AppState, shared_routes, socket_routes, stopped};
 use crate::daemon::state::Thresholds;
@@ -21,6 +22,8 @@ pub(crate) struct DaemonConfig {
     /// `None` serves no UI; `Some(0)` lets the OS pick the port.
     pub(crate) ui_port: Option<u16>,
     pub(crate) thresholds: Thresholds,
+    /// `None` writes no briefs.
+    pub(crate) brief: Option<BriefConfig>,
 }
 
 /// Where the daemon ended up listening, reported once both listeners are
@@ -52,7 +55,7 @@ pub(crate) async fn serve(
         .transpose()
         .map_err(|e| internal(format!("cannot read the UI address: {e}")))?;
 
-    let app = AppState::new(store, config.thresholds);
+    let app = AppState::new(store, config.thresholds, config.brief.clone());
     tokio::spawn(stop_on_signal(app.clone()));
 
     let socket_server = axum::serve(unix, socket_routes().with_state(app.clone()))

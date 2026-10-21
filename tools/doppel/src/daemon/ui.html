@@ -49,6 +49,11 @@
   .state.failing, .state.stalled, .state.disconnected { color: var(--bad); border-color: var(--bad); }
   .state.running { color: var(--ok); border-color: var(--ok); }
   .summary { color: var(--muted); font-size: 13px; }
+  .brief { border-left: 3px solid var(--accent); padding: 6px 10px; margin: 10px 0 4px; background: var(--bg); border-radius: 0 8px 8px 0; }
+  .brief .label { font-size: 12px; color: var(--accent); font-weight: 600; }
+  .brief .why { font-size: 13px; margin-top: 2px; }
+  .brief.failed { border-left-color: var(--bad); }
+  .brief.failed .label { color: var(--bad); }
   .table-wrap { overflow-x: auto; }
 </style>
 </head>
@@ -126,6 +131,55 @@ function renderSessions(sessions) {
   }
 }
 
+const CONFIDENCE = { low: "확신 낮음", medium: "확신 보통", high: "확신 높음" };
+
+function answerText(answers) {
+  return Object.entries(answers).map(([q, a]) => (Array.isArray(a) ? a.join(", ") : a)).join(" / ");
+}
+
+function briefBlock(ask) {
+  const brief = ask.brief;
+  if (!brief) return "";
+  if (brief.state === "pending") {
+    return el("div", { class: "brief" }, el("div", { class: "label" }, "doppel 이 판례를 살펴보는 중…"));
+  }
+  if (brief.state === "failed") {
+    return el("div", { class: "brief failed" }, [
+      el("div", { class: "label" }, "브리프를 만들지 못했습니다"),
+      el("div", { class: "meta" }, brief.error || ""),
+    ]);
+  }
+  const facts = [CONFIDENCE[brief.confidence] || brief.confidence];
+  if (brief.reversible === true) facts.push("되돌리기 쉬움");
+  if (brief.reversible === false) facts.push("되돌리기 어려움");
+  if (brief.cited && brief.cited.length) facts.push("판례 " + brief.cited.join(", "));
+  const block = el("div", { class: "brief" }, [
+    el("div", { class: "label" }, brief.recommendation
+      ? "doppel 추천: " + answerText(brief.recommendation)
+      : "doppel 새 의견"),
+    brief.new_opinion && !brief.recommendation ? el("div", { class: "why" }, brief.new_opinion) : "",
+    el("div", { class: "why" }, brief.rationale || ""),
+    brief.background ? el("div", { class: "meta" }, brief.background) : "",
+    el("div", { class: "meta" }, facts.join(" · ")),
+  ]);
+  if (brief.recommendation) {
+    block.append(el("div", { class: "options" }, el("button", {
+      class: "primary",
+      onclick: () => sendAnswers(ask, brief.recommendation),
+    }, "추천 수락")));
+  }
+  return block;
+}
+
+async function sendAnswers(ask, answers) {
+  try {
+    await api("/v1/asks/" + ask.ask_id + "/answer", { answers, answered_by: "doppel-ui" });
+  } catch (error) {
+    alert("답을 보내지 못했습니다: " + error.message);
+  }
+  refresh();
+}
+
 function questionBlock(ask, question, picked) {
   const multi = Boolean(question.multiSelect);
   const options = el("div", { class: "options" });
@@ -162,12 +216,7 @@ async function submit(ask, picked) {
     if (value === undefined || (value instanceof Set && value.size === 0)) return;
     answers[question.question] = value instanceof Set ? [...value] : value;
   }
-  try {
-    await api("/v1/asks/" + ask.ask_id + "/answer", { answers, answered_by: "doppel-ui" });
-  } catch (error) {
-    alert("답을 보내지 못했습니다: " + error.message);
-  }
-  refresh();
+  sendAnswers(ask, answers);
 }
 
 function renderInbox(asks) {
@@ -184,6 +233,7 @@ function renderInbox(asks) {
       el("div", { class: "meta" }, (ask.kind === "permission" ? "권한 확인" : "질문") + " · " +
         shortId(ask.session_id) + " · " + shortTime(ask.created_at) + (ask.state === "deferred" ? " · 보류됨" : "")),
     ]);
+    card.append(briefBlock(ask));
     for (const question of ask.questions) card.append(questionBlock(ask, question, picked));
     if (ask.questions.some(q => q.multiSelect)) {
       card.append(el("div", { class: "options" }, el("button", { class: "primary", onclick: () => submit(ask, picked) }, "선택 보내기")));

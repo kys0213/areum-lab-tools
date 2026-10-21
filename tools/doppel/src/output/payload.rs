@@ -195,6 +195,28 @@ pub struct SessionListData {
     pub sessions: Vec<SessionView>,
 }
 
+/// `stats` — how often briefs' recommendations were taken. `acceptance` is
+/// `null` until something was judged.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct StatsData {
+    pub briefs: u32,
+    pub failed: u32,
+    pub new_opinions: u32,
+    pub judged: u32,
+    pub accepted: u32,
+    pub acceptance: Option<f64>,
+    pub by_category: Vec<CategoryStatsData>,
+}
+
+/// `category` is `null` for asks whose ledger entries are not filed yet.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct CategoryStatsData {
+    pub category: Option<String>,
+    pub judged: u32,
+    pub accepted: u32,
+    pub acceptance: Option<f64>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(untagged)]
 pub enum Payload {
@@ -221,6 +243,7 @@ pub enum Payload {
     AskWait(AskView),
     AskAnswer(AskView),
     SessionList(SessionListData),
+    Stats(StatsData),
 }
 
 impl Payload {
@@ -364,6 +387,30 @@ impl Payload {
                 }
                 text
             }
+            Payload::Stats(d) => {
+                let percent = |rate: Option<f64>| {
+                    rate.map_or("-".to_owned(), |r| format!("{:.0}%", r * 100.0))
+                };
+                let mut text = format!(
+                    "{} brief(s), {} failed, {} new opinion(s); {} of {} recommendation(s) taken ({})",
+                    d.briefs,
+                    d.failed,
+                    d.new_opinions,
+                    d.accepted,
+                    d.judged,
+                    percent(d.acceptance)
+                );
+                for c in &d.by_category {
+                    text.push_str(&format!(
+                        "\n{}: {} of {} ({})",
+                        c.category.as_deref().unwrap_or("(uncategorized)"),
+                        c.accepted,
+                        c.judged,
+                        percent(c.acceptance)
+                    ));
+                }
+                text
+            }
             Payload::Search(d) => {
                 let mut text = format!("{} precedent(s) for \"{}\"", d.count, d.query);
                 for hit in &d.hits {
@@ -377,6 +424,27 @@ impl Payload {
 }
 
 fn format_ask(ask: &AskView) -> String {
+    let brief = ask
+        .brief
+        .as_ref()
+        .map_or(String::new(), |b| match b.state.as_str() {
+            "ready" => match (&b.recommendation, &b.new_opinion) {
+                (Some(r), _) => format!(
+                    "\n  doppel 추천: {} ({}) — {}",
+                    one_line(&r.to_string()),
+                    b.confidence.as_deref().unwrap_or("?"),
+                    one_line(b.rationale.as_deref().unwrap_or(""))
+                ),
+                (None, Some(opinion)) => format!("\n  doppel 새 의견: {}", one_line(opinion)),
+                (None, None) => String::new(),
+            },
+            "failed" => format!("\n  brief failed: {}", b.error.as_deref().unwrap_or("")),
+            _ => "\n  brief pending".to_owned(),
+        });
+    format!("{}{brief}", format_ask_line(ask))
+}
+
+fn format_ask_line(ask: &AskView) -> String {
     let questions = ask
         .questions
         .as_array()

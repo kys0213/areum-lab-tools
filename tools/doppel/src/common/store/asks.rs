@@ -167,6 +167,9 @@ impl Store {
             )
             .map_err(|e| constraint_err(e, format!("cannot close {id}")))?;
         let closed = self.get_ask(id)?;
+        if let Some(final_answers) = &closed.answers {
+            self.judge_brief(id, final_answers)?;
+        }
         let decisions = self.ledger_entries(&closed, &now)?;
         self.insert_decisions(&decisions)?;
         Ok(closed)
@@ -286,7 +289,7 @@ fn question_texts(questions: &Value) -> Result<Vec<&str>, AppError> {
 }
 
 /// Every question answered, nothing else: a label or a non-empty label list.
-fn validate_answers(questions: &Value, answers: &Value) -> Result<(), AppError> {
+pub(crate) fn validate_answers(questions: &Value, answers: &Value) -> Result<(), AppError> {
     let map = answers
         .as_object()
         .ok_or_else(|| usage("answers must be an object keyed by question"))?;

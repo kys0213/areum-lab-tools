@@ -15,12 +15,18 @@ use crate::common::store::Store;
 use crate::daemon::listen::{DaemonConfig, serve};
 use crate::daemon::state::Thresholds;
 
+use crate::daemon::brief::BriefConfig;
+
 struct Running {
     socket: PathBuf,
     task: JoinHandle<Result<(), AppError>>,
 }
 
 async fn start(dir: &TempDir) -> Running {
+    start_with(dir, None).await
+}
+
+async fn start_with(dir: &TempDir, brief: Option<BriefConfig>) -> Running {
     let socket = dir.path().join("d.sock");
     // The wall clock: the daemon judges session ages against real time.
     let store = Store::open(&dir.db_path()).unwrap();
@@ -28,6 +34,7 @@ async fn start(dir: &TempDir) -> Running {
         socket: socket.clone(),
         ui_port: None,
         thresholds: Thresholds::default(),
+        brief,
     };
     let (ready_tx, ready_rx) = oneshot::channel();
     let task = tokio::spawn(serve(store, config, Some(ready_tx)));
@@ -248,6 +255,7 @@ async fn a_second_daemon_is_refused_and_a_stale_socket_is_replaced() {
             socket: d.socket.clone(),
             ui_port: None,
             thresholds: Thresholds::default(),
+            brief: None,
         },
         None,
     )
@@ -273,4 +281,99 @@ async fn a_missing_daemon_is_a_network_error() {
         .unwrap_err();
     assert_eq!(err.kind, ErrorKind::Network);
     assert!(err.message.contains("doppel daemon start"));
+}
+
+/// A brief command that records its stdin and environment, then prints a
+/// brief recommending `label`.
+fn fake_brief(dir: &TempDir, label: &str) -> BriefConfig {
+    let brief = json!({
+        "background": "캐시 설계 중",
+        "recommendation": {"위치는?": label},
+        "confidence": "high",
+        "reversible": true,
+        "rationale": "지난번에도 같은 답",
+        "cited": []
+    });
+    let envelope = json!({"type": "result", "is_error": false, "result": brief.to_string()});
+    let script = dir.write(
+        "fake-brief.sh",
+        &format!(
+            "#!/bin/sh\ncat > \"$(dirname \"$0\")/bundle.json\"\necho \"$DOPPEL_DISABLE\" > \"$(dirname \"$0\")/env.txt\"\nprintf '%s' '{envelope}'\n"
+        ),
+    );
+    std::fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    BriefConfig {
+        argv: vec![script.display().to_string()],
+        timeout: Duration::from_secs(10),
+    }
+}
+
+async fn brief_state(socket: &Path, id: &str, want: &str) -> Value {
+    for _ in 0..100 {
+        let ask = get(socket, &format!("/v1/asks/{id}")).await.unwrap();
+        if ask["brief"]["state"] == want {
+            return ask;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("brief for {id} never reached {want}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_new_ask_gets_a_brief_and_its_acceptance_is_judged_on_close() {
+    let dir = TempDir::new("daemon-brief");
+    let d = start_with(&dir, Some(fake_brief(&dir, "디스크"))).await;
+    let id = open(&d.socket, "t1").await;
+
+    let ask = brief_state(&d.socket, &id, "ready").await;
+    assert_eq!(ask["brief"]["recommendation"], json!({"위치는?": "디스크"}));
+    assert_eq!(ask["brief"]["confidence"], "high");
+
+    let bundle: Value =
+        serde_json::from_str(&std::fs::read_to_string(dir.path().join("bundle.json")).unwrap())
+            .unwrap();
+    assert_eq!(bundle["ask"]["ask_id"], id.as_str());
+    assert_eq!(bundle["ask"]["questions"], questions());
+    assert_eq!(bundle["precedents"], json!([]));
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("env.txt"))
+            .unwrap()
+            .trim(),
+        "1",
+        "the brief's own session is kept off doppel"
+    );
+
+    let closed = post(
+        &d.socket,
+        &format!("/v1/asks/{id}/close"),
+        json!({"answers": {"위치는?": "디스크"}, "answered_by": "doppel-ui"}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(closed["brief"]["accepted"], true);
+    stop(d).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_brief_that_breaks_the_contract_is_failed_with_a_reason() {
+    let dir = TempDir::new("daemon-brief-bad");
+    let script = dir.write(
+        "bad-brief.sh",
+        "#!/bin/sh\ncat > /dev/null\necho '디스크가 좋겠어요'\n",
+    );
+    std::fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    let config = BriefConfig {
+        argv: vec![script.display().to_string()],
+        timeout: Duration::from_secs(10),
+    };
+    let d = start_with(&dir, Some(config)).await;
+    let id = open(&d.socket, "t1").await;
+    let ask = brief_state(&d.socket, &id, "failed").await;
+    assert!(
+        ask["brief"]["error"]
+            .as_str()
+            .unwrap()
+            .contains("not one JSON object")
+    );
+    stop(d).await;
 }

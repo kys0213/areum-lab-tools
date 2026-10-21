@@ -4,7 +4,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::common::store::{AskRecord, SessionFacts};
+use crate::common::store::{AskRecord, BriefRecord, SessionFacts};
 use crate::daemon::state::{Thresholds, derive_state};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -20,6 +20,50 @@ pub(crate) struct AskView {
     pub(crate) created_at: String,
     pub(crate) answered_at: Option<String>,
     pub(crate) closed_at: Option<String>,
+    /// `null` when the daemon writes no briefs.
+    #[serde(default)]
+    pub(crate) brief: Option<BriefView>,
+}
+
+/// The brief as the API shows it (docs/doppel-judgment.md §5).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub(crate) struct BriefView {
+    pub(crate) state: String,
+    pub(crate) background: Option<String>,
+    pub(crate) recommendation: Option<Value>,
+    pub(crate) new_opinion: Option<String>,
+    pub(crate) confidence: Option<String>,
+    pub(crate) reversible: Option<bool>,
+    pub(crate) rationale: Option<String>,
+    pub(crate) cited: Vec<String>,
+    pub(crate) error: Option<String>,
+    pub(crate) accepted: Option<bool>,
+}
+
+impl From<BriefRecord> for BriefView {
+    fn from(b: BriefRecord) -> Self {
+        BriefView {
+            state: b.state,
+            background: b.background,
+            recommendation: b.recommendation,
+            new_opinion: b.new_opinion,
+            confidence: b.confidence,
+            reversible: b.reversible,
+            rationale: b.rationale,
+            cited: b.cited,
+            error: b.error,
+            accepted: b.accepted,
+        }
+    }
+}
+
+impl AskView {
+    pub(crate) fn with_brief(ask: AskRecord, brief: Option<BriefRecord>) -> Self {
+        AskView {
+            brief: brief.map(BriefView::from),
+            ..AskView::from(ask)
+        }
+    }
 }
 
 impl From<AskRecord> for AskView {
@@ -36,6 +80,7 @@ impl From<AskRecord> for AskView {
             created_at: a.created_at,
             answered_at: a.answered_at,
             closed_at: a.closed_at,
+            brief: None,
         }
     }
 }

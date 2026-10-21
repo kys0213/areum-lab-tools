@@ -205,7 +205,9 @@ doppel 이 띄우는 headless 세션은 `--input-format stream-json` 으로 stdi
 ended_at, open_asks }` — `state` 는 [doppel.md §5](./doppel.md) 의 값.
 
 `Ask`: `{ ask_id, session_id, tool_use_id, kind, questions, state, answers, answered_by,
-created_at, answered_at, closed_at }`. `questions` 는 `AskUserQuestion` 입력 그대로
+created_at, answered_at, closed_at, brief }`. `brief` 는 데몬이 브리프를 쓰지 않으면 `null`,
+쓰면 `{ state: pending | ready | failed, background, recommendation, new_opinion, confidence,
+reversible, rationale, cited, error, accepted }` 다 ([doppel-judgment.md §5](./doppel-judgment.md)). `questions` 는 `AskUserQuestion` 입력 그대로
 (`[{ question, header, multiSelect, options: [{ label, description }] }]`), `answers` 는
 `{ "<question>": "<label>" | ["<label>", …] }`. 권한 확인(`kind: "permission"`)은 질문 하나
 (`"<도구> 실행 허용: <입력 요약>"`)에 선택지 `allow`·`deny` 다.
@@ -280,13 +282,40 @@ CREATE TABLE asks (
   CHECK ((state = 'closed') = (closed_at IS NOT NULL)),
   CHECK (state <> 'deferred' OR deferred_at IS NOT NULL)
 );
+
+CREATE TABLE briefs (
+  ask_id         TEXT PRIMARY KEY REFERENCES asks(id),
+  state          TEXT NOT NULL,                        -- pending | ready | failed
+  background     TEXT,
+  recommendation TEXT,                                 -- JSON answers
+  new_opinion    TEXT,
+  confidence     TEXT,                                 -- low | medium | high
+  reversible     INTEGER,
+  rationale      TEXT,
+  cited          TEXT NOT NULL DEFAULT '[]',           -- 인용한 판례 id
+  precedents     TEXT NOT NULL DEFAULT '[]',           -- 번들에 실은 판례 id
+  command        TEXT NOT NULL,                        -- 실행한 명령 (프롬프트 버전의 대리값)
+  error          TEXT,
+  accepted       INTEGER,                              -- 확정된 답이 추천과 같은가
+  created_at     TEXT NOT NULL,
+  finished_at    TEXT,
+  CHECK (state IN ('pending','ready','failed')),
+  CHECK (confidence IS NULL OR confidence IN ('low','medium','high')),
+  CHECK (reversible IS NULL OR reversible IN (0,1)),
+  CHECK (accepted IS NULL OR accepted IN (0,1)),
+  CHECK ((state = 'pending') = (finished_at IS NULL)),
+  CHECK (state <> 'ready' OR (confidence IS NOT NULL AND rationale IS NOT NULL
+                              AND (recommendation IS NOT NULL OR new_opinion IS NOT NULL))),
+  CHECK (state <> 'failed' OR error IS NOT NULL),
+  CHECK (accepted IS NULL OR (state = 'ready' AND recommendation IS NOT NULL))
+);
 ```
 
 ### `doppel` CLI 의 짝
 
 | 명령 | 하는 일 |
 |---|---|
-| `doppel daemon run [--ui-port N]` | 데몬을 이 프로세스에서 돌린다 |
+| `doppel daemon run [--ui-port N] [--no-ui] [--brief \| --brief-command "<cmd>"]` | 데몬을 이 프로세스에서 돌린다. 상태 기준값 `--stall-after-secs`·`--fail-streak`·`--heartbeat-timeout-secs`, 브리프 시간 제한 `--brief-timeout-secs` |
 | `doppel daemon start \| stop \| status` | 분리 실행 · `/v1/shutdown` · `/v1/health` |
 | `doppel attach --session <id>` | `/v1/attach/{id}` 를 열고 받은 메시지를 한 줄에 하나씩 stdout 으로 |
 | `doppel ask wait <ask-id> [--timeout <초>] --json` | `/v1/asks/{id}/wait` 를 감싼다 — hook 이 예산에 세지 않고 기다리는 수단. stdout 은 `{"ok":true,"command":"ask wait","data":<Ask>}` 한 줄이고, 데몬이 답하면 `data.state` 가 아직 `open` 이어도 exit 0 이다 |
