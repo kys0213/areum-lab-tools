@@ -64,7 +64,7 @@ plugin hook ◀── stdout JSON lines ── doppel attach ◀── WebSocket
 
 | kind | 처리 |
 |---|---|
-| `answer` | 대기 중인 질문이면 그 hook 이 경주에서 이긴다. 이미 보류된 질문이면 `$.prompt.submit` 으로 답을 담은 새 턴을 연다 |
+| `answer` | `{ kind, ask_id, tool_use_id, answers, answered_by }`. 보류된 질문의 늦은 답이다 — hook 이 `$.prompt.submit` 으로 답을 담은 새 턴을 열고 ask 를 `close` 한다. 닫히기 전에 attach 가 다시 열리면 다시 보낸다 |
 | `context` | `$.session.append` 로 진행 중 턴에 meta 행을 넣는다 |
 | `prompt` | `$.prompt.submit` 으로 새 턴을 연다 |
 
@@ -192,6 +192,7 @@ doppel 이 띄우는 headless 세션은 `--input-format stream-json` 으로 stdi
 | `GET /v1/sessions` | → `{ "sessions": [Session] }` (최근 이벤트 순) |
 | `POST /v1/asks` | `{ session_id, tool_use_id, kind, questions }` → `Ask` (같은 `session_id`·`tool_use_id` 면 기존 것) |
 | `GET /v1/asks?state=<state>` | → `{ "asks": [Ask] }` |
+| `GET /v1/asks/{id}` | → `Ask` |
 | `GET /v1/asks/{id}/wait?timeout_ms=<n>` | `open` 이 아니게 되거나 시간이 다 되면 → `Ask` |
 | `POST /v1/asks/{id}/answer` | `{ answers, answered_by }` → `Ask` — `open`·`deferred` 일 때만, 아니면 `409` |
 | `POST /v1/asks/{id}/defer` | → `Ask` — `open` 일 때만 |
@@ -223,12 +224,63 @@ open ──answer──▶ answered ──close──▶ closed
   먼저 이겼다면 `close` 가 터미널 답으로 덮는다.
 - `deferred` 에서 답이 오면 doppel 은 그 세션의 attach 연결로 `{ "kind": "answer", ask_id,
   tool_use_id, answers }` 를 보낸다.
+- 데몬이 멈추면 attach·UI WebSocket 도 닫힌다. plugin 은 attach 를 다시 띄우고, 다시 열린 연결에는
+  아직 닫히지 않은 늦은 답이 먼저 간다.
 - 세션이 `session.end` 를 보내면 남은 `open`·`deferred` ask 는 `closed`(`answered_by:
   "session-ended"`)가 된다.
 - `close` 에 `answers` 가 있으면 doppel 은 판단 원장에 기록한다. 질문은 세션 transcript
   ingest 와 같은 키(`source: "session"`, `<session_id>:<tool_use_id>:<순번>`)로 넣어 나중의
   ingest 가 중복을 만들지 않는다. 권한은 터미널에서 답한 것(`answered_by: "session"`)은 넣지
   않는다 — transcript 의 `permissionDecision` 이 그 기록이다.
+
+### 저장 스키마
+
+판단 원장과 같은 파일(`~/.areum/doppel/doppel.db`)에 둔다. 세션의 상태는 저장하지 않고 이
+사실들로 그때그때 판정한다 ([doppel.md §5](./doppel.md)).
+
+```sql
+CREATE TABLE sessions (
+  session_id        TEXT PRIMARY KEY,
+  cwd               TEXT,
+  surface           TEXT NOT NULL DEFAULT 'unknown',   -- terminal | headless | unknown
+  launched_by       TEXT NOT NULL DEFAULT 'user',      -- doppel | user
+  started_at        TEXT NOT NULL,
+  last_event_at     TEXT NOT NULL,
+  last_heartbeat_at TEXT NOT NULL,
+  turn_active       INTEGER NOT NULL DEFAULT 0,
+  fail_streak       INTEGER NOT NULL DEFAULT 0,        -- 이번 턴의 도구 실패 수
+  last_summary      TEXT,
+  ended_at          TEXT,
+  end_reason        TEXT,
+  CHECK (surface IN ('terminal','headless','unknown')),
+  CHECK (launched_by IN ('doppel','user')),
+  CHECK (turn_active IN (0,1)),
+  CHECK (fail_streak >= 0),
+  CHECK (ended_at IS NULL OR turn_active = 0)
+);
+
+CREATE TABLE asks (
+  id          TEXT PRIMARY KEY,                        -- ask-000001
+  session_id  TEXT NOT NULL REFERENCES sessions(session_id),
+  tool_use_id TEXT NOT NULL,
+  kind        TEXT NOT NULL,                           -- ask | permission
+  questions   TEXT NOT NULL,                           -- JSON, AskUserQuestion 입력 그대로
+  state       TEXT NOT NULL,                           -- open | deferred | answered | closed
+  answers     TEXT,                                    -- JSON
+  answered_by TEXT,
+  created_at  TEXT NOT NULL,
+  answered_at TEXT,
+  deferred_at TEXT,
+  closed_at   TEXT,
+  UNIQUE (session_id, tool_use_id),
+  CHECK (kind IN ('ask','permission')),
+  CHECK (state IN ('open','deferred','answered','closed')),
+  CHECK (state NOT IN ('open','deferred') OR (answers IS NULL AND answered_by IS NULL)),
+  CHECK (state <> 'answered' OR (answers IS NOT NULL AND answered_by IS NOT NULL)),
+  CHECK ((state = 'closed') = (closed_at IS NOT NULL)),
+  CHECK (state <> 'deferred' OR deferred_at IS NOT NULL)
+);
+```
 
 ### `doppel` CLI 의 짝
 
@@ -237,6 +289,6 @@ open ──answer──▶ answered ──close──▶ closed
 | `doppel daemon run [--ui-port N]` | 데몬을 이 프로세스에서 돌린다 |
 | `doppel daemon start \| stop \| status` | 분리 실행 · `/v1/shutdown` · `/v1/health` |
 | `doppel attach --session <id>` | `/v1/attach/{id}` 를 열고 받은 메시지를 한 줄에 하나씩 stdout 으로 |
-| `doppel ask wait <ask-id> [--timeout <초>]` | `/v1/asks/{id}/wait` 를 감싼다 — hook 이 예산에 세지 않고 기다리는 수단 |
-| `doppel ask list [--state <state>]` · `doppel ask answer <ask-id> --answer "<q>=<label>"` | inbox 를 터미널에서 |
+| `doppel ask wait <ask-id> [--timeout <초>] --json` | `/v1/asks/{id}/wait` 를 감싼다 — hook 이 예산에 세지 않고 기다리는 수단. stdout 은 `{"ok":true,"command":"ask wait","data":<Ask>}` 한 줄이고, 데몬이 답하면 `data.state` 가 아직 `open` 이어도 exit 0 이다 |
+| `doppel ask list [--state <state>]` · `doppel ask answer <ask-id> <label>… [--answer "<q>=<label>"]` | inbox 를 터미널에서 (`answered_by: "doppel-cli"`) |
 | `doppel session list` | 세션 상태 |

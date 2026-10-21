@@ -9,6 +9,8 @@ use std::collections::BTreeMap;
 
 use serde::Serialize;
 
+use crate::daemon::api::{AskView, SessionView};
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct OptionData {
     pub label: String,
@@ -163,6 +165,36 @@ pub struct SearchData {
     pub hits: Vec<SearchHitData>,
 }
 
+/// `daemon run|start|stop|status`. `running` is whether a daemon answers on
+/// `socket` after the command; `ui_url` is the web UI when it serves one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DaemonData {
+    pub running: bool,
+    pub socket: String,
+    pub ui_url: Option<String>,
+    pub pid: Option<u32>,
+    pub version: Option<String>,
+}
+
+/// `attach` ended: the daemon closed the connection after `messages` lines.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct AttachData {
+    pub session_id: String,
+    pub messages: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct AskListData {
+    pub count: usize,
+    pub asks: Vec<AskView>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct SessionListData {
+    pub count: usize,
+    pub sessions: Vec<SessionView>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(untagged)]
 pub enum Payload {
@@ -180,6 +212,15 @@ pub enum Payload {
     GoldenList(GoldenListData),
     Review(ReviewData),
     Search(SearchData),
+    DaemonRun(DaemonData),
+    DaemonStart(DaemonData),
+    DaemonStop(DaemonData),
+    DaemonStatus(DaemonData),
+    Attach(AttachData),
+    AskList(AskListData),
+    AskWait(AskView),
+    AskAnswer(AskView),
+    SessionList(SessionListData),
 }
 
 impl Payload {
@@ -275,6 +316,54 @@ impl Payload {
                 }
                 text
             }
+            Payload::DaemonRun(d) => format!("doppel daemon stopped ({})", d.socket),
+            Payload::DaemonStart(d) | Payload::DaemonStatus(d) if d.running => {
+                let mut text = format!(
+                    "doppel daemon running on {} (pid {}, v{})",
+                    d.socket,
+                    d.pid.map_or("?".to_owned(), |p| p.to_string()),
+                    d.version.as_deref().unwrap_or("?")
+                );
+                if let Some(url) = &d.ui_url {
+                    text.push_str(&format!("\nweb UI: {url}"));
+                }
+                text
+            }
+            Payload::DaemonStart(d) | Payload::DaemonStatus(d) => {
+                format!("doppel daemon is not running ({})", d.socket)
+            }
+            Payload::DaemonStop(d) => format!("doppel daemon stopped ({})", d.socket),
+            Payload::Attach(d) => format!(
+                "attach for {} closed after {} message(s)",
+                d.session_id, d.messages
+            ),
+            Payload::AskList(d) => {
+                let mut text = format!("{} ask(s)", d.count);
+                for ask in &d.asks {
+                    text.push('\n');
+                    text.push_str(&format_ask(ask));
+                }
+                text
+            }
+            Payload::AskWait(ask) | Payload::AskAnswer(ask) => format_ask(ask),
+            Payload::SessionList(d) => {
+                let mut text = format!("{} session(s)", d.count);
+                for s in &d.sessions {
+                    text.push_str(&format!(
+                        "\n{} [{}] {} {}{}",
+                        s.session_id,
+                        s.state,
+                        s.cwd.as_deref().unwrap_or("-"),
+                        s.last_event_at,
+                        if s.open_asks > 0 {
+                            format!(" ({} waiting)", s.open_asks)
+                        } else {
+                            String::new()
+                        }
+                    ));
+                }
+                text
+            }
             Payload::Search(d) => {
                 let mut text = format!("{} precedent(s) for \"{}\"", d.count, d.query);
                 for hit in &d.hits {
@@ -285,6 +374,28 @@ impl Payload {
             }
         }
     }
+}
+
+fn format_ask(ask: &AskView) -> String {
+    let questions = ask
+        .questions
+        .as_array()
+        .map(|qs| {
+            qs.iter()
+                .filter_map(|q| q["question"].as_str())
+                .map(one_line)
+                .collect::<Vec<_>>()
+                .join(" / ")
+        })
+        .unwrap_or_default();
+    let mut text = format!(
+        "{} [{}/{}] {} — {}",
+        ask.ask_id, ask.kind, ask.state, ask.session_id, questions
+    );
+    if let (Some(answers), Some(by)) = (&ask.answers, &ask.answered_by) {
+        text.push_str(&format!(" → {} (by {by})", one_line(&answers.to_string())));
+    }
+    text
 }
 
 /// Collapses newlines so a list row stays one row.

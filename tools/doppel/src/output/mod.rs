@@ -5,9 +5,10 @@ pub(crate) use crate::common::error::{AppError, exit_code};
 // The payload contract is this module's surface: command handlers import the
 // data types from here rather than reaching into `payload` directly.
 pub(crate) use payload::{
-    CategorizeData, CategoryData, CategoryListData, DecisionData, DecisionListData,
-    DecisionSummaryData, GoldenData, GoldenListData, GoldenSummaryData, IngestData, InitData,
-    OptionData, Payload, ReviewData, SearchData, SearchHitData,
+    AskListData, AttachData, CategorizeData, CategoryData, CategoryListData, DaemonData,
+    DecisionData, DecisionListData, DecisionSummaryData, GoldenData, GoldenListData,
+    GoldenSummaryData, IngestData, InitData, OptionData, Payload, ReviewData, SearchData,
+    SearchHitData, SessionListData,
 };
 
 /// Which stream a rendered line belongs on. Human-mode errors are
@@ -67,6 +68,7 @@ mod tests {
         for kind in [
             ErrorKind::Usage,
             ErrorKind::Config,
+            ErrorKind::Network,
             ErrorKind::NotFound,
             ErrorKind::Conflict,
             ErrorKind::Internal,

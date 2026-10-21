@@ -8,13 +8,19 @@
 //! transition or a tripped constraint is `conflict`. A raw rusqlite error only
 //! surfaces as `internal` when no specific kind applies.
 //!
+//! The daemon's tables (`sessions`, `asks`, docs/doppel-protocol.md §6) live
+//! in the same file: an ask that closes writes its answer into the ledger in
+//! the same database.
+//!
 //! Per-table behaviour lives in the child modules; this file holds what they
 //! share — the connection, the clock, id minting and error mapping.
 
+mod asks;
 mod categories;
 mod decisions;
 mod golden;
 mod search;
+mod sessions;
 
 use std::path::Path;
 
@@ -23,14 +29,17 @@ use rusqlite::{Connection, ErrorCode};
 use crate::common::error::{AppError, ErrorKind};
 use crate::common::time::now_rfc3339;
 
+pub(crate) use asks::AskRecord;
 pub(crate) use categories::CategoryRecord;
 pub(crate) use decisions::{ChoiceOption, DecisionFilter, DecisionRecord, NewDecision};
 pub(crate) use golden::{GoldenFilter, GoldenRecord};
 pub(crate) use search::{SearchFilter, fts_query};
+pub(crate) use sessions::{SessionEvent, SessionFacts};
 
-/// Wall-clock source for `created_at`/`reviewed_at`. Injected so tests pin
-/// exact timestamps and, with them, every tie-break that orders by time.
-pub(crate) trait Clock {
+/// Wall-clock source for every time column. Injected so tests pin exact
+/// timestamps and, with them, every tie-break that orders by time. `Send`
+/// because the daemon shares the store across its request handlers.
+pub(crate) trait Clock: Send {
     fn now(&self) -> String;
 }
 
@@ -219,6 +228,50 @@ CREATE TABLE IF NOT EXISTS golden (
 CREATE VIRTUAL TABLE IF NOT EXISTS golden_fts USING fts5(
   golden_id UNINDEXED, question, answers, rationale, context,
   tokenize = 'unicode61'
+);
+
+CREATE TABLE IF NOT EXISTS sessions (
+  session_id        TEXT PRIMARY KEY,
+  cwd               TEXT,
+  surface           TEXT NOT NULL DEFAULT 'unknown',
+  launched_by       TEXT NOT NULL DEFAULT 'user',
+  started_at        TEXT NOT NULL,
+  last_event_at     TEXT NOT NULL,
+  last_heartbeat_at TEXT NOT NULL,
+  turn_active       INTEGER NOT NULL DEFAULT 0,
+  fail_streak       INTEGER NOT NULL DEFAULT 0,
+  last_summary      TEXT,
+  ended_at          TEXT,
+  end_reason        TEXT,
+
+  CHECK (surface IN ('terminal','headless','unknown')),
+  CHECK (launched_by IN ('doppel','user')),
+  CHECK (turn_active IN (0,1)),
+  CHECK (fail_streak >= 0),
+  CHECK (ended_at IS NULL OR turn_active = 0)
+);
+
+CREATE TABLE IF NOT EXISTS asks (
+  id          TEXT PRIMARY KEY,
+  session_id  TEXT NOT NULL REFERENCES sessions(session_id),
+  tool_use_id TEXT NOT NULL,
+  kind        TEXT NOT NULL,
+  questions   TEXT NOT NULL,
+  state       TEXT NOT NULL,
+  answers     TEXT,
+  answered_by TEXT,
+  created_at  TEXT NOT NULL,
+  answered_at TEXT,
+  deferred_at TEXT,
+  closed_at   TEXT,
+
+  UNIQUE (session_id, tool_use_id),
+  CHECK (kind IN ('ask','permission')),
+  CHECK (state IN ('open','deferred','answered','closed')),
+  CHECK (state NOT IN ('open','deferred') OR (answers IS NULL AND answered_by IS NULL)),
+  CHECK (state <> 'answered' OR (answers IS NOT NULL AND answered_by IS NOT NULL)),
+  CHECK ((state = 'closed') = (closed_at IS NOT NULL)),
+  CHECK (state <> 'deferred' OR deferred_at IS NOT NULL)
 );
 ";
 

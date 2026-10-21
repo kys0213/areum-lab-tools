@@ -16,7 +16,7 @@ pub(crate) fn now_rfc3339() -> String {
 /// A pre-epoch system clock is not a state the ledger can represent: clamping
 /// it would stamp `1970-01-01T00:00:00Z` into `created_at` and silently place
 /// the row ahead of every real entry in time-ordered listings.
-fn now_epoch_secs() -> u64 {
+pub(crate) fn now_epoch_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("system clock is after the Unix epoch")
@@ -49,6 +49,31 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
     let day = (doy - (153 * mp + 2) / 5 + 1) as u32;
     let month = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
     (if month <= 2 { year + 1 } else { year }, month, day)
+}
+
+/// Seconds since the Unix epoch of a canonical timestamp — the inverse of
+/// [`format_epoch_secs`], for the session-state thresholds that compare two
+/// stored instants. `None` for anything not in the canonical shape.
+pub(crate) fn epoch_from_canonical(raw: &str) -> Option<u64> {
+    if raw.len() != 20 || !raw.ends_with('Z') || !has_datetime_shape(&raw[..19]) {
+        return None;
+    }
+    let field = |range: std::ops::Range<usize>| raw[range].parse::<i64>().ok();
+    let (year, month, day) = (field(0..4)?, field(5..7)?, field(8..10)?);
+    let (hour, minute, second) = (field(11..13)?, field(14..16)?, field(17..19)?);
+    let days = days_from_civil(year, month, day);
+    u64::try_from(days * 86_400 + hour * 3_600 + minute * 60 + second).ok()
+}
+
+/// Hinnant's `days_from_civil`, the inverse of [`civil_from_days`].
+fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let mp = if month > 2 { month - 3 } else { month + 9 };
+    let doy = (153 * mp + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
 }
 
 /// Normalizes a transcript timestamp (`2026-10-21T14:47:37.935Z`, with or
@@ -124,6 +149,15 @@ mod tests {
         assert!(now.ends_with('Z'));
         assert_eq!(now.as_bytes()[10], b'T');
     }
+    #[test]
+    fn epoch_round_trips_through_the_canonical_shape() {
+        for secs in [0, 1_700_000_000, 1_709_164_800, 4_102_444_799] {
+            assert_eq!(epoch_from_canonical(&format_epoch_secs(secs)), Some(secs));
+        }
+        assert_eq!(epoch_from_canonical("2026-10-21T14:47:37.9Z"), None);
+        assert_eq!(epoch_from_canonical("garbage"), None);
+    }
+
     #[test]
     fn transcript_timestamps_drop_fractional_seconds() {
         assert_eq!(

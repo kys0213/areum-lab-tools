@@ -13,6 +13,11 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub db: Option<String>,
 
+    /// Daemon socket override (default: $DOPPEL_SOCKET, else
+    /// ~/.areum/doppel/doppel.sock).
+    #[arg(long, global = true)]
+    pub socket: Option<String>,
+
     /// Emit machine-readable JSON envelope instead of human text.
     /// Agents should always pass this flag.
     #[arg(long, global = true)]
@@ -66,6 +71,96 @@ pub enum Command {
         #[arg(long = "include-candidates")]
         include_candidates: bool,
     },
+
+    /// Run or control the resident daemon that sessions connect to.
+    #[command(subcommand)]
+    Daemon(DaemonCommand),
+
+    /// Stream doppel's messages for one session to stdout, one JSON object
+    /// per line, until the daemon closes the connection. The plugin runs
+    /// this for the session's life.
+    Attach {
+        /// Claude Code session id.
+        #[arg(long)]
+        session: String,
+    },
+
+    /// Questions and permission confirmations relayed from sessions.
+    #[command(subcommand)]
+    Ask(AskCommand),
+
+    /// Sessions connected to the daemon.
+    #[command(subcommand)]
+    Session(SessionCommand),
+}
+
+/// Daemon settings shared by `run` and `start`. The thresholds decide the
+/// session states (docs/doppel.md §5); the daemon never adjusts them itself.
+#[derive(clap::Args, Debug, Clone, PartialEq, Eq)]
+pub struct DaemonOptions {
+    /// Loopback port of the web UI.
+    #[arg(long = "ui-port", default_value_t = 7319)]
+    pub ui_port: u16,
+    /// Serve no web UI.
+    #[arg(long = "no-ui")]
+    pub no_ui: bool,
+    /// A running turn with no event for this long is `stalled`.
+    #[arg(long = "stall-after-secs", default_value_t = 600)]
+    pub stall_after_secs: u64,
+    /// This many tool failures in one turn is `failing`.
+    #[arg(long = "fail-streak", default_value_t = 3)]
+    pub fail_streak: u32,
+    /// No sign of life for this long is `disconnected`.
+    #[arg(long = "heartbeat-timeout-secs", default_value_t = 90)]
+    pub heartbeat_timeout_secs: u64,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum DaemonCommand {
+    /// Run the daemon in this process until `daemon stop`, SIGINT or SIGTERM.
+    Run(DaemonOptions),
+    /// Start the daemon in the background and wait until it answers.
+    Start(DaemonOptions),
+    /// Ask the running daemon to stop.
+    Stop,
+    /// Whether a daemon answers on the socket.
+    Status,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum AskCommand {
+    /// List asks, newest first.
+    List {
+        /// Only asks in this state (open | deferred | answered | closed).
+        #[arg(long)]
+        state: Option<String>,
+    },
+    /// Wait until the ask leaves `open`, or the timeout runs out (the ask is
+    /// then answered still open — call again).
+    Wait {
+        /// Ask id (ask-000001).
+        id: String,
+        /// Seconds to wait, at most 590.
+        #[arg(long, default_value_t = 590)]
+        timeout: u64,
+    },
+    /// Answer an ask from the terminal.
+    Answer {
+        /// Ask id (ask-000001).
+        id: String,
+        /// The chosen label(s), for an ask with a single question.
+        labels: Vec<String>,
+        /// `<question>=<label>`; repeat for several questions or several
+        /// labels of a multi-select question.
+        #[arg(long = "answer")]
+        answers: Vec<String>,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum SessionCommand {
+    /// List sessions with their derived state, most recently active first.
+    List,
 }
 
 #[derive(Subcommand, Debug)]
@@ -275,6 +370,15 @@ impl Command {
             Command::Golden(GoldenCommand::List { .. }) => "golden list",
             Command::Review => "review",
             Command::Search { .. } => "search",
+            Command::Daemon(DaemonCommand::Run(_)) => "daemon run",
+            Command::Daemon(DaemonCommand::Start(_)) => "daemon start",
+            Command::Daemon(DaemonCommand::Stop) => "daemon stop",
+            Command::Daemon(DaemonCommand::Status) => "daemon status",
+            Command::Attach { .. } => "attach",
+            Command::Ask(AskCommand::List { .. }) => "ask list",
+            Command::Ask(AskCommand::Wait { .. }) => "ask wait",
+            Command::Ask(AskCommand::Answer { .. }) => "ask answer",
+            Command::Session(SessionCommand::List) => "session list",
         }
     }
 }
@@ -354,6 +458,47 @@ mod tests {
                 assert!(!include_candidates);
             }
             other => panic!("expected search, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn daemon_options_default_to_the_documented_values() {
+        let cli = Cli::try_parse_from(["doppel", "daemon", "run"]).unwrap();
+        match cli.command {
+            Command::Daemon(DaemonCommand::Run(options)) => {
+                assert_eq!(options.ui_port, 7319);
+                assert!(!options.no_ui);
+                assert_eq!(options.stall_after_secs, 600);
+                assert_eq!(options.fail_streak, 3);
+                assert_eq!(options.heartbeat_timeout_secs, 90);
+            }
+            other => panic!("expected daemon run, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ask_answer_takes_labels_or_question_pairs() {
+        let cli = Cli::try_parse_from([
+            "doppel",
+            "ask",
+            "answer",
+            "ask-000001",
+            "A",
+            "--answer",
+            "범위는?=API",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Ask(AskCommand::Answer {
+                id,
+                labels,
+                answers,
+            }) => {
+                assert_eq!(id, "ask-000001");
+                assert_eq!(labels, ["A"]);
+                assert_eq!(answers, ["범위는?=API"]);
+            }
+            other => panic!("expected ask answer, got {other:?}"),
         }
     }
 

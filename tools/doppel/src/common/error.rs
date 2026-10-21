@@ -8,6 +8,8 @@ use serde::Serialize;
 pub enum ErrorKind {
     Usage,
     Config,
+    /// The daemon could not be reached over its socket.
+    Network,
     NotFound,
     Conflict,
     Internal,
@@ -18,6 +20,7 @@ impl ErrorKind {
         match self {
             ErrorKind::Usage => "usage",
             ErrorKind::Config => "config",
+            ErrorKind::Network => "network",
             ErrorKind::NotFound => "not_found",
             ErrorKind::Conflict => "conflict",
             ErrorKind::Internal => "internal",
@@ -54,6 +57,7 @@ pub fn exit_code(err: &AppError) -> i32 {
         ErrorKind::Internal => 1,
         ErrorKind::Usage => 2,
         ErrorKind::Config => 3,
+        ErrorKind::Network => 6,
         ErrorKind::NotFound => 7,
         ErrorKind::Conflict => 8,
     }
@@ -69,6 +73,7 @@ mod tests {
             (ErrorKind::Internal, 1),
             (ErrorKind::Usage, 2),
             (ErrorKind::Config, 3),
+            (ErrorKind::Network, 6),
             (ErrorKind::NotFound, 7),
             (ErrorKind::Conflict, 8),
         ];

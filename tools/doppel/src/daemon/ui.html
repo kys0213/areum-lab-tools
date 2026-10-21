@@ -1,0 +1,219 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>doppel</title>
+<style>
+  :root {
+    --bg: #f6f6f4; --panel: #ffffff; --text: #1d1d1b; --muted: #6b6b66;
+    --line: #e2e2dd; --accent: #2f5fd0; --accent-text: #ffffff;
+    --warn: #b45309; --bad: #b42318; --ok: #157347;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #151514; --panel: #1f1f1d; --text: #ececea; --muted: #9a9a94;
+      --line: #33332f; --accent: #7fa2ff; --accent-text: #0b0b0a;
+      --warn: #f0a24a; --bad: #f07167; --ok: #5cc08a;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+         font: 15px/1.5 -apple-system, BlinkMacSystemFont, "Apple SD Gothic Neo", "Segoe UI", sans-serif; }
+  header { display: flex; align-items: baseline; gap: 12px; padding: 16px 20px; border-bottom: 1px solid var(--line); }
+  header h1 { font-size: 18px; margin: 0; }
+  header .status { color: var(--muted); font-size: 13px; }
+  main { display: grid; grid-template-columns: minmax(0, 3fr) minmax(0, 2fr); gap: 20px; padding: 20px; max-width: 1280px; margin: 0 auto; }
+  @media (max-width: 900px) { main { grid-template-columns: 1fr; padding: 16px; } }
+  h2 { font-size: 14px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); margin: 0 0 10px; }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px; margin-bottom: 12px; }
+  .empty { color: var(--muted); padding: 12px 0; }
+  .meta { color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
+  .question { font-weight: 600; margin: 8px 0 6px; }
+  .options { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 6px; }
+  button { font: inherit; border: 1px solid var(--line); background: var(--bg); color: var(--text);
+           border-radius: 8px; padding: 6px 12px; cursor: pointer; text-align: left; }
+  button:hover { border-color: var(--accent); }
+  button.primary { background: var(--accent); color: var(--accent-text); border-color: var(--accent); }
+  button .desc { display: block; font-size: 12px; color: var(--muted); }
+  button.primary .desc { color: inherit; opacity: .8; }
+  button.selected { border-color: var(--accent); box-shadow: inset 0 0 0 1px var(--accent); }
+  .other { display: flex; gap: 8px; margin-top: 8px; }
+  .other input { flex: 1; min-width: 0; font: inherit; padding: 6px 10px; border-radius: 8px;
+                 border: 1px solid var(--line); background: var(--bg); color: var(--text); }
+  table { width: 100%; border-collapse: collapse; }
+  td, th { text-align: left; padding: 8px 6px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  th { font-size: 12px; color: var(--muted); font-weight: 500; }
+  .state { font-size: 12px; padding: 2px 8px; border-radius: 999px; border: 1px solid var(--line); white-space: nowrap; }
+  .state.waiting_ask, .state.waiting_permission { color: var(--warn); border-color: var(--warn); }
+  .state.failing, .state.stalled, .state.disconnected { color: var(--bad); border-color: var(--bad); }
+  .state.running { color: var(--ok); border-color: var(--ok); }
+  .summary { color: var(--muted); font-size: 13px; }
+  .table-wrap { overflow-x: auto; }
+</style>
+</head>
+<body>
+<header>
+  <h1>doppel</h1>
+  <span class="status" id="status">연결 중…</span>
+</header>
+<main>
+  <section>
+    <h2>답을 기다리는 질문</h2>
+    <div id="inbox"></div>
+  </section>
+  <section>
+    <h2>세션</h2>
+    <div class="card table-wrap">
+      <table>
+        <thead><tr><th>상태</th><th>세션</th><th>마지막</th></tr></thead>
+        <tbody id="sessions"></tbody>
+      </table>
+    </div>
+  </section>
+</main>
+<script>
+const STATE_LABEL = {
+  running: "진행 중", waiting_ask: "질문 대기", waiting_permission: "권한 대기",
+  waiting_turn: "입력 대기", stalled: "정체", failing: "반복 실패",
+  disconnected: "끊김", ended: "종료",
+};
+
+function el(tag, attrs, children) {
+  const node = document.createElement(tag);
+  for (const [key, value] of Object.entries(attrs || {})) {
+    if (key === "class") node.className = value;
+    else if (key.startsWith("on")) node.addEventListener(key.slice(2), value);
+    else node.setAttribute(key, value);
+  }
+  for (const child of [].concat(children || [])) {
+    node.append(child instanceof Node ? child : document.createTextNode(String(child)));
+  }
+  return node;
+}
+
+async function api(path, body) {
+  const response = await fetch(path, body === undefined ? {} : {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "X-Doppel-Client": "ui" },
+    body: JSON.stringify(body),
+  });
+  const data = await response.json();
+  if (!response.ok) throw new Error(data.error ? data.error.message : response.statusText);
+  return data;
+}
+
+function shortTime(at) { return at ? at.slice(5, 16).replace("T", " ") : ""; }
+function shortId(id) { return id.length > 12 ? id.slice(0, 8) : id; }
+
+function renderSessions(sessions) {
+  const body = document.getElementById("sessions");
+  body.replaceChildren();
+  if (sessions.length === 0) {
+    body.append(el("tr", {}, el("td", { colspan: "3", class: "empty" }, "연결된 세션이 없습니다")));
+    return;
+  }
+  for (const s of sessions) {
+    body.append(el("tr", {}, [
+      el("td", {}, el("span", { class: "state " + s.state }, STATE_LABEL[s.state] || s.state)),
+      el("td", {}, [
+        el("div", {}, (s.cwd || "-") + "  "),
+        el("div", { class: "meta" }, shortId(s.session_id) + " · " + s.surface + (s.open_asks ? " · 질문 " + s.open_asks : "")),
+        s.last_summary ? el("div", { class: "summary" }, s.last_summary) : "",
+      ]),
+      el("td", { class: "meta" }, shortTime(s.last_event_at)),
+    ]));
+  }
+}
+
+function questionBlock(ask, question, picked) {
+  const multi = Boolean(question.multiSelect);
+  const options = el("div", { class: "options" });
+  for (const option of question.options || []) {
+    const button = el("button", {
+      onclick: () => {
+        if (multi) {
+          const set = picked[question.question] || (picked[question.question] = new Set());
+          set.has(option.label) ? set.delete(option.label) : set.add(option.label);
+          button.classList.toggle("selected");
+        } else {
+          picked[question.question] = option.label;
+          submit(ask, picked);
+        }
+      },
+    }, [option.label, option.description ? el("span", { class: "desc" }, option.description) : ""]);
+    options.append(button);
+  }
+  const input = el("input", { placeholder: "직접 입력" });
+  const other = el("div", { class: "other" }, [input, el("button", {
+    onclick: () => {
+      if (!input.value.trim()) return;
+      picked[question.question] = multi ? new Set([input.value.trim()]) : input.value.trim();
+      submit(ask, picked);
+    },
+  }, "보내기")]);
+  return el("div", {}, [el("div", { class: "question" }, question.question), options, other]);
+}
+
+async function submit(ask, picked) {
+  const answers = {};
+  for (const question of ask.questions) {
+    const value = picked[question.question];
+    if (value === undefined || (value instanceof Set && value.size === 0)) return;
+    answers[question.question] = value instanceof Set ? [...value] : value;
+  }
+  try {
+    await api("/v1/asks/" + ask.ask_id + "/answer", { answers, answered_by: "doppel-ui" });
+  } catch (error) {
+    alert("답을 보내지 못했습니다: " + error.message);
+  }
+  refresh();
+}
+
+function renderInbox(asks) {
+  const inbox = document.getElementById("inbox");
+  inbox.replaceChildren();
+  const waiting = asks.filter(a => a.state === "open" || a.state === "deferred");
+  if (waiting.length === 0) {
+    inbox.append(el("div", { class: "empty" }, "기다리는 질문이 없습니다"));
+    return;
+  }
+  for (const ask of waiting) {
+    const picked = {};
+    const card = el("div", { class: "card" }, [
+      el("div", { class: "meta" }, (ask.kind === "permission" ? "권한 확인" : "질문") + " · " +
+        shortId(ask.session_id) + " · " + shortTime(ask.created_at) + (ask.state === "deferred" ? " · 보류됨" : "")),
+    ]);
+    for (const question of ask.questions) card.append(questionBlock(ask, question, picked));
+    if (ask.questions.some(q => q.multiSelect)) {
+      card.append(el("div", { class: "options" }, el("button", { class: "primary", onclick: () => submit(ask, picked) }, "선택 보내기")));
+    }
+    inbox.append(card);
+  }
+}
+
+async function refresh() {
+  try {
+    const [sessions, asks] = await Promise.all([api("/v1/sessions"), api("/v1/asks")]);
+    renderSessions(sessions.sessions);
+    renderInbox(asks.asks);
+  } catch (error) {
+    document.getElementById("status").textContent = "불러오지 못함: " + error.message;
+  }
+}
+
+function connect() {
+  const socket = new WebSocket("ws://" + location.host + "/v1/ui");
+  socket.onopen = () => { document.getElementById("status").textContent = "연결됨"; refresh(); };
+  socket.onmessage = () => refresh();
+  socket.onclose = () => {
+    document.getElementById("status").textContent = "끊김 — 다시 연결하는 중";
+    setTimeout(connect, 2000);
+  };
+}
+
+connect();
+setInterval(refresh, 30000);
+</script>
+</body>
+</html>

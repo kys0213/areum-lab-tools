@@ -39,6 +39,25 @@ pub(crate) fn resolve_transcript_root(
         })
 }
 
+/// The `--socket` flag, else `$DOPPEL_SOCKET` (what the plugin reads too),
+/// else `~/.areum/doppel/doppel.sock`.
+pub(crate) fn resolve_socket_path(
+    flag: Option<&str>,
+    env: Option<&str>,
+    home: Option<&str>,
+) -> Result<PathBuf, AppError> {
+    if let Some(path) = flag.or(env).filter(|p| !p.is_empty()) {
+        return Ok(PathBuf::from(path));
+    }
+    home.map(|h| PathBuf::from(h).join(".areum/doppel/doppel.sock"))
+        .ok_or_else(|| {
+            AppError::new(
+                ErrorKind::Config,
+                "HOME is not set; cannot locate ~/.areum/doppel/doppel.sock (pass --socket)",
+            )
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -74,5 +93,25 @@ mod tests {
         let err = resolve_transcript_root(None, None).unwrap_err();
         assert_eq!(err.kind, ErrorKind::Config);
         assert!(err.message.contains("--root"));
+    }
+
+    #[test]
+    fn socket_flag_beats_env_beats_home() {
+        assert_eq!(
+            resolve_socket_path(Some("/a.sock"), Some("/b.sock"), Some("/home/u")).unwrap(),
+            PathBuf::from("/a.sock")
+        );
+        assert_eq!(
+            resolve_socket_path(None, Some("/b.sock"), Some("/home/u")).unwrap(),
+            PathBuf::from("/b.sock")
+        );
+        assert_eq!(
+            resolve_socket_path(None, None, Some("/home/u")).unwrap(),
+            PathBuf::from("/home/u/.areum/doppel/doppel.sock")
+        );
+        assert_eq!(
+            resolve_socket_path(None, None, None).unwrap_err().kind,
+            ErrorKind::Config
+        );
     }
 }

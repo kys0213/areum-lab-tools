@@ -227,11 +227,11 @@ doppel search "<질문>" [--category <name>] [--project <path>] [--limit 5] [--i
 ### 세션·칸반·데몬 (P1 이후)
 
 ```sh
-doppel daemon start | stop | status
+doppel daemon run | start | stop | status      # --ui-port · --no-ui · 상태 기준값
 doppel attach --session <id>                   # plugin 이 띄우는 세션별 연결
-doppel ask create | wait | answer | close      # doppel 채널의 질문 (doppel-protocol.md)
-doppel session list [--state <state>]
-doppel card add | list | triage | claim | done | release
+doppel ask list | wait | answer                # 질문 inbox (doppel-protocol.md §6)
+doppel session list
+doppel card add | list | triage | claim | done | release   # P3
 ```
 
 ---
@@ -241,8 +241,9 @@ doppel card add | list | triage | claim | done | release
 `~/.areum/doppel/doppel.db` (rusqlite, bundled, FTS5). 연결마다
 `PRAGMA foreign_keys = ON` 을 건다. 시각은 `YYYY-MM-DDTHH:MM:SSZ` 문자열이다.
 
-판단 원장·카테고리·골든셋·검색 색인은 [doppel-judgment.md §6](./doppel-judgment.md)에
-정의한다. 세션·ask·카드 테이블은 해당 단계에서 이 문서에 더한다.
+판단 원장·카테고리·골든셋·검색 색인은 [doppel-judgment.md §6](./doppel-judgment.md)에,
+세션·ask 테이블은 [doppel-protocol.md §6](./doppel-protocol.md)에 정의한다. 카드 테이블은
+P3 에서 더한다.
 
 ---
 
@@ -255,6 +256,7 @@ discord·kanban 과 공유하는 kind 는 같은 번호를 쓴다.
 | `internal` | 1 | 예기치 못한 실패 |
 | `usage` | 2 | 인자 조합 오류 |
 | `config` | 3 | HOME 없음, DB 파일 손상 |
+| `network` | 6 | 데몬 socket 에 닿지 못함 (`doppel daemon start` 전) |
 | `not_found` | 7 | 판단·카테고리·골든 없음 |
 | `conflict` | 8 | 전이 규칙 위반 (확정된 골든을 다시 확정, 폐기된 카테고리로 분류 등) |
 

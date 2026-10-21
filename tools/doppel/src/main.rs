@@ -1,6 +1,7 @@
 mod cli;
 mod commands;
 mod common;
+mod daemon;
 mod ingest;
 mod output;
 
@@ -8,8 +9,11 @@ use std::path::Path;
 
 use clap::Parser;
 
-use cli::{CategoryCommand, Cli, Command, DecisionCommand, GoldenCommand, IngestCommand};
-use common::config::{resolve_db_path, resolve_transcript_root};
+use cli::{
+    AskCommand, CategoryCommand, Cli, Command, DaemonCommand, DecisionCommand, GoldenCommand,
+    IngestCommand, SessionCommand,
+};
+use common::config::{resolve_db_path, resolve_socket_path, resolve_transcript_root};
 use common::store::{DecisionFilter, GoldenFilter, SearchFilter};
 use output::{AppError, Payload, Sink};
 
@@ -33,6 +37,14 @@ fn run(cli: Cli) -> Result<Payload, AppError> {
     let home = std::env::var("HOME").ok();
     let db_path = resolve_db_path(cli.db.as_deref(), home.as_deref())?;
     let db = db_path.as_path();
+    let socket_env = std::env::var("DOPPEL_SOCKET").ok();
+    let socket = || {
+        resolve_socket_path(
+            cli.socket.as_deref(),
+            socket_env.as_deref(),
+            home.as_deref(),
+        )
+    };
 
     match cli.command {
         Command::Init => commands::run_init(db),
@@ -105,6 +117,27 @@ fn run(cli: Cli) -> Result<Payload, AppError> {
                 limit,
             },
         ),
+        Command::Daemon(DaemonCommand::Run(options)) => {
+            commands::run_daemon_run(db, &socket()?, &options)
+        }
+        Command::Daemon(DaemonCommand::Start(options)) => {
+            commands::run_daemon_start(db, &socket()?, &options)
+        }
+        Command::Daemon(DaemonCommand::Stop) => commands::run_daemon_stop(&socket()?),
+        Command::Daemon(DaemonCommand::Status) => commands::run_daemon_status(&socket()?),
+        Command::Attach { ref session } => commands::run_attach(&socket()?, session),
+        Command::Ask(AskCommand::List { ref state }) => {
+            commands::run_ask_list(&socket()?, state.as_deref())
+        }
+        Command::Ask(AskCommand::Wait { ref id, timeout }) => {
+            commands::run_ask_wait(&socket()?, id, timeout)
+        }
+        Command::Ask(AskCommand::Answer {
+            ref id,
+            ref labels,
+            ref answers,
+        }) => commands::run_ask_answer(&socket()?, id, labels, answers),
+        Command::Session(SessionCommand::List) => commands::run_session_list(&socket()?),
     }
 }
 
