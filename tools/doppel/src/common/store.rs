@@ -1,0 +1,264 @@
+//! SQLite persistence for the judgment ledger. Owns the schema of
+//! docs/doppel-judgment.md §6 verbatim, so an inconsistent row — a reviewed
+//! candidate, a superseded precedent that is not retired, a half-filed
+//! category — is unwritable.
+//!
+//! Every failure leaves here as an [`AppError`] with the kind the CLI contract
+//! promises (docs/doppel.md §9): a missing row is `not_found`, a refused
+//! transition or a tripped constraint is `conflict`. A raw rusqlite error only
+//! surfaces as `internal` when no specific kind applies.
+//!
+//! Per-table behaviour lives in the child modules; this file holds what they
+//! share — the connection, the clock, id minting and error mapping.
+
+mod categories;
+mod decisions;
+mod golden;
+mod search;
+
+use std::path::Path;
+
+use rusqlite::{Connection, ErrorCode};
+
+use crate::common::error::{AppError, ErrorKind};
+use crate::common::time::now_rfc3339;
+
+pub(crate) use categories::CategoryRecord;
+pub(crate) use decisions::{ChoiceOption, DecisionFilter, DecisionRecord, NewDecision};
+pub(crate) use golden::{GoldenFilter, GoldenRecord};
+pub(crate) use search::{SearchFilter, fts_query};
+
+/// Wall-clock source for `created_at`/`reviewed_at`. Injected so tests pin
+/// exact timestamps and, with them, every tie-break that orders by time.
+pub(crate) trait Clock {
+    fn now(&self) -> String;
+}
+
+pub(crate) struct SystemClock;
+
+impl Clock for SystemClock {
+    fn now(&self) -> String {
+        now_rfc3339()
+    }
+}
+
+/// How long a statement waits on a lock held by another connection (a
+/// concurrent `ingest`) before giving up.
+const BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(5_000);
+
+pub(crate) struct Store {
+    conn: Connection,
+    clock: Box<dyn Clock>,
+}
+
+impl Store {
+    /// Opens (creating if needed) the database with the wall clock.
+    pub(crate) fn open(path: &Path) -> Result<Store, AppError> {
+        Store::open_with_clock(path, Box::new(SystemClock))
+    }
+
+    /// Same as [`Store::open`], additionally reporting whether this call
+    /// created the database file. `init` is the only caller that needs it.
+    pub(crate) fn open_reporting_created(path: &Path) -> Result<(Store, bool), AppError> {
+        Store::open_with_clock_reporting_created(path, Box::new(SystemClock))
+    }
+
+    pub(crate) fn open_with_clock(path: &Path, clock: Box<dyn Clock>) -> Result<Store, AppError> {
+        Store::open_with_clock_reporting_created(path, clock).map(|(store, _created)| store)
+    }
+
+    /// Creates the parent directory, configures the connection (foreign keys,
+    /// WAL, busy timeout) and ensures the schema — all idempotent, so opening
+    /// an existing database is the same call as creating one. The existence
+    /// check sits right before the call that would create the file.
+    fn open_with_clock_reporting_created(
+        path: &Path,
+        clock: Box<dyn Clock>,
+    ) -> Result<(Store, bool), AppError> {
+        if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+            std::fs::create_dir_all(parent).map_err(|e| {
+                AppError::new(
+                    ErrorKind::Internal,
+                    format!("failed to create db directory {}: {e}", parent.display()),
+                )
+            })?;
+        }
+
+        let created = !path.exists();
+        let conn = Connection::open(path).map_err(map_sqlite_err)?;
+        conn.busy_timeout(BUSY_TIMEOUT).map_err(map_sqlite_err)?;
+        enable_foreign_keys(&conn)?;
+        enable_wal(&conn)?;
+        create_schema(&conn)?;
+        Ok((Store { conn, clock }, created))
+    }
+
+    /// In-memory database for tests. WAL is meaningless for `:memory:`.
+    #[cfg(test)]
+    pub(crate) fn open_in_memory(clock: Box<dyn Clock>) -> Result<Store, AppError> {
+        let conn = Connection::open_in_memory().map_err(map_sqlite_err)?;
+        enable_foreign_keys(&conn)?;
+        create_schema(&conn)?;
+        Ok(Store { conn, clock })
+    }
+}
+
+/// Mints the next id of a table whose ids are `<prefix>-<6 digits>`
+/// (`dec-000017`, `gld-000003`). Called inside the inserting transaction, so
+/// two writers serialize on SQLite's writer lock instead of minting the same
+/// number.
+fn next_id(conn: &Connection, table: &str, prefix: &str) -> Result<String, AppError> {
+    let sql = format!(
+        "SELECT MAX(CAST(substr(id, {}) AS INTEGER)) FROM {table}",
+        prefix.len() + 2
+    );
+    let highest: Option<i64> = conn
+        .query_row(&sql, [], |row| row.get(0))
+        .map_err(map_sqlite_err)?;
+    Ok(format!("{prefix}-{:06}", highest.unwrap_or(0) + 1))
+}
+
+/// SQLite leaves foreign keys off per connection by default, which would let
+/// a decision point at a category that does not exist.
+fn enable_foreign_keys(conn: &Connection) -> Result<(), AppError> {
+    conn.pragma_update(None, "foreign_keys", "ON")
+        .map_err(map_sqlite_err)
+}
+
+/// Switches the connection to WAL, retrying on SQLITE_BUSY: the WAL
+/// transition needs brief exclusive locks and SQLite skips the busy handler
+/// for parts of it, so two processes racing the first open would otherwise
+/// see an immediate "database is locked".
+fn enable_wal(conn: &Connection) -> Result<(), AppError> {
+    const RETRY_SLEEP: std::time::Duration = std::time::Duration::from_millis(10);
+    let deadline = std::time::Instant::now() + BUSY_TIMEOUT;
+    loop {
+        match conn.pragma_update(None, "journal_mode", "WAL") {
+            Ok(()) => return Ok(()),
+            Err(err) if is_busy(&err) && std::time::Instant::now() < deadline => {
+                std::thread::sleep(RETRY_SLEEP);
+            }
+            Err(err) => return Err(map_sqlite_err(err)),
+        }
+    }
+}
+
+fn is_busy(err: &rusqlite::Error) -> bool {
+    matches!(
+        err.sqlite_error_code(),
+        Some(ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked)
+    )
+}
+
+/// Every statement is additive and `IF NOT EXISTS`, so opening an existing
+/// database is a no-op and later stages add their tables by appending here.
+fn create_schema(conn: &Connection) -> Result<(), AppError> {
+    conn.execute_batch(CREATE_SCHEMA_SQL)
+        .map_err(map_sqlite_err)
+}
+
+/// docs/doppel-judgment.md §6 verbatim.
+const CREATE_SCHEMA_SQL: &str = "
+CREATE TABLE IF NOT EXISTS categories (
+  name        TEXT PRIMARY KEY,
+  description TEXT NOT NULL,
+  state       TEXT NOT NULL DEFAULT 'active',
+  created_at  TEXT NOT NULL,
+  CHECK (state IN ('active','retired'))
+);
+
+CREATE TABLE IF NOT EXISTS decisions (
+  id            TEXT PRIMARY KEY,
+  source        TEXT NOT NULL,
+  external_id   TEXT NOT NULL,
+  kind          TEXT NOT NULL,
+  project       TEXT,
+  session_id    TEXT,
+  question      TEXT NOT NULL,
+  options       TEXT NOT NULL,
+  answers       TEXT NOT NULL,
+  rationale     TEXT,
+  context       TEXT,
+  category      TEXT REFERENCES categories(name),
+  category_by   TEXT,
+  decided_at    TEXT NOT NULL,
+  created_at    TEXT NOT NULL,
+
+  UNIQUE (source, external_id),
+  CHECK (source IN ('session','plan','doppel')),
+  CHECK (kind IN ('ask','permission','plan')),
+  CHECK ((category IS NULL) = (category_by IS NULL)),
+  CHECK (category_by IS NULL OR category_by IN ('human','model'))
+);
+
+CREATE TABLE IF NOT EXISTS golden (
+  id            TEXT PRIMARY KEY,
+  decision_id   TEXT NOT NULL UNIQUE REFERENCES decisions(id),
+  category      TEXT NOT NULL REFERENCES categories(name),
+  project       TEXT,
+  question      TEXT NOT NULL,
+  options       TEXT NOT NULL,
+  answers       TEXT NOT NULL,
+  rationale     TEXT,
+  context       TEXT,
+  decided_at    TEXT NOT NULL,
+  state         TEXT NOT NULL,
+  reason        TEXT NOT NULL,
+  superseded_by TEXT REFERENCES golden(id),
+  note          TEXT,
+  created_at    TEXT NOT NULL,
+  reviewed_at   TEXT,
+
+  CHECK (state IN ('candidate','confirmed','retired')),
+  CHECK (reason IN ('override','ingest','manual')),
+  CHECK ((state = 'candidate') = (reviewed_at IS NULL)),
+  CHECK (superseded_by IS NULL OR state = 'retired'),
+  CHECK (superseded_by IS NULL OR superseded_by <> id)
+);
+
+CREATE VIRTUAL TABLE IF NOT EXISTS golden_fts USING fts5(
+  golden_id UNINDEXED, question, answers, rationale, context,
+  tokenize = 'unicode61'
+);
+";
+
+fn not_found(message: impl Into<String>) -> AppError {
+    AppError::new(ErrorKind::NotFound, message)
+}
+
+fn conflict(message: impl Into<String>) -> AppError {
+    AppError::new(ErrorKind::Conflict, message)
+}
+
+/// Every constraint this schema declares encodes a ledger rule, so tripping
+/// one is a `conflict` with the caller-meaningful message.
+fn constraint_err(err: rusqlite::Error, message: impl Into<String>) -> AppError {
+    if err.sqlite_error_code() == Some(ErrorCode::ConstraintViolation) {
+        conflict(message)
+    } else {
+        map_sqlite_err(err)
+    }
+}
+
+fn map_sqlite_err(err: rusqlite::Error) -> AppError {
+    AppError::new(ErrorKind::Internal, format!("sqlite error: {err}"))
+}
+
+/// JSON columns (`options`, `answers`) are written only by this module, so a
+/// value that fails to decode means the file was edited by hand — fail
+/// rather than show a partial row.
+fn decode_json<T: serde::de::DeserializeOwned>(raw: &str, column: &str) -> Result<T, AppError> {
+    serde_json::from_str(raw).map_err(|e| {
+        AppError::new(
+            ErrorKind::Internal,
+            format!("corrupt {column} column ({e}): {raw}"),
+        )
+    })
+}
+
+fn encode_json<T: serde::Serialize>(value: &T) -> String {
+    serde_json::to_string(value).expect("plain data serializes infallibly")
+}
+
+#[cfg(test)]
+mod tests;

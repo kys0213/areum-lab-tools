@@ -267,7 +267,8 @@ discord·kanban 과 공유하는 kind 는 같은 번호를 쓴다.
 
 - 지금은 macOS 만 낸다: `aarch64-apple-darwin`, `x86_64-apple-darwin`.
 - 릴리스 target 은 도구별로 선언한다 (`tools/<tool>/release-targets`). 공용
-  `release.yml` 이 그 목록으로 matrix 를 만든다. 선언이 없는 도구는 기존 기본값
+  `release.yml` 이 `scripts/release_targets.sh` 로 그 목록을 matrix 로 바꾸고, 모든
+  target 이 빌드된 뒤 Release 에 한 번에 올린다. 선언이 없는 도구는 기존 기본값
   (`aarch64-apple-darwin`) 그대로다.
 - 설치 스크립트는 OS 별 파일이다. `scripts/install.sh` 가 macOS 의 arch 로 target 을
   고른다. 다른 OS 는 지원할 때 매핑(Linux)이나 파일(Windows `install.ps1`)을 더한다.
