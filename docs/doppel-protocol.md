@@ -44,18 +44,21 @@ plugin hook ◀── stdout JSON lines ── doppel attach ◀── WebSocket
 
 ### 세션 → doppel 이벤트
 
-모든 이벤트는 `{ "v": 1, "session_id", "at", "kind", ... }` 이다.
+모든 이벤트는 `{ "v": 1, "session_id", "at", "kind", ... }` 이다. `at` 은 hook 의 시각(RFC3339)
+으로 참고만 하고, doppel 은 받은 시각으로 상태를 판정한다 — 세션마다 시계가 어긋나도 정체
+판정이 흔들리지 않게. `launched_by` 는 doppel 이 띄운 세션에 넣는 env `DOPPEL_LAUNCHED=1`
+로 정한다.
 
 | kind | 보내는 hook | 추가 필드 |
 |---|---|---|
 | `session.start` | `session.start` | `cwd`, `surface`(`terminal`·`headless`), `launched_by`(`doppel`·`user`) |
 | `session.end` | `session.end` | `reason` |
 | `heartbeat` | `$.clock.every` | — |
-| `turn.start` / `turn.complete` | 같은 이름 (main 루프만) | `turn.complete` 는 답 텍스트 요약 |
+| `turn.start` / `turn.complete` | 같은 이름 (main 루프만) | `turn.complete` 는 `summary`(답 텍스트 앞부분) |
 | `tool.failure` | `classic.PostToolUseFailure` | `tool` |
-| `ask.open` | `tool.call {AskUserQuestion}` | `tool_use_id`, `questions` |
-| `permission.open` | 권한 확인이 사람에게 넘어올 때 | `tool_use_id`, `tool`, `input` 요약 |
-| `ask.closed` | `session.append` 의 tool-result 행 | `tool_use_id`, `answers`, `answered_by`(`terminal`·`doppel`·`slack`·…) |
+
+질문과 권한 확인은 이벤트가 아니라 ask 로 다룬다 — `POST /v1/asks`(열기)와
+`POST /v1/asks/{id}/close`(확정, `answered_by`: `session`·`doppel-ui`·`slack`·…)다 (§6).
 
 ### doppel → 세션 메시지 (attach stdout, 한 줄에 JSON 하나)
 
@@ -141,14 +144,99 @@ plugin 과 데몬 모두 "이벤트 스트림 → 변환 → 구독" 한 모양�
 
 ---
 
-## 5. 확인이 필요한 런타임 가정
+## 5. 런타임 가정과 확인 결과
 
-Claude Code 2.1.306 타입 선언으로 설계했고 실세션 spike 가 남았다.
+Claude Code 2.1.306 타입 선언으로 설계했고, 2026-10-21 headless 세션(`claude -p
+--input-format stream-json --permission-prompt-tool stdio`, 기본 권한 프롬프트가
+stdio 로 나가 응답 없이 대기하는 상태)에서 확인했다.
 
-| 가정 | 틀렸을 때 |
+| 가정 | 결과 |
 |---|---|
-| `session.start` 에서 띄운 `doppel attach` 가 세션 내내 산다 | `$.http.fetch` long-poll 로 들어오는 방향을 바꾼다 |
-| `next` 를 건 채 답하면 터미널 `AskUserQuestion` 대화상자가 닫힌다 | 터미널도 doppel band 로 질문을 그린다 |
-| 권한 허용 시 `next(e)` 재호출 + `tool.check` allow 로 프롬프트 없이 실행된다 | 권한은 doppel band 로 그린다 |
-| `$.prompt.submit` 이 터미널 세션에서 새 턴을 연다 | 터미널 세션의 늦은 답은 기록만 한다 |
-| `classic.Notification` 의 `notification_type` 이 권한·idle 을 구분한다 | 권한 대기는 `PermissionRequest` 로만 판정한다 |
+| `session.start` 에서 띄운 자식 프로세스가 세션 내내 살고, 세션이 끝나면 정리된다 | 확인 — 60초 동안 출력을 받았고 `session.end` 직전에 끝났다 |
+| `$.http.fetch` 가 `socketPath` 로 Unix socket HTTP 서버에 닿는다 | 확인 |
+| core 의 질문이 대기 중일 때 `next` 를 건 채 원격 답으로 돌아가면 그 답이 모델에 간다 | 확인 (headless). 터미널 대화상자가 화면에서 닫히는지는 대화형 세션에서 볼 일이다 |
+| 권한 허용 시 걸린 `next` 를 버리고 `tool.check` allow + `next(e)` 재호출로 프롬프트 없이 실행된다 | 확인 — 두 번째 호출은 권한 요청을 다시 내지 않았다 |
+| `$.prompt.submit` 이 idle 세션에 새 턴을 연다 | 확인 (stream-json 입력을 열어 둔 headless). 터미널 세션은 대화형 세션에서 볼 일이다 |
+| `classic.Notification` 의 `notification_type` 이 권한·idle 을 구분한다 | 미확인 — 대화형에서만 발화한다. 권한 대기는 `permission.open` 으로 판정하므로 의존하지 않는다 |
+
+doppel 이 띄우는 headless 세션은 `--input-format stream-json` 으로 stdin 을 열어 둔다.
+그래야 턴이 끝나도 프로세스가 남아 늦은 답을 `$.prompt.submit` 으로 받을 수 있다.
+
+---
+
+## 6. doppel 데몬 API
+
+데몬은 같은 라우터를 두 곳에서 연다.
+
+| 리스너 | 주소 | 누가 |
+|---|---|---|
+| Unix socket | `~/.areum/doppel/doppel.sock` (권한 600) | plugin hook, `doppel` CLI, `doppel attach` |
+| loopback TCP | `127.0.0.1:7319` (`--ui-port`) | 웹 UI |
+
+- 단일 실행은 소켓이 보장한다. 소켓에 연결되면 이미 떠 있는 것이고, 연결이 거부되는 소켓
+  파일은 지난 실행의 잔해라 지우고 다시 연다.
+- TCP 리스너는 `Host` 가 `127.0.0.1:<port>`·`localhost:<port>` 일 때만, `POST` 는 `Origin` 이
+  없거나 같은 출처이고 `X-Doppel-Client` 헤더가 있을 때만 받는다 — 다른 사이트가 브라우저를
+  시켜 질문에 답하거나(DNS rebinding·CSRF) 데몬을 끄는 것을 막는다. `/v1/shutdown` 은 Unix
+  socket 으로만 받는다.
+- 본문은 JSON 이고, 오류는 `{ "ok": false, "error": { "kind", "message" } }` 와 상태 코드
+  (`400` usage, `404` not_found, `409` conflict, `500` internal)다.
+
+### 엔드포인트
+
+| 메서드·경로 | 본문 → 응답 |
+|---|---|
+| `GET /v1/health` | → `{ "ok": true, "version", "pid" }` |
+| `POST /v1/shutdown` | → `{ "ok": true }` 후 종료 |
+| `POST /v1/events` | §2 의 세션 이벤트 → `202 { "ok": true }` |
+| `GET /v1/sessions` | → `{ "sessions": [Session] }` (최근 이벤트 순) |
+| `POST /v1/asks` | `{ session_id, tool_use_id, kind, questions }` → `Ask` (같은 `session_id`·`tool_use_id` 면 기존 것) |
+| `GET /v1/asks?state=<state>` | → `{ "asks": [Ask] }` |
+| `GET /v1/asks/{id}/wait?timeout_ms=<n>` | `open` 이 아니게 되거나 시간이 다 되면 → `Ask` |
+| `POST /v1/asks/{id}/answer` | `{ answers, answered_by }` → `Ask` — `open`·`deferred` 일 때만, 아니면 `409` |
+| `POST /v1/asks/{id}/defer` | → `Ask` — `open` 일 때만 |
+| `POST /v1/asks/{id}/close` | `{ answers?, answered_by }` → `Ask` — 이미 `closed` 면 `409` |
+| `GET /v1/attach/{session_id}` | WebSocket. doppel → 세션 메시지(§2) |
+| `GET /v1/ui` | WebSocket. `{ "kind": "changed", "what": "sessions" \| "asks" }` 알림 |
+| `GET /` | 웹 UI |
+
+`Session`: `{ session_id, cwd, surface, launched_by, state, started_at, last_event_at,
+ended_at, open_asks }` — `state` 는 [doppel.md §5](./doppel.md) 의 값.
+
+`Ask`: `{ ask_id, session_id, tool_use_id, kind, questions, state, answers, answered_by,
+created_at, answered_at, closed_at }`. `questions` 는 `AskUserQuestion` 입력 그대로
+(`[{ question, header, multiSelect, options: [{ label, description }] }]`), `answers` 는
+`{ "<question>": "<label>" | ["<label>", …] }`. 권한 확인(`kind: "permission"`)은 질문 하나
+(`"<도구> 실행 허용: <입력 요약>"`)에 선택지 `allow`·`deny` 다.
+
+### ask 상태
+
+```
+open ──answer──▶ answered ──close──▶ closed
+  │                                    ▲
+  ├──defer──▶ deferred ──answer──▶ answered (attach 로 세션에 전달)
+  └───────────────close (다른 곳이 이김 · 세션 종료)───┘
+```
+
+- `answered` 는 doppel surface 가 답을 정했지만 세션의 hook 이 아직 확정하지 않은 상태다.
+  확정은 hook 의 `close` 다 — hook 이 경주의 최종 판정자라서, doppel 이 답한 직후 터미널이
+  먼저 이겼다면 `close` 가 터미널 답으로 덮는다.
+- `deferred` 에서 답이 오면 doppel 은 그 세션의 attach 연결로 `{ "kind": "answer", ask_id,
+  tool_use_id, answers }` 를 보낸다.
+- 세션이 `session.end` 를 보내면 남은 `open`·`deferred` ask 는 `closed`(`answered_by:
+  "session-ended"`)가 된다.
+- `close` 에 `answers` 가 있으면 doppel 은 판단 원장에 기록한다. 질문은 세션 transcript
+  ingest 와 같은 키(`source: "session"`, `<session_id>:<tool_use_id>:<순번>`)로 넣어 나중의
+  ingest 가 중복을 만들지 않는다. 권한은 터미널에서 답한 것(`answered_by: "session"`)은 넣지
+  않는다 — transcript 의 `permissionDecision` 이 그 기록이다.
+
+### `doppel` CLI 의 짝
+
+| 명령 | 하는 일 |
+|---|---|
+| `doppel daemon run [--ui-port N]` | 데몬을 이 프로세스에서 돌린다 |
+| `doppel daemon start \| stop \| status` | 분리 실행 · `/v1/shutdown` · `/v1/health` |
+| `doppel attach --session <id>` | `/v1/attach/{id}` 를 열고 받은 메시지를 한 줄에 하나씩 stdout 으로 |
+| `doppel ask wait <ask-id> [--timeout <초>]` | `/v1/asks/{id}/wait` 를 감싼다 — hook 이 예산에 세지 않고 기다리는 수단 |
+| `doppel ask list [--state <state>]` · `doppel ask answer <ask-id> --answer "<q>=<label>"` | inbox 를 터미널에서 |
+| `doppel session list` | 세션 상태 |
