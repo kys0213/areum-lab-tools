@@ -1,42 +1,9 @@
-use serde::Serialize;
+//! kanban's `--json` wire contract, pinned with its own payloads. The
+//! envelope shape lives in `cli_contract`; these literal-string tests guard
+//! that kanban's output stays byte-identical through it.
 
 use crate::common::error::AppError;
 use crate::output::payload::Payload;
-
-#[derive(Serialize)]
-struct SuccessEnvelope<'a> {
-    ok: bool,
-    command: &'a str,
-    data: &'a Payload,
-}
-
-#[derive(Serialize)]
-struct ErrorEnvelope<'a> {
-    ok: bool,
-    command: &'a str,
-    error: &'a AppError,
-}
-
-// Called from `crate::output::render`, the parent module.
-pub(super) fn success_json(command: &str, data: &Payload) -> String {
-    let envelope = SuccessEnvelope {
-        ok: true,
-        command,
-        data,
-    };
-    serde_json::to_string(&envelope)
-        .expect("success envelope serialization is infallible for plain data")
-}
-
-pub(super) fn error_json(command: &str, error: &AppError) -> String {
-    let envelope = ErrorEnvelope {
-        ok: false,
-        command,
-        error,
-    };
-    serde_json::to_string(&envelope)
-        .expect("error envelope serialization is infallible for plain data")
-}
 
 #[cfg(test)]
 mod tests {

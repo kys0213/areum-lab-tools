@@ -18,12 +18,12 @@
 
 use std::path::Path;
 
+use cli_contract::time::now_rfc3339;
 use rusqlite::types::{FromSql, FromSqlError, FromSqlResult, ValueRef};
 use rusqlite::{Connection, ErrorCode, OptionalExtension, Row, params};
 
 use crate::cli::{ItemState, Priority};
 use crate::common::error::{AppError, ErrorKind};
-use crate::common::time::now_rfc3339;
 
 /// Wall-clock source for the `created_at`/`updated_at`/`claimed_at` columns.
 /// Injected rather than called inside the query code so tests pin exact

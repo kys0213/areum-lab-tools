@@ -6,6 +6,7 @@
 //! shapes are what `--json` emits, so renaming one is a breaking change for
 //! every agent parsing the envelope.
 
+use cli_contract::HumanText;
 use serde::Serialize;
 
 /// A label row (`kind` | `area` | `duplicate-of` | `similar`). `confidence` is
@@ -231,9 +232,8 @@ pub enum Payload {
     Move(MoveData),
 }
 
-impl Payload {
-    // Called from `crate::output::render`, the parent module.
-    pub(super) fn to_human(&self) -> String {
+impl HumanText for Payload {
+    fn to_human(&self) -> String {
         match self {
             Payload::Init(d) if d.created => format!("board initialized: {}", d.path),
             Payload::Init(d) => format!("board already initialized: {}", d.path),

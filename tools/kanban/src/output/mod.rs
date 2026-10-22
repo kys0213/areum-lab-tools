@@ -1,7 +1,12 @@
+#[cfg(test)]
 mod envelope;
 mod payload;
 
-pub(crate) use crate::common::error::{AppError, ErrorKind, exit_code};
+pub(crate) use crate::common::error::{AppError, ErrorKind};
+// Command tests assert exit codes through this surface; production code
+// reaches exit codes only via `cli_contract::render`.
+#[cfg(test)]
+pub(crate) use crate::common::error::exit_code;
 // The payload contract is this module's surface: command handlers import the
 // data types from here rather than reaching into `payload` directly.
 pub(crate) use payload::{
@@ -10,43 +15,16 @@ pub(crate) use payload::{
     ProjectRmData, ReleaseData,
 };
 
-/// Which stream a rendered line belongs on. Human-mode errors are
-/// diagnostics and must not pollute stdout; every other case is a result
-/// payload and belongs on stdout.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Sink {
-    Stdout,
-    Stderr,
-}
+pub use cli_contract::Sink;
 
-/// Renders a command result to the stream it belongs on, the line to print,
-/// and the process exit code. Human text by default; the JSON envelope when
-/// `json` is set. In human mode, errors go to stderr and stdout stays empty
-/// ("diagnostics on stderr"); the JSON envelope always goes to stdout.
+/// Renders a command result (see [`cli_contract::render`]), pinned to
+/// kanban's payload and error types.
 pub fn render(
     command: &str,
     result: &Result<Payload, AppError>,
     json: bool,
 ) -> (Sink, String, i32) {
-    match result {
-        Ok(payload) => {
-            let text = if json {
-                envelope::success_json(command, payload)
-            } else {
-                payload.to_human()
-            };
-            (Sink::Stdout, text, 0)
-        }
-        Err(err) => {
-            let text = if json {
-                envelope::error_json(command, err)
-            } else {
-                err.to_human()
-            };
-            let sink = if json { Sink::Stdout } else { Sink::Stderr };
-            (sink, text, exit_code(err))
-        }
-    }
+    cli_contract::render(command, result, json)
 }
 
 #[cfg(test)]
