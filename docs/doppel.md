@@ -36,9 +36,10 @@ doppel 은 세 가지를 한다.
 데몬은 판단 agent 를 `claude -p` 로 실행만 한다. 판단의 내용은 plugin 의 agent
 프롬프트에 있다.
 
-외부 메시징 채널(Slack·Discord·mail)은 doppel 의 일부가 아니다. 채널마다 별도 plugin 이
-세션에 붙고, 그 채널의 외부 연결은 채널별 로컬 프로세스 하나가 갖는다. doppel 도 그 중
-하나의 채널처럼 세션에 붙는다.
+외부 메시징 채널(Slack·Discord·mail)은 doppel 의 범위 밖이다. doppel 은 채널 connector 를
+만들지 않는다 — 이미 있는 connector 가 각자 세션에 붙고, doppel 은 그 중 하나처럼 같은
+질문을 두고 경주할 뿐이다. 다른 connector 가 먼저 답을 받으면 doppel 은 자기 ask 를 닫는다
+([doppel-protocol.md §3](./doppel-protocol.md)).
 
 ```
 claude sessions  N:1  doppel   (웹 UI · 판단 학습)
@@ -287,5 +288,4 @@ discord·kanban 과 공유하는 kind 는 같은 번호를 쓴다.
 |---|---|
 | P0 | 판단 원장, `ingest`(세션 JSONL·plans), 카테고리, 골든 묶음 리뷰, 판례 검색 |
 | P1 | 데몬, 세션 연결·상태, 결정 지점, 웹 UI inbox, doppel 채널의 질문 경주 (P1a) · 브리프, 수락률 (P1b) |
-| P2 | 채널 plugin (Slack 먼저) — 채널별 로컬 연결 프로세스 + 세션 plugin, 공유 relay 계약 |
-| P3 | 칸반 유입·라벨링·분배, 카테고리별 opt-in 자동 처리 |
+| P2 | 칸반 유입·라벨링·분배, 카테고리별 opt-in 자동 처리 |

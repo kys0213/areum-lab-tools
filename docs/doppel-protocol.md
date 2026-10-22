@@ -99,10 +99,12 @@ on('tool.call', { tool: 'AskUserQuestion' }, async ($, e, next) => {
 
 ### 모든 곳에 반영
 
-경주에 진 plugin 은 최종 답을 `session.append` 의 tool-result 행(같은 `tool_use_id`)에서
-읽어 자기 채널 글을 "○○에서 답변됨: …" 으로 갱신한다. 위에서 중단된 plugin 도 이 행으로
-답을 안다. 답한 곳은 tool-result 행에 남기지 않으므로, 이긴 plugin 이 `ask.closed` 를 낼 때
-자기 이름을 싣는다.
+- 경주에서 `next(e)` 가 이긴 plugin 은 그 결과로 자기 채널 글을 "○○에서 답변됨" 으로 갱신한다.
+- 위의 hook 이 먼저 이겨 자기 dispatch 가 결과 없이 버려진 plugin 은 `session.append` 의
+  tool-result 행(같은 `tool_use_id`)으로 호출이 끝났음을 안다. doppel plugin 은 이때 ask 를
+  `close`(`answered_by: "elsewhere"`, 답 없이)한다. 답 자체는 transcript 에 남아
+  `doppel ingest sessions` 가 원장에 넣는다.
+- 다른 connector 가 이 계약을 따르지 않아도 doppel 쪽은 위 규칙으로 정리된다.
 
 ### 기다림과 보류
 
