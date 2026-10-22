@@ -8,9 +8,10 @@ use crate::common::client::request;
 use crate::common::error::{AppError, ErrorKind};
 use crate::common::store::Store;
 use crate::daemon::api::Health;
-use crate::daemon::brief::BriefConfig;
+use crate::daemon::auto::{AutoConfig, TriageGate};
 use crate::daemon::launch::LaunchConfig;
 use crate::daemon::listen::{Bound, DaemonConfig, serve};
+use crate::daemon::model_call::ModelCommand;
 use crate::daemon::state::Thresholds;
 use crate::output::{DaemonData, Payload};
 
@@ -19,12 +20,35 @@ use crate::output::{DaemonData, Payload};
 const SETTLE_BUDGET: Duration = Duration::from_secs(5);
 const SETTLE_POLL: Duration = Duration::from_millis(100);
 
-fn brief_config(options: &DaemonOptions) -> Option<BriefConfig> {
+fn brief_config(options: &DaemonOptions) -> Option<ModelCommand> {
     let timeout = Duration::from_secs(options.brief_timeout_secs);
     match &options.brief_command {
-        Some(command) => BriefConfig::from_command(command, timeout),
-        None if options.brief => BriefConfig::from_command(BriefConfig::DEFAULT_COMMAND, timeout),
+        Some(command) => ModelCommand::from_command(command, timeout),
+        None if options.brief => {
+            ModelCommand::from_command(crate::daemon::brief::DEFAULT_COMMAND, timeout)
+        }
         None => None,
+    }
+}
+
+fn proposal_config(options: &DaemonOptions) -> Option<ModelCommand> {
+    let timeout = Duration::from_secs(options.propose_timeout_secs);
+    match &options.propose_command {
+        Some(command) => ModelCommand::from_command(command, timeout),
+        None if options.propose => {
+            ModelCommand::from_command(crate::daemon::proposal::DEFAULT_COMMAND, timeout)
+        }
+        None => None,
+    }
+}
+
+fn auto_config(options: &DaemonOptions) -> AutoConfig {
+    AutoConfig {
+        triage: options.auto_triage.then_some(TriageGate {
+            min_judged: options.auto_triage_min_judged,
+            min_acceptance: options.auto_triage_min_acceptance,
+        }),
+        dispatch: options.auto_dispatch,
     }
 }
 
@@ -39,7 +63,9 @@ fn launch_config(socket: &Path, options: &DaemonOptions) -> Option<LaunchConfig>
 fn config(socket: &Path, options: &DaemonOptions) -> DaemonConfig {
     DaemonConfig {
         brief: brief_config(options),
+        proposal: proposal_config(options),
         launch: launch_config(socket, options),
+        auto: auto_config(options),
         socket: socket.to_path_buf(),
         ui_port: (!options.no_ui).then_some(options.ui_port),
         thresholds: Thresholds {
@@ -133,6 +159,18 @@ pub(crate) fn run_daemon_start(
             &options.brief_timeout_secs.to_string(),
         ])
         .args(["--max-running", &options.max_running.to_string()])
+        .args([
+            "--propose-timeout-secs",
+            &options.propose_timeout_secs.to_string(),
+        ])
+        .args([
+            "--auto-triage-min-judged",
+            &options.auto_triage_min_judged.to_string(),
+        ])
+        .args([
+            "--auto-triage-min-acceptance",
+            &options.auto_triage_min_acceptance.to_string(),
+        ])
         .stdin(Stdio::null())
         .stdout(log)
         .stderr(log_err);
@@ -147,6 +185,18 @@ pub(crate) fn run_daemon_start(
     }
     if let Some(launch_command) = &options.launch_command {
         command.args(["--launch-command", launch_command]);
+    }
+    if options.propose {
+        command.arg("--propose");
+    }
+    if let Some(propose_command) = &options.propose_command {
+        command.args(["--propose-command", propose_command]);
+    }
+    if options.auto_triage {
+        command.arg("--auto-triage");
+    }
+    if options.auto_dispatch {
+        command.arg("--auto-dispatch");
     }
     detach(&mut command);
     let mut child = command

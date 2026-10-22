@@ -327,25 +327,78 @@ function triageRow(card) {
   }, card.state === "inbox" ? "배정" : "다시 배정")]);
 }
 
+function proposalBlock(card) {
+  const p = card.proposal;
+  if (!p) return "";
+  if (p.state === "pending") {
+    return el("div", { class: "brief" }, el("div", { class: "label" }, "doppel 이 배정을 살펴보는 중…"));
+  }
+  if (p.state === "failed") {
+    return el("div", { class: "brief failed" }, [
+      el("div", { class: "label" }, "배정 제안을 만들지 못했습니다"),
+      el("div", { class: "meta" }, p.error || ""),
+    ]);
+  }
+  const facts = [CONFIDENCE[p.confidence] || p.confidence];
+  if (p.applied) facts.push("doppel 이 자동 배정함");
+  if (p.accepted === true) facts.push("수락됨");
+  if (p.accepted === false) facts.push("뒤집힘");
+  if (p.cited && p.cited.length) facts.push("판례 " + p.cited.join(", "));
+  const block = el("div", { class: "brief" }, [
+    el("div", { class: "label" }, "doppel 제안: " + (p.project || "맞는 프로젝트 없음") + " · " + p.priority),
+    el("div", { class: "why" }, p.rationale || ""),
+    el("div", { class: "meta" }, facts.join(" · ")),
+  ]);
+  if (card.state === "inbox" && p.project) {
+    block.append(el("div", { class: "options" }, el("button", {
+      class: "primary",
+      onclick: () => act("/v1/cards/" + card.card_id + "/triage", { project: p.project, priority: p.priority }),
+    }, "제안대로 배정")));
+  }
+  return block;
+}
+
+async function sendBack(id, input) {
+  const note = input.value.trim();
+  try {
+    await api("/v1/cards/" + id + "/release", { reason: note || "다시 시킴" });
+    await api("/v1/cards/" + id + "/dispatch", { resume: true, note: note || null });
+  } catch (error) {
+    alert(error.message);
+  }
+  refresh();
+}
+
 function ticket(card) {
   const node = el("div", { class: "card ticket" }, [
-    el("div", { class: "meta" }, card.priority + " · " + (card.project || "미배정") + " · " + card.source + " · " + shortTime(card.updated_at)),
+    el("div", { class: "meta" }, card.priority + " · " + (card.project || "미배정") + " · " + card.source + " · " + shortTime(card.updated_at) +
+      (card.proposal && card.proposal.applied ? " · doppel 이 자동 배정" : "")),
     el("div", { class: "title" }, card.title),
     card.body ? el("div", { class: "body" }, card.body) : "",
     card.last_error ? el("div", { class: "error" }, card.last_error) : "",
   ]);
   const id = card.card_id;
+  if (card.state === "inbox" || card.state === "triaged") node.append(proposalBlock(card));
   if (card.state === "inbox" || card.state === "triaged") node.append(triageRow(card));
   const buttons = el("div", { class: "row" });
-  if (card.state === "triaged") buttons.append(el("button", { class: "primary", onclick: () => act("/v1/cards/" + id + "/dispatch") }, "실행"));
+  if (card.state === "inbox" && card.proposal && card.proposal.state !== "pending") {
+    buttons.append(el("button", { onclick: () => act("/v1/cards/" + id + "/propose") }, "제안 다시 받기"));
+  }
+  if (card.state === "triaged") {
+    buttons.append(el("button", { class: "primary", onclick: () => act("/v1/cards/" + id + "/dispatch") }, card.session_id ? "새로 실행" : "실행"));
+    if (card.session_id) {
+      buttons.append(el("button", { onclick: () => act("/v1/cards/" + id + "/dispatch", { resume: true }) }, "이어서 실행"));
+    }
+  }
   if (card.state === "running") {
     if (card.session_id) node.append(el("div", { class: "meta" }, "세션 " + shortId(card.session_id)));
     buttons.append(el("button", { onclick: () => act("/v1/cards/" + id + "/release", { reason: "UI 에서 멈춤" }) }, "멈추기"));
   }
   if (card.state === "review") {
     node.append(el("div", { class: "outcome" }, card.outcome || ""));
+    const feedback = el("input", { placeholder: "고칠 점 (같은 세션에 이어서 전달)" });
+    node.append(el("div", { class: "row" }, [feedback, el("button", { onclick: () => sendBack(id, feedback) }, "다시 시키기")]));
     buttons.append(el("button", { class: "primary", onclick: () => act("/v1/cards/" + id + "/done") }, "완료"));
-    buttons.append(el("button", { onclick: () => act("/v1/cards/" + id + "/release", { reason: "다시 시킴" }) }, "다시 시키기"));
   }
   if (card.state !== "running" && card.state !== "review") {
     buttons.append(el("button", { onclick: () => act("/v1/cards/" + id + "/done") }, "닫기"));

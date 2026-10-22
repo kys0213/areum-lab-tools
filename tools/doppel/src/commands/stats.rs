@@ -1,10 +1,12 @@
 use std::path::Path;
 
 use crate::common::store::Store;
-use crate::output::{AppError, CategoryStatsData, Payload, StatsData};
+use crate::output::{AppError, CategoryStatsData, Payload, ProposalStatsData, StatsData};
 
 pub(crate) fn run_stats(db_path: &Path) -> Result<Payload, AppError> {
-    let stats = Store::open(db_path)?.brief_stats()?;
+    let store = Store::open(db_path)?;
+    let stats = store.brief_stats()?;
+    let proposals = store.proposal_stats()?;
     Ok(Payload::Stats(StatsData {
         briefs: stats.briefs,
         failed: stats.failed,
@@ -22,6 +24,14 @@ pub(crate) fn run_stats(db_path: &Path) -> Result<Payload, AppError> {
                 accepted: c.accepted,
             })
             .collect(),
+        proposals: ProposalStatsData {
+            proposals: proposals.proposals,
+            failed: proposals.failed,
+            applied: proposals.applied,
+            judged: proposals.judged,
+            accepted: proposals.accepted,
+            acceptance: rate(proposals.accepted, proposals.judged),
+        },
     }))
 }
 

@@ -108,7 +108,12 @@ pub enum Command {
 
 /// Daemon settings shared by `run` and `start`. The thresholds decide the
 /// session states (docs/doppel.md §5); the daemon never adjusts them itself.
-#[derive(clap::Args, Debug, Clone, PartialEq, Eq)]
+#[derive(clap::Args, Debug, Clone, PartialEq)]
+#[command(group(
+    clap::ArgGroup::new("proposal_source")
+        .args(["propose", "propose_command"])
+        .multiple(true)
+))]
 pub struct DaemonOptions {
     /// Loopback port of the web UI.
     #[arg(long = "ui-port", default_value_t = 7319)]
@@ -145,6 +150,42 @@ pub struct DaemonOptions {
     /// At most this many cards run at once.
     #[arg(long = "max-running", default_value_t = 2)]
     pub max_running: u32,
+    /// Write an assignment proposal for every new card with the default
+    /// command (`claude -p --output-format json --model sonnet
+    /// /doppel:triage`).
+    #[arg(long)]
+    pub propose: bool,
+    /// Write proposals with this command instead (split on whitespace, no
+    /// shell). The bundle arrives on its stdin.
+    #[arg(long = "propose-command")]
+    pub propose_command: Option<String>,
+    /// How long one proposal may take before it is marked failed.
+    #[arg(long = "propose-timeout-secs", default_value_t = 180)]
+    pub propose_timeout_secs: u64,
+    /// Assign a card as proposed when the proposal is sure (`high`) and the
+    /// proposals so far clear the two thresholds below.
+    #[arg(long = "auto-triage", requires = "proposal_source")]
+    pub auto_triage: bool,
+    /// Auto-triage only after this many proposals were judged by a person.
+    #[arg(long = "auto-triage-min-judged", default_value_t = 20)]
+    pub auto_triage_min_judged: u32,
+    /// Auto-triage only while this share of judged proposals was taken
+    /// (0.0 to 1.0).
+    #[arg(long = "auto-triage-min-acceptance", default_value_t = 0.9, value_parser = fraction)]
+    pub auto_triage_min_acceptance: f64,
+    /// Launch triaged cards that were never sent back, most urgent first,
+    /// up to --max-running.
+    #[arg(long = "auto-dispatch")]
+    pub auto_dispatch: bool,
+}
+
+fn fraction(text: &str) -> Result<f64, String> {
+    let value: f64 = text.parse().map_err(|e| format!("{e}"))?;
+    if (0.0..=1.0).contains(&value) {
+        Ok(value)
+    } else {
+        Err(format!("{value} is not between 0.0 and 1.0"))
+    }
 }
 
 #[derive(Subcommand, Debug)]
@@ -262,6 +303,9 @@ pub enum CardCommand {
         /// Card id (crd-000001).
         id: String,
     },
+    /// Ask doppel for a (new) assignment proposal; needs a daemon started
+    /// with --propose.
+    Propose { id: String },
     /// Assign a project and priority. Recorded in the decision ledger.
     Triage {
         id: String,
@@ -272,7 +316,16 @@ pub enum CardCommand {
         priority: Option<Priority>,
     },
     /// Launch a session for a triaged card in its project.
-    Dispatch { id: String },
+    Dispatch {
+        id: String,
+        /// Continue the card's last session instead of starting a new one.
+        #[arg(long)]
+        resume: bool,
+        /// What the resumed session hears first (default: why the card was
+        /// sent back).
+        #[arg(long, requires = "resume")]
+        note: Option<String>,
+    },
     /// Back to triaged, stopping its session if one runs.
     Release {
         id: String,
@@ -506,6 +559,7 @@ impl Command {
             Command::Card(CardCommand::Add { .. }) => "card add",
             Command::Card(CardCommand::List { .. }) => "card list",
             Command::Card(CardCommand::Show { .. }) => "card show",
+            Command::Card(CardCommand::Propose { .. }) => "card propose",
             Command::Card(CardCommand::Triage { .. }) => "card triage",
             Command::Card(CardCommand::Dispatch { .. }) => "card dispatch",
             Command::Card(CardCommand::Release { .. }) => "card release",

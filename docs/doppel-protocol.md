@@ -201,10 +201,11 @@ doppel 이 띄우는 headless 세션은 `--input-format stream-json` 으로 stdi
 | `POST /v1/asks/{id}/close` | `{ answers?, answered_by }` → `Ask` — 이미 `closed` 면 `409` |
 | `GET /v1/attach/{session_id}` | WebSocket. doppel → 세션 메시지(§2) |
 | `GET /v1/projects` · `POST /v1/projects` | → `{ "projects": [Project] }` · `{ name, path, description? }` → `Project` (경로가 디렉토리가 아니면 `400`, 같은 이름이면 `409`) |
-| `POST /v1/cards` | `{ source, external_id, title, body? }` → `Card` (`inbox`; 같은 `source`·`external_id` 면 `409`) |
+| `POST /v1/cards` | `{ source, external_id, title, body? }` → `Card` (`inbox`; 같은 `source`·`external_id` 면 `409`). `--propose` 데몬이면 제안을 쓰기 시작한다 |
+| `POST /v1/cards/{id}/propose` | → `Card` — 제안을 (다시) 쓰기 시작한다. `inbox` 가 아니거나 쓰는 중이면 `409`, 데몬이 제안을 쓰지 않으면 `500` config |
 | `GET /v1/cards?state=<state>` · `GET /v1/cards/{id}` | → `{ "cards": [Card] }` (우선순위, 오래된 순) · `Card` |
 | `POST /v1/cards/{id}/triage` | `{ project, priority?, by? }` → `Card` — `inbox`·`triaged` 일 때만. `priority` 가 없으면 지금 값, `by` 는 `human`(기본)·`model`. `human` 이면 원장에 `kind: triage` 로 남는다 |
-| `POST /v1/cards/{id}/dispatch` | → `Card`(`running`) 후 세션을 띄운다 ([doppel.md §6](./doppel.md)). `triaged` 가 아니거나 `--max-running` 이 차면 `409`, 실행 명령이 없으면 `500` config |
+| `POST /v1/cards/{id}/dispatch` | `{ resume?, note? }` → `Card`(`running`) 후 세션을 띄운다 ([doppel.md §6](./doppel.md)). `resume` 이면 지난 세션을 잇는다(없으면 `400`). `triaged` 가 아니거나 `--max-running` 이 차면 `409`, 실행 명령이 없으면 `500` config |
 | `POST /v1/cards/{id}/release` | `{ reason? }` → `Card`(`triaged`) — `running`·`review` 일 때만. 도는 세션은 멈춘다 |
 | `POST /v1/cards/{id}/done` | → `Card`(`done`) — 도는 세션은 멈춘다 |
 | `GET /v1/ui` | WebSocket. `{ "kind": "changed", "what": "sessions" \| "asks" \| "cards" }` 알림 |
@@ -224,8 +225,10 @@ reversible, rationale, cited, error, accepted }` 다 ([doppel-judgment.md §5](.
 `Project`: `{ name, path, description, created_at }`.
 
 `Card`: `{ card_id, source, external_id, title, body, state, project, priority, session_id,
-claimed_at, outcome, last_error, created_at, updated_at }` — `state` 와 전이는
-[doppel.md §6](./doppel.md).
+claimed_at, outcome, last_error, created_at, updated_at, proposal }` — `state` 와 전이는
+[doppel.md §6](./doppel.md). `proposal` 은 제안을 쓴 적이 없으면 `null`, 있으면 `{ state: pending |
+ready | failed, project, priority, confidence, rationale, cited, error, applied, accepted }` 다
+([doppel-judgment.md §5](./doppel-judgment.md)).
 
 ### ask 상태
 
@@ -354,7 +357,38 @@ CREATE TABLE cards (
   CHECK (state <> 'running' OR claimed_at IS NOT NULL),
   CHECK (state <> 'review' OR outcome IS NOT NULL)
 );
+
+CREATE TABLE proposals (
+  card_id     TEXT PRIMARY KEY REFERENCES cards(id),
+  state       TEXT NOT NULL,                           -- pending | ready | failed
+  project     TEXT REFERENCES projects(name),          -- null: 맞는 프로젝트 없음
+  priority    TEXT,
+  confidence  TEXT,                                    -- low | medium | high
+  rationale   TEXT,
+  cited       TEXT NOT NULL DEFAULT '[]',
+  precedents  TEXT NOT NULL DEFAULT '[]',              -- 번들에 실은 판례 id
+  command     TEXT NOT NULL,
+  error       TEXT,
+  applied     INTEGER NOT NULL DEFAULT 0,              -- doppel 이 제안대로 배정함
+  accepted    INTEGER,                                 -- 사람의 첫 배정이 제안과 같은가
+  created_at  TEXT NOT NULL,
+  finished_at TEXT,
+  CHECK (state IN ('pending','ready','failed')),
+  CHECK (priority IS NULL OR priority IN ('P0','P1','P2','P3')),
+  CHECK (confidence IS NULL OR confidence IN ('low','medium','high')),
+  CHECK ((state = 'pending') = (finished_at IS NULL)),
+  CHECK (state <> 'ready' OR (priority IS NOT NULL AND confidence IS NOT NULL
+                              AND rationale IS NOT NULL)),
+  CHECK (state <> 'failed' OR error IS NOT NULL),
+  CHECK (applied IN (0,1)),
+  CHECK (applied = 0 OR (state = 'ready' AND project IS NOT NULL)),
+  CHECK (accepted IS NULL OR accepted IN (0,1)),
+  CHECK (accepted IS NULL OR state = 'ready')
+);
 ```
+
+제안을 다시 받으면 그 카드의 이전 제안 행을 지우고 새로 쓴다 — 판정 대상은 언제나 마지막
+제안이다.
 
 스키마 버전은 `PRAGMA user_version` 이다. 열 때 낮은 버전이면 그 자리에서 이관한다 (버전 1:
 `decisions.kind` 에 `triage` 추가 — SQLite 는 CHECK 를 바꿀 수 없어 테이블을 다시 만든다).
@@ -363,10 +397,10 @@ CREATE TABLE cards (
 
 | 명령 | 하는 일 |
 |---|---|
-| `doppel daemon run [--ui-port N] [--no-ui] [--brief \| --brief-command "<cmd>"]` | 데몬을 이 프로세스에서 돌린다. 상태 기준값 `--stall-after-secs`·`--fail-streak`·`--heartbeat-timeout-secs`, 브리프 시간 제한 `--brief-timeout-secs`, 카드 실행 `--launch-command "<cmd>"`(빈 값이면 실행 안 함)·`--max-running N` |
+| `doppel daemon run [--ui-port N] [--no-ui] [--brief \| --brief-command "<cmd>"]` | 데몬을 이 프로세스에서 돌린다. 상태 기준값 `--stall-after-secs`·`--fail-streak`·`--heartbeat-timeout-secs`, 브리프 시간 제한 `--brief-timeout-secs`, 카드 실행 `--launch-command "<cmd>"`(빈 값이면 실행 안 함)·`--max-running N`, 배정 제안 `--propose \| --propose-command "<cmd>"`·`--propose-timeout-secs`, 자동 처리 `--auto-triage`(`--auto-triage-min-judged N`·`--auto-triage-min-acceptance 0..1`, 제안 명령이 있어야 한다)·`--auto-dispatch` |
 | `doppel daemon start \| stop \| status` | 분리 실행 · `/v1/shutdown` · `/v1/health` |
 | `doppel attach --session <id>` | `/v1/attach/{id}` 를 열고 받은 메시지를 한 줄에 하나씩 stdout 으로 |
 | `doppel ask wait <ask-id> [--timeout <초>] --json` | `/v1/asks/{id}/wait` 를 감싼다 — hook 이 예산에 세지 않고 기다리는 수단. stdout 은 `{"ok":true,"command":"ask wait","data":<Ask>}` 한 줄이고, 데몬이 답하면 `data.state` 가 아직 `open` 이어도 exit 0 이다 |
 | `doppel ask list [--state <state>]` · `doppel ask answer <ask-id> <label>… [--answer "<q>=<label>"]` | inbox 를 터미널에서 (`answered_by: "doppel-cli"`) |
 | `doppel session list` | 세션 상태 |
-| `doppel project add\|list` · `doppel card add\|list\|show\|triage\|dispatch\|release\|done` | 위 프로젝트·카드 엔드포인트를 감싼다 ([doppel.md §7](./doppel.md)) |
+| `doppel project add\|list` · `doppel card add\|list\|show\|propose\|triage\|dispatch\|release\|done` | 위 프로젝트·카드 엔드포인트를 감싼다 ([doppel.md §7](./doppel.md)) |

@@ -79,12 +79,26 @@ pub(crate) fn run_card_triage(
     )?))
 }
 
-pub(crate) fn run_card_dispatch(socket: &Path, id: &str) -> Result<Payload, AppError> {
+pub(crate) fn run_card_propose(socket: &Path, id: &str) -> Result<Payload, AppError> {
+    Ok(Payload::CardPropose(transition(
+        socket,
+        id,
+        "propose",
+        &json!({}),
+    )?))
+}
+
+pub(crate) fn run_card_dispatch(
+    socket: &Path,
+    id: &str,
+    resume: bool,
+    note: Option<&str>,
+) -> Result<Payload, AppError> {
     Ok(Payload::CardDispatch(transition(
         socket,
         id,
         "dispatch",
-        &json!({}),
+        &json!({ "resume": resume, "note": note }),
     )?))
 }
 

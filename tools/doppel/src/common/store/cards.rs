@@ -8,6 +8,8 @@ use super::{Store, conflict, constraint_err, map_sqlite_err, next_id, not_found}
 use crate::common::error::{AppError, ErrorKind};
 use crate::common::store::{ChoiceOption, NewDecision};
 
+/// The seed category assignments are filed under.
+pub(crate) const TRIAGE_CATEGORY: &str = "triage";
 /// How much of a card body a triage decision keeps as context.
 const CONTEXT_CHARS: usize = 2_000;
 /// How much of a session's final answer a card keeps.
@@ -120,10 +122,48 @@ impl Store {
         }
         let card = self.get_card(id)?;
         if by == "human" {
-            let decision = self.triage_decision(&card, &now)?;
-            self.insert_decisions(&[decision])?;
+            self.record_triage(&card, project, priority, &now)?;
         }
         Ok(card)
+    }
+
+    /// A person's assignment into the ledger, filed under `triage` when that
+    /// category is active — the kind decides the category, no model guesses
+    /// it. When the assignment overrode doppel's proposal, the entry becomes
+    /// a golden candidate so the next review sees it first.
+    fn record_triage(
+        &mut self,
+        card: &CardRecord,
+        project: &str,
+        priority: &str,
+        now: &str,
+    ) -> Result<(), AppError> {
+        let decision = self.triage_decision(card, now)?;
+        let external_id = decision.external_id.clone();
+        self.insert_decisions(&[decision])?;
+        let decision_id: String = self
+            .conn
+            .query_row(
+                "SELECT id FROM decisions WHERE source = 'doppel' AND external_id = ?1",
+                params![external_id],
+                |row| row.get(0),
+            )
+            .map_err(map_sqlite_err)?;
+        let filed = self
+            .get_category(TRIAGE_CATEGORY)
+            .is_ok_and(|c| c.state == "active");
+        if filed {
+            self.categorize(&decision_id, TRIAGE_CATEGORY, "human")?;
+        }
+        let overrode = self.judge_proposal(&card.id, project, priority)? == Some(false);
+        if overrode && filed {
+            self.propose_golden(
+                &decision_id,
+                "override",
+                Some("doppel 의 배정 제안을 뒤집음"),
+            )?;
+        }
+        Ok(())
     }
 
     /// Atomically takes a triaged card for a new session, unless `max_running`

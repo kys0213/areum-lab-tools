@@ -210,6 +210,20 @@ pub struct StatsData {
     pub accepted: u32,
     pub acceptance: Option<f64>,
     pub by_category: Vec<CategoryStatsData>,
+    /// Assignment proposals for cards.
+    pub proposals: ProposalStatsData,
+}
+
+/// `applied` counts proposals doppel assigned itself (auto triage); those
+/// are judged only if a person re-assigns the card.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ProposalStatsData {
+    pub proposals: u32,
+    pub failed: u32,
+    pub applied: u32,
+    pub judged: u32,
+    pub accepted: u32,
+    pub acceptance: Option<f64>,
 }
 
 /// `category` is `null` for asks whose ledger entries are not filed yet.
@@ -252,6 +266,7 @@ pub enum Payload {
     CardAdd(CardView),
     CardList(CardListData),
     CardShow(CardView),
+    CardPropose(CardView),
     CardTriage(CardView),
     CardDispatch(CardView),
     CardRelease(CardView),
@@ -387,6 +402,7 @@ impl Payload {
             Payload::CardList(d) => format_card_list(d),
             Payload::CardAdd(c)
             | Payload::CardShow(c)
+            | Payload::CardPropose(c)
             | Payload::CardTriage(c)
             | Payload::CardDispatch(c)
             | Payload::CardRelease(c)
@@ -431,6 +447,16 @@ impl Payload {
                         percent(c.acceptance)
                     ));
                 }
+                let p = &d.proposals;
+                text.push_str(&format!(
+                    "\n{} proposal(s), {} failed, {} applied by doppel; {} of {} taken ({})",
+                    p.proposals,
+                    p.failed,
+                    p.applied,
+                    p.accepted,
+                    p.judged,
+                    percent(p.acceptance)
+                ));
                 text
             }
             Payload::Search(d) => {

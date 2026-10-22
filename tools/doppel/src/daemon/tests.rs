@@ -15,8 +15,9 @@ use crate::common::store::Store;
 use crate::daemon::listen::{DaemonConfig, serve};
 use crate::daemon::state::Thresholds;
 
-use crate::daemon::brief::BriefConfig;
+use crate::daemon::auto::AutoConfig;
 use crate::daemon::launch::LaunchConfig;
+use crate::daemon::model_call::ModelCommand;
 
 pub(super) struct Running {
     pub(super) socket: PathBuf,
@@ -27,25 +28,42 @@ async fn start(dir: &TempDir) -> Running {
     start_with(dir, None).await
 }
 
-async fn start_with(dir: &TempDir, brief: Option<BriefConfig>) -> Running {
+async fn start_with(dir: &TempDir, brief: Option<ModelCommand>) -> Running {
     serve_in(dir, brief, None).await
 }
 
 pub(super) async fn serve_in(
     dir: &TempDir,
-    brief: Option<BriefConfig>,
+    brief: Option<ModelCommand>,
     launch: Option<LaunchConfig>,
 ) -> Running {
-    let socket = dir.path().join("d.sock");
-    // The wall clock: the daemon judges session ages against real time.
-    let store = Store::open(&dir.db_path()).unwrap();
-    let config = DaemonConfig {
-        socket: socket.clone(),
-        ui_port: None,
-        thresholds: Thresholds::default(),
+    serve_config(DaemonConfig {
         brief,
         launch,
-    };
+        ..config_in(dir)
+    })
+    .await
+}
+
+/// A daemon on `dir`'s socket with nothing optional switched on.
+pub(super) fn config_in(dir: &TempDir) -> DaemonConfig {
+    DaemonConfig {
+        socket: dir.path().join("d.sock"),
+        ui_port: None,
+        thresholds: Thresholds::default(),
+        brief: None,
+        proposal: None,
+        launch: None,
+        auto: AutoConfig::default(),
+    }
+}
+
+pub(super) async fn serve_config(config: DaemonConfig) -> Running {
+    // The wall clock: the daemon judges session ages against real time; the
+    // database sits next to the socket.
+    let socket = config.socket.clone();
+    let db = socket.with_file_name("doppel.db");
+    let store = Store::open(&db).unwrap();
     let (ready_tx, ready_rx) = oneshot::channel();
     let task = tokio::spawn(serve(store, config, Some(ready_tx)));
     ready_rx.await.expect("daemon reports ready");
@@ -264,9 +282,7 @@ async fn a_second_daemon_is_refused_and_a_stale_socket_is_replaced() {
         DaemonConfig {
             socket: d.socket.clone(),
             ui_port: None,
-            thresholds: Thresholds::default(),
-            brief: None,
-            launch: None,
+            ..config_in(&dir)
         },
         None,
     )
@@ -296,7 +312,7 @@ async fn a_missing_daemon_is_a_network_error() {
 
 /// A brief command that records its stdin and environment, then prints a
 /// brief recommending `label`.
-fn fake_brief(dir: &TempDir, label: &str) -> BriefConfig {
+fn fake_brief(dir: &TempDir, label: &str) -> ModelCommand {
     let brief = json!({
         "background": "캐시 설계 중",
         "recommendation": {"위치는?": label},
@@ -313,7 +329,7 @@ fn fake_brief(dir: &TempDir, label: &str) -> BriefConfig {
         ),
     );
     std::fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
-    BriefConfig {
+    ModelCommand {
         argv: vec![script.display().to_string()],
         timeout: Duration::from_secs(10),
     }
@@ -373,7 +389,7 @@ async fn a_brief_that_breaks_the_contract_is_failed_with_a_reason() {
         "#!/bin/sh\ncat > /dev/null\necho '디스크가 좋겠어요'\n",
     );
     std::fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
-    let config = BriefConfig {
+    let config = ModelCommand {
         argv: vec![script.display().to_string()],
         timeout: Duration::from_secs(10),
     };

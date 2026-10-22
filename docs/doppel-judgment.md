@@ -21,7 +21,7 @@
 | `session` | `permission` | 세션 JSONL 에서 사람이 직접 내린 권한 결정 (`permissionDecision.source` 가 `user` 로 시작) | `<session_id>:<record uuid>` |
 | `plan` | `plan` | `plans/*.md` 의 결정 기록 — 제목·승인 출처·결정·버린 선택지 | `<repo 이름>/<repo 기준 경로>` |
 | `doppel` | `ask`·`permission` | doppel 이 중계한 질문의 답 (P1) | `<session_id>:<tool_use_id>:<질문 순번>` |
-| `doppel` | `triage` | 사람이 정한 카드 배정 — 질문 `작업 배정: <제목>`, 선택지는 그때의 프로젝트, 답은 `[프로젝트, 우선순위]` ([doppel.md §6](./doppel.md)) | `card:<card id>:<배정 순번>` |
+| `doppel` | `triage` | 사람이 정한 카드 배정 — 질문 `작업 배정: <제목>`, 선택지는 그때의 프로젝트, 답은 `[프로젝트, 우선순위]`. 들어올 때 카테고리 `triage`(`category_by: human`)로 분류된다 ([doppel.md §6](./doppel.md)) | `card:<card id>:<배정 순번>` |
 
 ### 세션 JSONL 에서 읽는 것
 
@@ -166,11 +166,49 @@
 - 카테고리별 다수 답 baseline 대비 향상폭(lift), 거절·정정 사례와 "새 의견" 채택률, 골든셋
   leave-one-out 재현은 분류가 쌓인 뒤 더한다.
 
+### 배정 제안
+
+카드 하나에 한 장. 데몬이 `--propose` 로 켜져 있으면 카드가 `inbox` 에 들어올 때 만든다
+([doppel.md §6](./doppel.md)). 브리프와 같은 틀이다 — 데몬은 번들을 설정된 명령(기본
+`claude -p --output-format json --model sonnet /doppel:triage`)의 stdin 으로 넘기고 출력 계약만
+검사한다. 판례는 카테고리 `triage` 의 확정 골든을 카드 제목·본문으로 검색한 것이다.
+
+```jsonc
+// 번들 (stdin)
+{
+  "v": 1,
+  "card": { "card_id", "source", "title", "body" },
+  "projects": [ { "name", "path", "description" } ],
+  "precedents": [                     // triage 확정 판례, 검색 점수 순 최대 5개
+    { "golden_id", "question", "context", "answers", "rationale", "decided_at", "score" }
+  ]                                   // question = "작업 배정: <제목>", context = 본문, answers = [프로젝트, 우선순위]
+}
+```
+
+```jsonc
+// 제안 (명령의 출력: JSON 객체 하나, `claude -p --output-format json` 이면 그 `result`)
+{
+  "project": "<projects 의 name>" | null,   // null: 맞는 프로젝트가 없다
+  "priority": "P0" | "P1" | "P2" | "P3",
+  "confidence": "low" | "medium" | "high",
+  "rationale": "왜 그 배정인가 1~2문장",
+  "cited": ["gld-000012"]                   // 번들의 판례 id 만
+}
+```
+
+- 번들에 없는 프로젝트·판례를 쓰거나, 우선순위·확신도가 값 밖이면 제안은 `failed` 로 남는다.
+- 평가: 제안 뒤 사람의 첫 배정이 프로젝트·우선순위 모두 같으면 수락. 뒤집힌 배정의 원장
+  항목은 골든 후보(`override`)가 된다.
+
 ### 자동 처리
 
-기본은 끈다. 내가 카테고리별로 켤 때만 doppel 이 추천안으로 바로 답하고 사후 보고한다.
-켤 수 있는지는 측정값과 내가 정한 기준값(표본 수·lift)으로 CLI 가 판정하고, 기준값을
-스스로 바꾸지 않는다. 되돌릴 수 없는 행동은 켤 수 없다.
+기본은 끈다. 내가 켤 때만 doppel 이 추천안으로 바로 처리하고 사후 보고한다. 켤 수 있는지는
+측정값과 내가 정한 기준값(표본 수·수락률)으로 데몬이 판정하고, 기준값을 스스로 바꾸지 않는다.
+되돌릴 수 없는 행동은 켤 수 없다.
+
+- 배정: `--auto-triage` — 판정된 제안 수·수락률이 기준 이상이고 이번 제안이 `high` 일 때
+  ([doppel.md §6](./doppel.md)). 배정은 다시 할 수 있는 행동이다.
+- 질문 답: 아직 없다.
 
 ---
 
@@ -240,7 +278,8 @@ CREATE VIRTUAL TABLE golden_fts USING fts5(
 );
 ```
 
-`briefs` 는 ask 하나에 하나다 (스키마는 [doppel-protocol.md §6](./doppel-protocol.md)).
+`briefs` 는 ask 하나에, `proposals` 는 카드 하나에 하나다 (스키마는
+[doppel-protocol.md §6](./doppel-protocol.md)).
 
 `golden_fts` 는 골든을 만들 때 함께 쓴다. 골든의 검색 대상 텍스트는 바뀌지 않으므로
 갱신 경로가 없다.

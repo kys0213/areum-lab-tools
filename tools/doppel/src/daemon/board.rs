@@ -1,21 +1,20 @@
 //! Board handlers (docs/doppel.md §6): projects and cards. Every change is
 //! published as a `cards` notice for the UI.
 
-use std::path::Path as FsPath;
-
 use axum::Json;
 use axum::Router;
 use axum::extract::{Path, Query, State};
 use axum::routing::{get, post};
 
-use crate::common::error::{AppError, ErrorKind};
-use crate::common::store::NewCard;
+use crate::common::error::AppError;
+use crate::common::store::{CardRecord, NewCard, Store};
 use crate::daemon::api::{
-    CardList, CardView, NewCardBody, NewProjectBody, ProjectList, ProjectView, ReleaseBody,
-    TriageBody,
+    CardList, CardView, DispatchBody, NewCardBody, NewProjectBody, ProjectList, ProjectView,
+    ReleaseBody, TriageBody,
 };
-use crate::daemon::launch;
+use crate::daemon::launch::{self, Mode};
 use crate::daemon::routes::{ApiResult, AppState, StateQuery, one_of, usage};
+use crate::daemon::{auto, proposal};
 
 const PRIORITIES: [&str; 4] = ["P0", "P1", "P2", "P3"];
 
@@ -24,6 +23,7 @@ pub(super) fn routes() -> Router<AppState> {
         .route("/v1/projects", get(list_projects).post(add_project))
         .route("/v1/cards", get(list_cards).post(add_card))
         .route("/v1/cards/{id}", get(get_card))
+        .route("/v1/cards/{id}/propose", post(propose_card))
         .route("/v1/cards/{id}/triage", post(triage_card))
         .route("/v1/cards/{id}/dispatch", post(dispatch_card))
         .route("/v1/cards/{id}/release", post(release_card))
@@ -48,14 +48,29 @@ async fn add_project(
     Ok(Json(project.into()))
 }
 
+fn view(store: &Store, card: CardRecord) -> Result<CardView, AppError> {
+    let proposal = store.get_proposal(&card.id)?;
+    Ok(CardView::with_proposal(card, proposal))
+}
+
+/// The card as the API shows it, read fresh so its proposal is current.
+fn current(app: &AppState, id: &str) -> ApiResult<CardView> {
+    let store = app.store();
+    let card = store.get_card(id)?;
+    Ok(Json(view(&store, card)?))
+}
+
 async fn list_cards(
     State(app): State<AppState>,
     Query(query): Query<StateQuery>,
 ) -> ApiResult<CardList> {
-    let cards = app.store().list_cards(query.state.as_deref())?;
-    Ok(Json(CardList {
-        cards: cards.into_iter().map(CardView::from).collect(),
-    }))
+    let store = app.store();
+    let cards = store
+        .list_cards(query.state.as_deref())?
+        .into_iter()
+        .map(|card| view(&store, card))
+        .collect::<Result<_, _>>()?;
+    Ok(Json(CardList { cards }))
 }
 
 async fn add_card(
@@ -72,11 +87,21 @@ async fn add_card(
         body: &body.body,
     })?;
     app.hub.cards_changed();
-    Ok(Json(card.into()))
+    if app.proposal.is_some() {
+        // The card is in; a proposal that cannot start shows as missing.
+        let _ = proposal::begin(&app, &card.id);
+    }
+    current(&app, &card.id)
 }
 
 async fn get_card(State(app): State<AppState>, Path(id): Path<String>) -> ApiResult<CardView> {
-    Ok(Json(app.store().get_card(&id)?.into()))
+    current(&app, &id)
+}
+
+/// Asks for a (new) proposal; it is written in the background.
+async fn propose_card(State(app): State<AppState>, Path(id): Path<String>) -> ApiResult<CardView> {
+    proposal::begin(&app, &id)?;
+    current(&app, &id)
 }
 
 async fn triage_card(
@@ -96,36 +121,24 @@ async fn triage_card(
         store.triage_card(&id, &body.project, &priority, &by)?
     };
     app.hub.cards_changed();
-    Ok(Json(card.into()))
+    auto::pump(&app);
+    current(&app, &card.id)
 }
 
 /// Claims the card and launches its session in the background; the answer is
 /// the card as claimed, before the session has started.
-async fn dispatch_card(State(app): State<AppState>, Path(id): Path<String>) -> ApiResult<CardView> {
-    let config = app.launch.clone().ok_or_else(|| {
-        AppError::new(
-            ErrorKind::Config,
-            "this daemon launches no sessions (empty --launch-command)",
-        )
-    })?;
-    let (card, path) = {
-        let store = app.store();
-        let card = store.get_card(&id)?;
-        let project = card
-            .project
-            .as_deref()
-            .ok_or_else(|| usage(format!("{id} has no project; triage it first")))?;
-        let path = store.get_project(project)?.path;
-        if !FsPath::new(&path).is_dir() {
-            return Err(usage(format!(
-                "project {project} path {path} is not a directory"
-            )));
-        }
-        (store.claim_card(&id, config.max_running)?, path)
+async fn dispatch_card(
+    State(app): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<DispatchBody>,
+) -> ApiResult<CardView> {
+    let mode = if body.resume {
+        Mode::Resume { note: body.note }
+    } else {
+        Mode::Fresh
     };
-    app.hub.cards_changed();
-    tokio::spawn(launch::run(app.clone(), config, card.clone(), path));
-    Ok(Json(card.into()))
+    let card = launch::start(&app, &id, mode)?;
+    current(&app, &card.id)
 }
 
 /// Back to `triaged`; a running session is stopped.
@@ -135,17 +148,18 @@ async fn release_card(
     Json(body): Json<ReleaseBody>,
 ) -> ApiResult<CardView> {
     let reason = body.reason.unwrap_or_else(|| "released by hand".to_owned());
-    let card = app.store().release_card(&id, &reason)?;
+    app.store().release_card(&id, &reason)?;
     app.runs.stop(&id);
     app.hub.cards_changed();
-    Ok(Json(card.into()))
+    current(&app, &id)
 }
 
 async fn done_card(State(app): State<AppState>, Path(id): Path<String>) -> ApiResult<CardView> {
-    let card = app.store().done_card(&id)?;
+    app.store().done_card(&id)?;
     app.runs.stop(&id);
     app.hub.cards_changed();
-    Ok(Json(card.into()))
+    auto::pump(&app);
+    current(&app, &id)
 }
 
 #[cfg(test)]

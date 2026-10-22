@@ -22,6 +22,7 @@ mod categories;
 mod decisions;
 mod golden;
 mod projects;
+mod proposals;
 mod search;
 mod sessions;
 
@@ -34,11 +35,12 @@ use crate::common::time::now_rfc3339;
 
 pub(crate) use asks::{AskRecord, validate_answers};
 pub(crate) use briefs::{BriefDraft, BriefRecord};
-pub(crate) use cards::{CardRecord, NewCard};
+pub(crate) use cards::{CardRecord, NewCard, TRIAGE_CATEGORY};
 pub(crate) use categories::CategoryRecord;
 pub(crate) use decisions::{ChoiceOption, DecisionFilter, DecisionRecord, NewDecision};
 pub(crate) use golden::{GoldenFilter, GoldenRecord};
 pub(crate) use projects::ProjectRecord;
+pub(crate) use proposals::{ProposalDraft, ProposalRecord, ProposalStats};
 pub(crate) use search::{SearchFilter, fts_query};
 pub(crate) use sessions::{SessionEvent, SessionFacts};
 
@@ -362,6 +364,35 @@ CREATE TABLE IF NOT EXISTS cards (
   CHECK (state NOT IN ('triaged','running','review') OR project IS NOT NULL),
   CHECK (state <> 'running' OR claimed_at IS NOT NULL),
   CHECK (state <> 'review' OR outcome IS NOT NULL)
+);
+
+CREATE TABLE IF NOT EXISTS proposals (
+  card_id     TEXT PRIMARY KEY REFERENCES cards(id),
+  state       TEXT NOT NULL,
+  project     TEXT REFERENCES projects(name),
+  priority    TEXT,
+  confidence  TEXT,
+  rationale   TEXT,
+  cited       TEXT NOT NULL DEFAULT '[]',
+  precedents  TEXT NOT NULL DEFAULT '[]',
+  command     TEXT NOT NULL,
+  error       TEXT,
+  applied     INTEGER NOT NULL DEFAULT 0,
+  accepted    INTEGER,
+  created_at  TEXT NOT NULL,
+  finished_at TEXT,
+
+  CHECK (state IN ('pending','ready','failed')),
+  CHECK (priority IS NULL OR priority IN ('P0','P1','P2','P3')),
+  CHECK (confidence IS NULL OR confidence IN ('low','medium','high')),
+  CHECK ((state = 'pending') = (finished_at IS NULL)),
+  CHECK (state <> 'ready' OR (priority IS NOT NULL AND confidence IS NOT NULL
+                              AND rationale IS NOT NULL)),
+  CHECK (state <> 'failed' OR error IS NOT NULL),
+  CHECK (applied IN (0,1)),
+  CHECK (applied = 0 OR (state = 'ready' AND project IS NOT NULL)),
+  CHECK (accepted IS NULL OR accepted IN (0,1)),
+  CHECK (accepted IS NULL OR state = 'ready')
 );
 
 CREATE TABLE IF NOT EXISTS briefs (

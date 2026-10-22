@@ -2,17 +2,15 @@
 //! the card's project, hand it the card as the first message over
 //! stream-json, and move the card when the session is done.
 
-use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
 
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::sync::oneshot;
 
+use crate::common::error::{AppError, ErrorKind};
 use crate::common::store::CardRecord;
+use crate::daemon::auto;
 use crate::daemon::routes::AppState;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -39,49 +37,80 @@ impl LaunchConfig {
     }
 }
 
-/// Card id → (run number, the run's stop signal).
-type Stops = HashMap<String, (u64, oneshot::Sender<()>)>;
-
-/// Card runs in flight. Each run is numbered so a run that ends after its
-/// card was released and dispatched again cannot unregister the new run.
-#[derive(Clone, Default)]
-pub(crate) struct Runs {
-    next: Arc<AtomicU64>,
-    stops: Arc<Mutex<Stops>>,
+/// How a dispatch starts the session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum Mode {
+    /// A new session that reads the card.
+    Fresh,
+    /// The card's last session, continued with `note` — or, without one,
+    /// with the reason the card was sent back.
+    Resume { note: Option<String> },
 }
 
-impl Runs {
-    fn register(&self, card_id: &str) -> (u64, oneshot::Receiver<()>) {
-        let run = self.next.fetch_add(1, Ordering::Relaxed);
-        let (tx, rx) = oneshot::channel();
-        self.lock().insert(card_id.to_owned(), (run, tx));
-        (run, rx)
-    }
-
-    fn unregister(&self, card_id: &str, run: u64) {
-        let mut stops = self.lock();
-        if stops.get(card_id).is_some_and(|(r, _)| *r == run) {
-            stops.remove(card_id);
-        }
-    }
-
-    /// Stops the card's run, if one is in flight: its session is killed and
-    /// the run leaves the card as the caller put it.
-    pub(super) fn stop(&self, card_id: &str) {
-        if let Some((_, tx)) = self.lock().remove(card_id) {
-            let _ = tx.send(());
-        }
-    }
-
-    fn lock(&self) -> std::sync::MutexGuard<'_, Stops> {
-        // Every critical section is one map operation; nothing is half done.
-        self.stops
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-    }
+/// One run's launch: where, which session to continue, what to say first.
+struct Plan {
+    project_path: String,
+    resume: Option<String>,
+    message: String,
 }
 
-/// The first message a launched session reads.
+/// Claims the card and launches its session in the background. Answers the
+/// card as claimed, before the session has started.
+pub(super) fn start(app: &AppState, id: &str, mode: Mode) -> Result<CardRecord, AppError> {
+    let config = app.launch.clone().ok_or_else(|| {
+        AppError::new(
+            ErrorKind::Config,
+            "this daemon launches no sessions (empty --launch-command)",
+        )
+    })?;
+    let (claimed, plan) = {
+        let store = app.store();
+        let card = store.get_card(id)?;
+        let project = card
+            .project
+            .as_deref()
+            .ok_or_else(|| usage(format!("{id} has no project; triage it first")))?;
+        let project_path = store.get_project(project)?.path;
+        if !Path::new(&project_path).is_dir() {
+            return Err(usage(format!(
+                "project {project} path {project_path} is not a directory"
+            )));
+        }
+        let (resume, message) = match mode {
+            Mode::Fresh => (None, first_message(&card)),
+            Mode::Resume { note } => {
+                let session = card
+                    .session_id
+                    .clone()
+                    .ok_or_else(|| usage(format!("{id} has no earlier session to resume")))?;
+                let message = resume_message(note.as_deref(), card.last_error.as_deref());
+                (Some(session), message)
+            }
+        };
+        let claimed = store.claim_card(id, config.max_running)?;
+        (
+            claimed,
+            Plan {
+                project_path,
+                resume,
+                message,
+            },
+        )
+    };
+    app.hub.cards_changed();
+    tokio::spawn(run(app.clone(), config, claimed.clone(), plan));
+    Ok(claimed)
+}
+
+fn usage(message: String) -> AppError {
+    AppError::new(ErrorKind::Usage, message)
+}
+
+fn user_message(text: &str) -> String {
+    json!({ "type": "user", "message": { "role": "user", "content": text } }).to_string()
+}
+
+/// The first message a new session reads.
 pub(super) fn first_message(card: &CardRecord) -> String {
     let text = if card.body.trim().is_empty() {
         format!("다음 작업을 처리해 주세요.\n\n# {}", card.title)
@@ -91,7 +120,17 @@ pub(super) fn first_message(card: &CardRecord) -> String {
             card.title, card.body
         )
     };
-    json!({ "type": "user", "message": { "role": "user", "content": text } }).to_string()
+    user_message(&text)
+}
+
+/// The first message a resumed session reads.
+pub(super) fn resume_message(note: Option<&str>, sent_back_because: Option<&str>) -> String {
+    let text = match (note.filter(|n| !n.trim().is_empty()), sent_back_because) {
+        (Some(note), _) => note.to_owned(),
+        (None, Some(reason)) => format!("이어서 진행해 주세요.\n\n되돌린 이유: {reason}"),
+        (None, None) => "이어서 진행해 주세요.".to_owned(),
+    };
+    user_message(&text)
 }
 
 /// What one stream-json output line means to the card.
@@ -136,17 +175,12 @@ pub(super) fn read_line(line: &str) -> StreamEvent {
 /// Runs one claimed card to the end. Every outcome lands on the card: its
 /// last answer moves it to `review`, anything else back to `triaged` — unless
 /// a person stopped the run, who already moved the card.
-pub(super) async fn run(
-    app: AppState,
-    config: LaunchConfig,
-    card: CardRecord,
-    project_path: String,
-) {
+async fn run(app: AppState, config: LaunchConfig, card: CardRecord, plan: Plan) {
     let (run, stopped) = app.runs.register(&card.id);
     let outcome = tokio::select! {
         biased;
         _ = stopped => None,
-        outcome = drive(&app, &config, &card, &project_path) => Some(outcome),
+        outcome = drive(&app, &config, &card, &plan) => Some(outcome),
     };
     app.runs.unregister(&card.id, run);
     let Some(outcome) = outcome else {
@@ -161,6 +195,8 @@ pub(super) async fn run(
         };
     }
     app.hub.cards_changed();
+    // A slot is free.
+    auto::pump(&app);
 }
 
 /// `Ok` with the session's last answer, `Err` with why there is none.
@@ -168,11 +204,18 @@ async fn drive(
     app: &AppState,
     config: &LaunchConfig,
     card: &CardRecord,
-    project_path: &str,
+    plan: &Plan,
 ) -> Result<String, String> {
+    let resume = plan
+        .resume
+        .as_deref()
+        .map(|session| ["--resume", session])
+        .into_iter()
+        .flatten();
     let mut child = tokio::process::Command::new(&config.argv[0])
         .args(&config.argv[1..])
-        .current_dir(project_path)
+        .args(resume)
+        .current_dir(&plan.project_path)
         .env("DOPPEL_LAUNCHED", "1")
         .env("DOPPEL_CARD", &card.id)
         .env("DOPPEL_SOCKET", &config.socket)
@@ -190,7 +233,7 @@ async fn drive(
     let stdout = child.stdout.take().ok_or("the session has no stdout")?;
     if let Some(input) = stdin.as_mut() {
         input
-            .write_all(format!("{}\n", first_message(card)).as_bytes())
+            .write_all(format!("{}\n", plan.message).as_bytes())
             .await
             .map_err(|e| format!("cannot send the card to the session: {e}"))?;
     }
@@ -264,6 +307,27 @@ mod tests {
         );
         assert_eq!(read_line(r#"{"type":"assistant"}"#), StreamEvent::Other);
         assert_eq!(read_line("not json"), StreamEvent::Other);
+    }
+
+    #[test]
+    fn a_resumed_session_hears_the_note_or_why_it_was_sent_back() {
+        let text = |m: String| {
+            serde_json::from_str::<Value>(&m).unwrap()["message"]["content"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        };
+        assert_eq!(
+            text(resume_message(Some("테스트도 추가"), Some("x"))),
+            "테스트도 추가"
+        );
+        assert!(
+            text(resume_message(None, Some("범위가 넓음"))).contains("되돌린 이유: 범위가 넓음")
+        );
+        assert_eq!(
+            text(resume_message(Some("  "), None)),
+            "이어서 진행해 주세요."
+        );
     }
 
     #[test]

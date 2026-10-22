@@ -3,41 +3,20 @@
 //! the answer against the contract. What the brief says is the command's
 //! (the plugin's `brief` skill) business.
 
-use std::path::Path;
-use std::process::Stdio;
-use std::time::Duration;
-
 use serde_json::{Value, json};
-use tokio::io::AsyncWriteExt;
 
 use crate::common::error::AppError;
 use crate::common::store::{
     AskRecord, BriefDraft, SearchFilter, SessionFacts, Store, fts_query, validate_answers,
 };
+use crate::daemon::model_call::{answer_object, cited, confidence, optional_string};
 use crate::daemon::routes::AppState;
 
 /// How many precedents a bundle carries at most.
 const PRECEDENTS: u32 = 5;
-/// How much of the command's stderr a failed brief keeps.
-const STDERR_TAIL: usize = 500;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct BriefConfig {
-    pub(crate) argv: Vec<String>,
-    pub(crate) timeout: Duration,
-}
-
-impl BriefConfig {
-    pub(crate) const DEFAULT_COMMAND: &'static str =
-        "claude -p --output-format json --model sonnet /doppel:brief";
-
-    /// Splits on whitespace — no shell, no quoting. `None` for a blank
-    /// command.
-    pub(crate) fn from_command(command: &str, timeout: Duration) -> Option<BriefConfig> {
-        let argv: Vec<String> = command.split_whitespace().map(str::to_owned).collect();
-        (!argv.is_empty()).then_some(BriefConfig { argv, timeout })
-    }
-}
+pub(crate) const DEFAULT_COMMAND: &str =
+    "claude -p --output-format json --model sonnet /doppel:brief";
 
 /// The bundle and the precedent ids it carries. The search query is every
 /// question and option label of the ask, so a precedent about any of the
@@ -100,53 +79,17 @@ pub(super) fn bundle(
     Ok((bundle, ids))
 }
 
-/// Reads the command's stdout under the brief contract. `claude -p
-/// --output-format json` wraps the model's text in `{"type":"result",
-/// "result": …}`; another command may print the brief directly. One layer of
-/// code fence around the object is removed — models add it unasked —
-/// anything else that is not one JSON object is a contract violation.
+/// Reads the command's stdout under the brief contract
+/// (docs/doppel-judgment.md §5).
 pub(super) fn parse_output(
     stdout: &str,
     questions: &Value,
     precedents: &[String],
 ) -> Result<BriefDraft, String> {
-    let outer: Option<Value> = serde_json::from_str(stdout.trim()).ok();
-    let text = match &outer {
-        Some(Value::Object(map)) if map.get("type").and_then(Value::as_str) == Some("result") => {
-            if map.get("is_error").and_then(Value::as_bool) == Some(true) {
-                return Err(format!(
-                    "the brief command reported an error: {}",
-                    map.get("result").and_then(Value::as_str).unwrap_or("")
-                ));
-            }
-            map.get("result")
-                .and_then(Value::as_str)
-                .ok_or("the result envelope has no text")?
-                .to_owned()
-        }
-        _ => stdout.to_owned(),
-    };
-    let body = strip_fence(text.trim());
-    let brief: Value =
-        serde_json::from_str(body).map_err(|e| format!("the brief is not one JSON object: {e}"))?;
-    let map = brief.as_object().ok_or("the brief is not a JSON object")?;
-
-    let string = |key: &str| -> Result<Option<String>, String> {
-        match map.get(key) {
-            None | Some(Value::Null) => Ok(None),
-            Some(Value::String(s)) if !s.trim().is_empty() => Ok(Some(s.clone())),
-            Some(Value::String(_)) => Ok(None),
-            Some(_) => Err(format!("\"{key}\" must be a string")),
-        }
-    };
-    let confidence = string("confidence")?.ok_or("\"confidence\" is missing")?;
-    if !matches!(confidence.as_str(), "low" | "medium" | "high") {
-        return Err(format!(
-            "\"confidence\" must be low, medium or high, not {confidence}"
-        ));
-    }
-    let rationale = string("rationale")?.ok_or("\"rationale\" is missing")?;
-    let new_opinion = string("new_opinion")?;
+    let map = answer_object(stdout, "brief")?;
+    let confidence = confidence(&map)?;
+    let rationale = optional_string(&map, "rationale")?.ok_or("\"rationale\" is missing")?;
+    let new_opinion = optional_string(&map, "new_opinion")?;
     let recommendation = match map.get("recommendation") {
         None | Some(Value::Null) => None,
         Some(answers) => {
@@ -167,42 +110,15 @@ pub(super) fn parse_output(
         Some(Value::Bool(b)) => Some(*b),
         Some(_) => return Err("\"reversible\" must be true, false or null".to_owned()),
     };
-    let cited: Vec<String> = match map.get("cited") {
-        None | Some(Value::Null) => Vec::new(),
-        Some(Value::Array(items)) => items
-            .iter()
-            .map(|i| {
-                i.as_str()
-                    .map(str::to_owned)
-                    .ok_or("\"cited\" must list ids")
-            })
-            .collect::<Result<_, _>>()?,
-        Some(_) => return Err("\"cited\" must be a list".to_owned()),
-    };
-    if let Some(unknown) = cited.iter().find(|id| !precedents.contains(id)) {
-        return Err(format!("cites {unknown}, which the bundle did not carry"));
-    }
     Ok(BriefDraft {
-        background: string("background")?,
+        background: optional_string(&map, "background")?,
         recommendation,
         new_opinion,
         confidence,
         reversible,
         rationale,
-        cited,
+        cited: cited(&map, precedents)?,
     })
-}
-
-fn strip_fence(text: &str) -> &str {
-    let Some(rest) = text.strip_prefix("```") else {
-        return text;
-    };
-    let after_info = rest.split_once('\n').map_or("", |(_, body)| body);
-    after_info
-        .trim_end()
-        .strip_suffix("```")
-        .unwrap_or(after_info)
-        .trim()
 }
 
 /// What a brief run needs once its pending row is written.
@@ -244,7 +160,8 @@ pub(super) async fn run(app: AppState, ask_id: String) {
     };
     app.hub.ask_changed(&ask_id);
 
-    let outcome = execute(&config, &prepared.bundle, prepared.cwd.as_deref())
+    let outcome = config
+        .run(&prepared.bundle, prepared.cwd.as_deref(), "brief")
         .await
         .and_then(|stdout| parse_output(&stdout, &prepared.questions, &prepared.precedents));
     {
@@ -255,59 +172,6 @@ pub(super) async fn run(app: AppState, ask_id: String) {
         };
     }
     app.hub.ask_changed(&ask_id);
-}
-
-/// Runs the command with the bundle on stdin. `DOPPEL_DISABLE` keeps the
-/// brief's own session from connecting back to doppel; the parent's
-/// `CLAUDE_CODE_SESSION_ID` is dropped because a nested `claude` takes it
-/// over as its own id.
-async fn execute(
-    config: &BriefConfig,
-    bundle: &Value,
-    cwd: Option<&str>,
-) -> Result<String, String> {
-    let mut command = tokio::process::Command::new(&config.argv[0]);
-    command
-        .args(&config.argv[1..])
-        .env("DOPPEL_DISABLE", "1")
-        .env_remove("CLAUDE_CODE_SESSION_ID")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
-    if let Some(dir) = cwd.filter(|d| Path::new(d).is_dir()) {
-        command.current_dir(dir);
-    }
-    let mut child = command
-        .spawn()
-        .map_err(|e| format!("cannot run {}: {e}", config.argv[0]))?;
-    if let Some(mut stdin) = child.stdin.take() {
-        stdin
-            .write_all(bundle.to_string().as_bytes())
-            .await
-            .map_err(|e| format!("cannot write the bundle: {e}"))?;
-    }
-    let output = tokio::time::timeout(config.timeout, child.wait_with_output())
-        .await
-        .map_err(|_| format!("timed out after {}s", config.timeout.as_secs()))?
-        .map_err(|e| format!("cannot read the brief: {e}"))?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let tail: String = stderr
-            .chars()
-            .rev()
-            .take(STDERR_TAIL)
-            .collect::<Vec<_>>()
-            .into_iter()
-            .rev()
-            .collect();
-        return Err(format!(
-            "the brief command exited with {}: {}",
-            output.status,
-            tail.trim()
-        ));
-    }
-    String::from_utf8(output.stdout).map_err(|_| "the brief is not UTF-8".to_owned())
 }
 
 #[cfg(test)]
@@ -407,17 +271,5 @@ mod tests {
         let draft = parse_output(&opinion.to_string(), &questions(), &[]).unwrap();
         assert_eq!(draft.recommendation, None);
         assert!(draft.new_opinion.is_some());
-    }
-
-    #[test]
-    fn commands_split_on_whitespace() {
-        let config =
-            BriefConfig::from_command("  claude -p  /doppel:brief ", Duration::from_secs(1))
-                .unwrap();
-        assert_eq!(config.argv, ["claude", "-p", "/doppel:brief"]);
-        assert_eq!(
-            BriefConfig::from_command("   ", Duration::from_secs(1)),
-            None
-        );
     }
 }

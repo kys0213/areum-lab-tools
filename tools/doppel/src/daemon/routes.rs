@@ -22,9 +22,13 @@ use crate::daemon::api::{
     AnswerBody, AskList, AskView, AttachMessage, CloseBody, EventBody, Health, OpenAskBody,
     SessionList, SessionView,
 };
-use crate::daemon::brief::{self, BriefConfig};
+use crate::daemon::auto::AutoConfig;
+use crate::daemon::brief;
 use crate::daemon::hub::Hub;
-use crate::daemon::launch::{LaunchConfig, Runs};
+use crate::daemon::launch::LaunchConfig;
+use crate::daemon::listen::DaemonConfig;
+use crate::daemon::model_call::ModelCommand;
+use crate::daemon::runs::Runs;
 use crate::daemon::state::Thresholds;
 
 /// Longest a single `wait` may hold the connection; the hook's own limit
@@ -39,9 +43,12 @@ pub(super) struct AppState {
     pub(super) hub: Hub,
     pub(super) thresholds: Thresholds,
     /// `None` writes no briefs.
-    pub(super) brief: Option<BriefConfig>,
+    pub(super) brief: Option<ModelCommand>,
+    /// `None` writes no triage proposals.
+    pub(super) proposal: Option<ModelCommand>,
     /// `None` refuses to dispatch cards.
     pub(super) launch: Option<LaunchConfig>,
+    pub(super) auto: AutoConfig,
     /// Card runs in flight, so a person can stop one.
     pub(super) runs: Runs,
     /// Flips to `true` once to stop the daemon: both listeners drain and
@@ -50,18 +57,15 @@ pub(super) struct AppState {
 }
 
 impl AppState {
-    pub(super) fn new(
-        store: Store,
-        thresholds: Thresholds,
-        brief: Option<BriefConfig>,
-        launch: Option<LaunchConfig>,
-    ) -> AppState {
+    pub(super) fn new(store: Store, config: &DaemonConfig) -> AppState {
         AppState {
             store: Arc::new(Mutex::new(store)),
             hub: Hub::new(),
-            thresholds,
-            brief,
-            launch,
+            thresholds: config.thresholds,
+            brief: config.brief.clone(),
+            proposal: config.proposal.clone(),
+            launch: config.launch.clone(),
+            auto: config.auto,
             runs: Runs::default(),
             stop: watch::channel(false).0,
         }

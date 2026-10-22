@@ -9,8 +9,8 @@ pub(crate) use board::{CardListData, ProjectListData};
 pub(crate) use payload::{
     AskListData, AttachData, CategorizeData, CategoryData, CategoryListData, CategoryStatsData,
     DaemonData, DecisionData, DecisionListData, DecisionSummaryData, GoldenData, GoldenListData,
-    GoldenSummaryData, IngestData, InitData, OptionData, Payload, ReviewData, SearchData,
-    SearchHitData, SessionListData, StatsData,
+    GoldenSummaryData, IngestData, InitData, OptionData, Payload, ProposalStatsData, ReviewData,
+    SearchData, SearchHitData, SessionListData, StatsData,
 };
 
 /// Which stream a rendered line belongs on. Human-mode errors are

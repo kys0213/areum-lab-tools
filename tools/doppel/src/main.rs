@@ -167,9 +167,14 @@ fn run(cli: Cli) -> Result<Payload, AppError> {
             ref project,
             priority,
         }) => commands::run_card_triage(&socket()?, id, project, priority.map(|p| p.as_str())),
-        Command::Card(CardCommand::Dispatch { ref id }) => {
-            commands::run_card_dispatch(&socket()?, id)
+        Command::Card(CardCommand::Propose { ref id }) => {
+            commands::run_card_propose(&socket()?, id)
         }
+        Command::Card(CardCommand::Dispatch {
+            ref id,
+            resume,
+            ref note,
+        }) => commands::run_card_dispatch(&socket()?, id, resume, note.as_deref()),
         Command::Card(CardCommand::Release { ref id, ref reason }) => {
             commands::run_card_release(&socket()?, id, reason.as_deref())
         }

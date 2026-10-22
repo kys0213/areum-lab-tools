@@ -12,9 +12,10 @@ use tokio::sync::oneshot;
 
 use crate::common::error::{AppError, ErrorKind};
 use crate::common::store::Store;
-use crate::daemon::brief::BriefConfig;
+use crate::daemon::auto::{self, AutoConfig};
 use crate::daemon::guard::loopback_only;
 use crate::daemon::launch::LaunchConfig;
+use crate::daemon::model_call::ModelCommand;
 use crate::daemon::routes::{AppState, shared_routes, socket_routes, stopped};
 use crate::daemon::state::Thresholds;
 
@@ -24,9 +25,12 @@ pub(crate) struct DaemonConfig {
     pub(crate) ui_port: Option<u16>,
     pub(crate) thresholds: Thresholds,
     /// `None` writes no briefs.
-    pub(crate) brief: Option<BriefConfig>,
+    pub(crate) brief: Option<ModelCommand>,
+    /// `None` writes no triage proposals.
+    pub(crate) proposal: Option<ModelCommand>,
     /// `None` refuses to dispatch cards.
     pub(crate) launch: Option<LaunchConfig>,
+    pub(crate) auto: AutoConfig,
 }
 
 /// Where the daemon ended up listening, reported once both listeners are
@@ -64,13 +68,9 @@ pub(crate) async fn serve(
     if !orphaned.is_empty() {
         eprintln!("released card(s) left running: {}", orphaned.join(", "));
     }
-    let app = AppState::new(
-        store,
-        config.thresholds,
-        config.brief.clone(),
-        config.launch.clone(),
-    );
+    let app = AppState::new(store, &config);
     tokio::spawn(stop_on_signal(app.clone()));
+    auto::pump(&app);
 
     let socket_server = axum::serve(unix, socket_routes().with_state(app.clone()))
         .with_graceful_shutdown(stopped(app.stop.subscribe()));

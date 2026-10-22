@@ -31,8 +31,8 @@ pub(crate) mod testutil;
 pub(crate) use ask::{run_ask_answer, run_ask_list, run_ask_wait};
 pub(crate) use attach::run_attach;
 pub(crate) use card::{
-    CardInput, run_card_add, run_card_dispatch, run_card_done, run_card_list, run_card_release,
-    run_card_show, run_card_triage,
+    CardInput, run_card_add, run_card_dispatch, run_card_done, run_card_list, run_card_propose,
+    run_card_release, run_card_show, run_card_triage,
 };
 pub(crate) use category::{run_category_add, run_category_list, run_category_retire};
 pub(crate) use daemon::{run_daemon_run, run_daemon_start, run_daemon_status, run_daemon_stop};

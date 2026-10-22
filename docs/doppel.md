@@ -183,8 +183,8 @@ doppel 은 세션별 이벤트를 누적해 상태를 만든다. 시간·횟수 
 | 전이 | 누가 | 명령 |
 |---|---|---|
 | (유입) → `inbox` | connector·사람 | `card add` |
-| `inbox`·`triaged` → `triaged` | 사람 (P2b 에서 모델 제안 + 사람 확정, opt-in 자동) | `card triage` |
-| `triaged` → `running` | 사람 (P2b 에서 opt-in 자동) | `card dispatch` |
+| `inbox`·`triaged` → `triaged` | 사람 (doppel 의 제안을 보고) · doppel — `--auto-triage` | `card triage` |
+| `triaged` → `running` | 사람 · doppel — `--auto-dispatch` | `card dispatch [--resume]` |
 | `running` → `review` | doppel — 세션이 결과를 내고 끝남 | 자동 |
 | `running` → `triaged` | doppel — 결과 없이 끝남 · 사람 | `card release` |
 | `review` → `triaged` | 사람 — 다시 시킴 | `card release` |
@@ -194,14 +194,45 @@ doppel 은 세션별 이벤트를 누적해 상태를 만든다. 시간·횟수 
 - `running` 진입은 한 SQL 문으로 원자적으로 점유하고, 동시에 도는 카드 수는 `--max-running`
   (기본 2)을 넘지 않는다.
 - 실패는 상태가 아니다. 점유를 풀어 `triaged` 로 되돌리고 이유를 `last_error` 에 남긴다.
-- 사람이 정한 배정(프로젝트·우선순위)은 판단 원장에 `kind: triage` 로 남는다. 이 판단들을 담을
-  시드 카테고리 `triage` 가 있다 (분류는 다른 원장 항목처럼 `decision categorize`).
+- 사람이 정한 배정(프로젝트·우선순위)은 판단 원장에 `kind: triage` 로 남고, 들어올 때 시드
+  카테고리 `triage` 로 분류된다(그 카테고리가 살아 있을 때). 종류가 곧 분류라 모델에게 묻지
+  않는다. doppel 이 한 배정(`by: model`)은 원장에 남지 않는다.
+
+### 배정 제안
+
+데몬이 `--propose` 로 켜져 있으면 카드가 `inbox` 에 들어올 때 doppel 이 배정을 제안한다.
+`card propose` 로 다시 받을 수 있다(`inbox` 에서만). 번들·출력 계약은
+[doppel-judgment.md §5](./doppel-judgment.md).
+
+- 제안은 `{ project | null, priority, confidence, rationale, cited }` 다. `project: null` 은 맞는
+  프로젝트가 없다는 뜻이다.
+- 제안 뒤 사람이 처음 배정할 때 프로젝트·우선순위가 모두 같으면 수락, 다르면 뒤집힘이다.
+  뒤집힌 배정은 골든 후보(`reason: override`)가 되어 `review` 맨 앞에 온다 — 맞춘 제안은 이미 아는
+  것이라 후보로 올리지 않는다.
+- `doppel stats` 가 제안 수락률을 낸다.
+
+### 자동 처리 (opt-in)
+
+기본은 끈다. 데몬 인자로만 켜고, doppel 은 측정값과 인자를 비교만 한다 — 문턱을 스스로 바꾸지
+않는다.
+
+- **자동 배정** `--auto-triage`: 사람이 판정한 제안이 `--auto-triage-min-judged`(기본 20) 개
+  이상이고 수락률이 `--auto-triage-min-acceptance`(기본 0.9) 이상일 때, 확신도 `high` 이고
+  프로젝트가 있는 제안을 그대로 배정한다(`by: model`). 제안에는 `applied` 로 남는다. 사람이 나중에
+  다시 배정하면 그때 판정된다.
+- **자동 실행** `--auto-dispatch`: `triaged` 이고 `last_error` 가 없는(한 번도 되돌려지지 않은)
+  카드를 우선순위·오래된 순으로 `--max-running` 까지 띄운다. 카드가 배정될 때·끝날 때·닫힐 때와
+  데몬이 시작할 때 다시 본다. 사람이 되돌린 카드는 사람이 다시 띄울 때까지 기다린다.
 
 ### 세션 실행
 
 `card dispatch` 는 `--launch-command`(기본 `claude -p --input-format stream-json
 --output-format stream-json --verbose --permission-mode auto --permission-prompt-tool stdio`)를
 프로젝트 경로에서 띄우고 카드 제목·본문을 첫 메시지로 보낸다.
+
+`card dispatch --resume [--note "..."]` 는 카드의 지난 세션을 이어서 띄운다 — 명령 끝에
+`--resume <session_id>` 를 붙이고, 첫 메시지로 `--note`(없으면 되돌린 이유)를 보낸다. 지난
+세션이 없는 카드는 거부한다(`usage`). 읽은 파일·대화 맥락이 그대로 이어진다.
 
 - env: `DOPPEL_LAUNCHED=1`, `DOPPEL_CARD=<card id>`, `DOPPEL_SOCKET=<이 데몬의 socket>`. 부모의
   `CLAUDE_CODE_SESSION_ID`·`CLAUDE_CODE_REMOTE_SESSION_ID` 는 지운다 — 남아 있으면 띄운 세션이
@@ -259,15 +290,17 @@ doppel search "<질문>" [--category <name>] [--project <path>] [--limit 5] [--i
 
 ```sh
 doppel daemon run | start | stop | status      # --ui-port · --no-ui · 상태 기준값 · --launch-command · --max-running
+                                               # --propose · --auto-triage(-min-judged·-min-acceptance) · --auto-dispatch
 doppel attach --session <id>                   # plugin 이 띄우는 세션별 연결
 doppel ask list | wait | answer                # 질문 inbox (doppel-protocol.md §6)
 doppel session list
-doppel stats                                   # 브리프 추천 수락률 (전체·카테고리별)
+doppel stats                                   # 브리프 추천 수락률 (전체·카테고리별) · 배정 제안 수락률
 doppel project add <name> --path <dir> [--desc "..."] | list
 doppel card add [--source cli] --external-id <id> --title "..." [--body "..." | --body -]
 doppel card list [--state <state>] | show <id>
+doppel card propose <id>                       # 배정 제안 다시 받기 (--propose 데몬)
 doppel card triage <id> --project <name> [--priority P0..P3]
-doppel card dispatch <id> | release <id> [--reason "..."] | done <id>
+doppel card dispatch <id> [--resume [--note "..."]] | release <id> [--reason "..."] | done <id>
 ```
 
 ---
@@ -322,4 +355,4 @@ discord·kanban 과 공유하는 kind 는 같은 번호를 쓴다.
 |---|---|
 | P0 | 판단 원장, `ingest`(세션 JSONL·plans), 카테고리, 골든 묶음 리뷰, 판례 검색 |
 | P1 | 데몬, 세션 연결·상태, 결정 지점, 웹 UI inbox, doppel 채널의 질문 경주 (P1a) · 브리프, 수락률 (P1b) |
-| P2 | 칸반 유입·라벨링·분배, 카테고리별 opt-in 자동 처리 |
+| P2 | 프로젝트·카드·배정·세션 실행·칸반 UI (P2a) · 배정 제안, opt-in 자동 배정·실행, 이어서 시키기 (P2b) |

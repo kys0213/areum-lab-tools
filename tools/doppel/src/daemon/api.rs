@@ -4,7 +4,9 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::common::store::{AskRecord, BriefRecord, CardRecord, ProjectRecord, SessionFacts};
+use crate::common::store::{
+    AskRecord, BriefRecord, CardRecord, ProjectRecord, ProposalRecord, SessionFacts,
+};
 use crate::daemon::state::{Thresholds, derive_state};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -243,6 +245,49 @@ pub(crate) struct CardView {
     pub(crate) last_error: Option<String>,
     pub(crate) created_at: String,
     pub(crate) updated_at: String,
+    /// `null` until doppel has been asked for one.
+    #[serde(default)]
+    pub(crate) proposal: Option<ProposalView>,
+}
+
+/// doppel's assignment proposal as the API shows it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub(crate) struct ProposalView {
+    pub(crate) state: String,
+    pub(crate) project: Option<String>,
+    pub(crate) priority: Option<String>,
+    pub(crate) confidence: Option<String>,
+    pub(crate) rationale: Option<String>,
+    pub(crate) cited: Vec<String>,
+    pub(crate) error: Option<String>,
+    /// doppel assigned the card as proposed.
+    pub(crate) applied: bool,
+    pub(crate) accepted: Option<bool>,
+}
+
+impl From<ProposalRecord> for ProposalView {
+    fn from(p: ProposalRecord) -> Self {
+        ProposalView {
+            state: p.state,
+            project: p.project,
+            priority: p.priority,
+            confidence: p.confidence,
+            rationale: p.rationale,
+            cited: p.cited,
+            error: p.error,
+            applied: p.applied,
+            accepted: p.accepted,
+        }
+    }
+}
+
+impl CardView {
+    pub(crate) fn with_proposal(card: CardRecord, proposal: Option<ProposalRecord>) -> Self {
+        CardView {
+            proposal: proposal.map(ProposalView::from),
+            ..CardView::from(card)
+        }
+    }
 }
 
 impl From<CardRecord> for CardView {
@@ -262,6 +307,7 @@ impl From<CardRecord> for CardView {
             last_error: c.last_error,
             created_at: c.created_at,
             updated_at: c.updated_at,
+            proposal: None,
         }
     }
 }
@@ -295,6 +341,15 @@ pub(crate) struct TriageBody {
     pub(crate) project: String,
     pub(crate) priority: Option<String>,
     pub(crate) by: Option<String>,
+}
+
+/// `resume` continues the card's last session; `note` is what it hears
+/// first (without one, why the card was sent back).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub(crate) struct DispatchBody {
+    #[serde(default)]
+    pub(crate) resume: bool,
+    pub(crate) note: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
