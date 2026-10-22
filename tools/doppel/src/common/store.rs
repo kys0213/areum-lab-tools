@@ -25,10 +25,10 @@ mod sessions;
 
 use std::path::Path;
 
+use cli_contract::time::now_rfc3339;
 use rusqlite::{Connection, ErrorCode};
 
 use crate::common::error::{AppError, ErrorKind};
-use crate::common::time::now_rfc3339;
 
 pub(crate) use asks::{AskRecord, validate_answers};
 pub(crate) use briefs::{BriefDraft, BriefRecord};

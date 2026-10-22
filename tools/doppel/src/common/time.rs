@@ -1,59 +1,15 @@
-//! Canonical UTC timestamps without a date/time crate. Every time column is
-//! TEXT in `YYYY-MM-DDTHH:MM:SSZ`, which compares lexicographically as time
-//! order — `decision list` and `search` order by `decided_at` relying on it.
+//! Reading side of the canonical UTC timestamps that `cli_contract::time`
+//! produces. Every time column is TEXT in `YYYY-MM-DDTHH:MM:SSZ`, which
+//! compares lexicographically as time order — `decision list` and `search`
+//! order by `decided_at` relying on it.
 //!
 //! Source timestamps (transcript millisecond RFC3339, plan `YYYY-MM-DD`
 //! dates) are normalized into the same shape here so every row sorts on one
 //! scale.
 
-use std::time::{SystemTime, UNIX_EPOCH};
-
-/// Wall-clock "now" as a canonical UTC RFC3339 string (`YYYY-MM-DDTHH:MM:SSZ`).
-pub(crate) fn now_rfc3339() -> String {
-    format_epoch_secs(now_epoch_secs())
-}
-
-/// A pre-epoch system clock is not a state the ledger can represent: clamping
-/// it would stamp `1970-01-01T00:00:00Z` into `created_at` and silently place
-/// the row ahead of every real entry in time-ordered listings.
-pub(crate) fn now_epoch_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system clock is after the Unix epoch")
-        .as_secs()
-}
-
-/// Formats seconds-since-Unix-epoch as `YYYY-MM-DDTHH:MM:SSZ`. Pure, so the
-/// civil-date conversion is testable against known instants without a clock.
-fn format_epoch_secs(secs: u64) -> String {
-    let days = (secs / 86_400) as i64;
-    let time_of_day = secs % 86_400;
-    let hour = time_of_day / 3_600;
-    let minute = (time_of_day % 3_600) / 60;
-    let second = time_of_day % 60;
-    let (year, month, day) = civil_from_days(days);
-    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
-}
-
-/// Converts a day count since 1970-01-01 into a `(year, month, day)` civil
-/// date using Howard Hinnant's `civil_from_days` algorithm — avoids pulling in
-/// a date crate for the one conversion the ledger needs.
-fn civil_from_days(days: i64) -> (i64, u32, u32) {
-    let z = days + 719_468;
-    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let doe = (z - era * 146_097) as u64;
-    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
-    let year = yoe as i64 + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let day = (doy - (153 * mp + 2) / 5 + 1) as u32;
-    let month = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
-    (if month <= 2 { year + 1 } else { year }, month, day)
-}
-
 /// Seconds since the Unix epoch of a canonical timestamp — the inverse of
-/// [`format_epoch_secs`], for the session-state thresholds that compare two
-/// stored instants. `None` for anything not in the canonical shape.
+/// [`cli_contract::time::format_epoch_secs`], for the session-state
+/// thresholds that compare two stored instants. `None` for anything not in the canonical shape.
 pub(crate) fn epoch_from_canonical(raw: &str) -> Option<u64> {
     if raw.len() != 20 || !raw.ends_with('Z') || !has_datetime_shape(&raw[..19]) {
         return None;
@@ -65,7 +21,8 @@ pub(crate) fn epoch_from_canonical(raw: &str) -> Option<u64> {
     u64::try_from(days * 86_400 + hour * 3_600 + minute * 60 + second).ok()
 }
 
-/// Hinnant's `days_from_civil`, the inverse of [`civil_from_days`].
+/// Hinnant's `days_from_civil`, the inverse of the `civil_from_days` behind
+/// [`cli_contract::time::format_epoch_secs`].
 fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
     let y = if month <= 2 { year - 1 } else { year };
     let era = if y >= 0 { y } else { y - 399 } / 400;
@@ -114,41 +71,10 @@ fn has_datetime_shape(s: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use cli_contract::time::format_epoch_secs;
+
     use super::*;
 
-    #[test]
-    fn epoch_is_unix_zero() {
-        assert_eq!(format_epoch_secs(0), "1970-01-01T00:00:00Z");
-    }
-
-    #[test]
-    fn known_instant_formats_to_utc() {
-        // 1_700_000_000 == 2023-11-14T22:13:20Z (independently verifiable).
-        assert_eq!(format_epoch_secs(1_700_000_000), "2023-11-14T22:13:20Z");
-    }
-
-    #[test]
-    fn leap_day_is_handled() {
-        // 2024-02-29T00:00:00Z == 1_709_164_800.
-        assert_eq!(format_epoch_secs(1_709_164_800), "2024-02-29T00:00:00Z");
-    }
-
-    #[test]
-    fn canonical_strings_sort_in_time_order() {
-        // Listing orders by decided_at as TEXT, so lexicographic order must
-        // equal chronological order across a year boundary.
-        let earlier = format_epoch_secs(1_700_000_000);
-        let later = format_epoch_secs(1_709_164_800);
-        assert!(earlier < later, "{earlier} should sort before {later}");
-    }
-
-    #[test]
-    fn now_has_canonical_shape() {
-        let now = now_rfc3339();
-        assert_eq!(now.len(), 20, "expected fixed-width RFC3339 UTC: {now}");
-        assert!(now.ends_with('Z'));
-        assert_eq!(now.as_bytes()[10], b'T');
-    }
     #[test]
     fn epoch_round_trips_through_the_canonical_shape() {
         for secs in [0, 1_700_000_000, 1_709_164_800, 4_102_444_799] {

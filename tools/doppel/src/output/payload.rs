@@ -7,6 +7,7 @@
 
 use std::collections::BTreeMap;
 
+use cli_contract::HumanText;
 use serde::Serialize;
 
 use crate::daemon::api::{AskView, SessionView};
@@ -246,8 +247,8 @@ pub enum Payload {
     Stats(StatsData),
 }
 
-impl Payload {
-    pub(super) fn to_human(&self) -> String {
+impl HumanText for Payload {
+    fn to_human(&self) -> String {
         match self {
             Payload::Init(d) => {
                 let verb = if d.created {
