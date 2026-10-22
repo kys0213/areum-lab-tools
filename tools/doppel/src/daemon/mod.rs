@@ -2,9 +2,11 @@
 //! Unix socket (plugins, CLI) and on a loopback TCP port (web UI).
 
 pub(crate) mod api;
+mod board;
 pub(crate) mod brief;
 mod guard;
 mod hub;
+pub(crate) mod launch;
 pub(crate) mod listen;
 mod routes;
 pub(crate) mod state;

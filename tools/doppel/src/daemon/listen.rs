@@ -14,6 +14,7 @@ use crate::common::error::{AppError, ErrorKind};
 use crate::common::store::Store;
 use crate::daemon::brief::BriefConfig;
 use crate::daemon::guard::loopback_only;
+use crate::daemon::launch::LaunchConfig;
 use crate::daemon::routes::{AppState, shared_routes, socket_routes, stopped};
 use crate::daemon::state::Thresholds;
 
@@ -24,6 +25,8 @@ pub(crate) struct DaemonConfig {
     pub(crate) thresholds: Thresholds,
     /// `None` writes no briefs.
     pub(crate) brief: Option<BriefConfig>,
+    /// `None` refuses to dispatch cards.
+    pub(crate) launch: Option<LaunchConfig>,
 }
 
 /// Where the daemon ended up listening, reported once both listeners are
@@ -55,7 +58,18 @@ pub(crate) async fn serve(
         .transpose()
         .map_err(|e| internal(format!("cannot read the UI address: {e}")))?;
 
-    let app = AppState::new(store, config.thresholds, config.brief.clone());
+    // Sessions this daemon launched die with it; a card still `running` now
+    // was left by a previous run.
+    let orphaned = store.release_orphaned_cards()?;
+    if !orphaned.is_empty() {
+        eprintln!("released card(s) left running: {}", orphaned.join(", "));
+    }
+    let app = AppState::new(
+        store,
+        config.thresholds,
+        config.brief.clone(),
+        config.launch.clone(),
+    );
     tokio::spawn(stop_on_signal(app.clone()));
 
     let socket_server = axum::serve(unix, socket_routes().with_state(app.clone()))

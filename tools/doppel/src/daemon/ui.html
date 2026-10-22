@@ -55,6 +55,22 @@
   .brief.failed { border-left-color: var(--bad); }
   .brief.failed .label { color: var(--bad); }
   .table-wrap { overflow-x: auto; }
+  .nowrap { white-space: nowrap; }
+  .board { grid-column: 1 / -1; }
+  .columns { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; }
+  @media (max-width: 900px) { .columns { grid-template-columns: 1fr; } }
+  .column h3 { font-size: 13px; margin: 0 0 8px; color: var(--muted); font-weight: 600; }
+  .ticket .title { font-weight: 600; overflow-wrap: anywhere; }
+  .ticket .body, .ticket .outcome { font-size: 13px; white-space: pre-wrap; overflow-wrap: anywhere; margin-top: 6px; }
+  .ticket .outcome { border-left: 3px solid var(--ok); padding-left: 8px; }
+  .ticket .error { font-size: 13px; color: var(--bad); margin-top: 6px; }
+  .row { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 8px; }
+  .row input, .row textarea, .row select { flex: 1; min-width: 0; font: inherit; padding: 6px 10px; border-radius: 8px;
+                 border: 1px solid var(--line); background: var(--bg); color: var(--text); }
+  .row textarea { min-height: 60px; flex-basis: 100%; }
+  #projects { white-space: pre-line; }
+  .forms { display: grid; grid-template-columns: minmax(0, 3fr) minmax(0, 2fr); gap: 12px; margin-bottom: 12px; }
+  @media (max-width: 900px) { .forms { grid-template-columns: 1fr; } }
 </style>
 </head>
 <body>
@@ -71,10 +87,29 @@
     <h2>세션</h2>
     <div class="card table-wrap">
       <table>
-        <thead><tr><th>상태</th><th>세션</th><th>마지막</th></tr></thead>
+        <thead><tr><th>상태</th><th>세션</th><th class="nowrap">마지막</th></tr></thead>
         <tbody id="sessions"></tbody>
       </table>
     </div>
+  </section>
+  <section class="board">
+    <h2>작업 보드</h2>
+    <div class="forms">
+      <div class="card">
+        <div class="meta">새 작업</div>
+        <div class="row"><input id="card-title" placeholder="제목"></div>
+        <div class="row"><textarea id="card-body" placeholder="내용 (선택)"></textarea></div>
+        <div class="row"><button class="primary" onclick="addCard()">받은 작업에 넣기</button></div>
+      </div>
+      <div class="card">
+        <div class="meta">프로젝트</div>
+        <div id="projects" class="meta"></div>
+        <div class="row"><input id="project-name" placeholder="이름"><input id="project-path" placeholder="절대 경로"></div>
+        <div class="row"><button onclick="addProject()">프로젝트 추가</button></div>
+      </div>
+    </div>
+    <div class="columns" id="columns"></div>
+    <div class="meta" id="done-count"></div>
   </section>
 </main>
 <script>
@@ -126,7 +161,7 @@ function renderSessions(sessions) {
         el("div", { class: "meta" }, shortId(s.session_id) + " · " + s.surface + (s.open_asks ? " · 질문 " + s.open_asks : "")),
         s.last_summary ? el("div", { class: "summary" }, s.last_summary) : "",
       ]),
-      el("td", { class: "meta" }, shortTime(s.last_event_at)),
+      el("td", { class: "meta nowrap" }, shortTime(s.last_event_at)),
     ]));
   }
 }
@@ -242,11 +277,108 @@ function renderInbox(asks) {
   }
 }
 
+const COLUMNS = [
+  ["inbox", "받은 작업"], ["triaged", "배정됨"], ["running", "실행 중"], ["review", "확인 대기"],
+];
+const PRIORITIES = ["P0", "P1", "P2", "P3"];
+let projects = [];
+
+async function act(path, body) {
+  try {
+    await api(path, body || {});
+  } catch (error) {
+    alert(error.message);
+  }
+  refresh();
+}
+
+async function addCard() {
+  const title = document.getElementById("card-title");
+  const body = document.getElementById("card-body");
+  if (!title.value.trim()) return;
+  await act("/v1/cards", { source: "ui", external_id: "ui-" + Date.now(), title: title.value.trim(), body: body.value });
+  title.value = ""; body.value = "";
+}
+
+async function addProject() {
+  const name = document.getElementById("project-name");
+  const path = document.getElementById("project-path");
+  if (!name.value.trim() || !path.value.trim()) return;
+  await act("/v1/projects", { name: name.value.trim(), path: path.value.trim() });
+  name.value = ""; path.value = "";
+}
+
+function select(values, current) {
+  const node = el("select");
+  for (const value of values) {
+    const option = el("option", { value }, value);
+    if (value === current) option.selected = true;
+    node.append(option);
+  }
+  return node;
+}
+
+function triageRow(card) {
+  if (projects.length === 0) return el("div", { class: "meta" }, "프로젝트를 먼저 추가하세요");
+  const project = select(projects.map(p => p.name), card.project);
+  const priority = select(PRIORITIES, card.priority);
+  return el("div", { class: "row" }, [project, priority, el("button", {
+    onclick: () => act("/v1/cards/" + card.card_id + "/triage", { project: project.value, priority: priority.value }),
+  }, card.state === "inbox" ? "배정" : "다시 배정")]);
+}
+
+function ticket(card) {
+  const node = el("div", { class: "card ticket" }, [
+    el("div", { class: "meta" }, card.priority + " · " + (card.project || "미배정") + " · " + card.source + " · " + shortTime(card.updated_at)),
+    el("div", { class: "title" }, card.title),
+    card.body ? el("div", { class: "body" }, card.body) : "",
+    card.last_error ? el("div", { class: "error" }, card.last_error) : "",
+  ]);
+  const id = card.card_id;
+  if (card.state === "inbox" || card.state === "triaged") node.append(triageRow(card));
+  const buttons = el("div", { class: "row" });
+  if (card.state === "triaged") buttons.append(el("button", { class: "primary", onclick: () => act("/v1/cards/" + id + "/dispatch") }, "실행"));
+  if (card.state === "running") {
+    if (card.session_id) node.append(el("div", { class: "meta" }, "세션 " + shortId(card.session_id)));
+    buttons.append(el("button", { onclick: () => act("/v1/cards/" + id + "/release", { reason: "UI 에서 멈춤" }) }, "멈추기"));
+  }
+  if (card.state === "review") {
+    node.append(el("div", { class: "outcome" }, card.outcome || ""));
+    buttons.append(el("button", { class: "primary", onclick: () => act("/v1/cards/" + id + "/done") }, "완료"));
+    buttons.append(el("button", { onclick: () => act("/v1/cards/" + id + "/release", { reason: "다시 시킴" }) }, "다시 시키기"));
+  }
+  if (card.state !== "running" && card.state !== "review") {
+    buttons.append(el("button", { onclick: () => act("/v1/cards/" + id + "/done") }, "닫기"));
+  }
+  node.append(buttons);
+  return node;
+}
+
+function renderBoard(cards) {
+  document.getElementById("projects").textContent =
+    projects.length ? projects.map(p => p.name + " — " + p.path).join("\n") : "등록된 프로젝트가 없습니다";
+  const columns = document.getElementById("columns");
+  columns.replaceChildren();
+  for (const [state, label] of COLUMNS) {
+    const mine = cards.filter(c => c.state === state);
+    const column = el("div", { class: "column" }, el("h3", {}, label + " " + mine.length));
+    if (mine.length === 0) column.append(el("div", { class: "empty" }, "없음"));
+    for (const card of mine) column.append(ticket(card));
+    columns.append(column);
+  }
+  const done = cards.filter(c => c.state === "done").length;
+  document.getElementById("done-count").textContent = done ? "완료 " + done + "건" : "";
+}
+
 async function refresh() {
   try {
-    const [sessions, asks] = await Promise.all([api("/v1/sessions"), api("/v1/asks")]);
+    const [sessions, asks, cards, projectList] = await Promise.all([
+      api("/v1/sessions"), api("/v1/asks"), api("/v1/cards"), api("/v1/projects"),
+    ]);
     renderSessions(sessions.sessions);
     renderInbox(asks.asks);
+    projects = projectList.projects;
+    renderBoard(cards.cards);
   } catch (error) {
     document.getElementById("status").textContent = "불러오지 못함: " + error.message;
   }

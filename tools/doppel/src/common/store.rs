@@ -17,9 +17,11 @@
 
 mod asks;
 mod briefs;
+mod cards;
 mod categories;
 mod decisions;
 mod golden;
+mod projects;
 mod search;
 mod sessions;
 
@@ -32,9 +34,11 @@ use crate::common::time::now_rfc3339;
 
 pub(crate) use asks::{AskRecord, validate_answers};
 pub(crate) use briefs::{BriefDraft, BriefRecord};
+pub(crate) use cards::{CardRecord, NewCard};
 pub(crate) use categories::CategoryRecord;
 pub(crate) use decisions::{ChoiceOption, DecisionFilter, DecisionRecord, NewDecision};
 pub(crate) use golden::{GoldenFilter, GoldenRecord};
+pub(crate) use projects::ProjectRecord;
 pub(crate) use search::{SearchFilter, fts_query};
 pub(crate) use sessions::{SessionEvent, SessionFacts};
 
@@ -163,23 +167,65 @@ fn is_busy(err: &rusqlite::Error) -> bool {
 
 /// Every statement is additive and `IF NOT EXISTS`, so opening an existing
 /// database is a no-op and later stages add their tables by appending here.
+/// A change that `IF NOT EXISTS` cannot express (a CHECK widening) is a
+/// numbered migration in [`migrate`].
 fn create_schema(conn: &Connection) -> Result<(), AppError> {
+    conn.execute_batch(&format!(
+        "CREATE TABLE IF NOT EXISTS decisions ({DECISIONS_COLUMNS}"
+    ))
+    .map_err(map_sqlite_err)?;
     conn.execute_batch(CREATE_SCHEMA_SQL)
+        .map_err(map_sqlite_err)?;
+    migrate(conn)
+}
+
+/// The schema version this build writes (`PRAGMA user_version`).
+const SCHEMA_VERSION: i64 = 1;
+
+/// Brings an older database up to [`SCHEMA_VERSION`], one step at a time.
+///
+/// - 1: `decisions.kind` admits `triage`. SQLite cannot alter a CHECK, so the
+///   table is rebuilt (create, copy, drop, rename) with foreign keys off —
+///   the documented way to change a constraint without breaking `golden`'s
+///   reference to it.
+fn migrate(conn: &Connection) -> Result<(), AppError> {
+    let version: i64 = conn
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .map_err(map_sqlite_err)?;
+    if version >= SCHEMA_VERSION {
+        return Ok(());
+    }
+    let decisions_sql: String = conn
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'decisions'",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(map_sqlite_err)?;
+    if !decisions_sql.contains("'triage'") {
+        conn.pragma_update(None, "foreign_keys", "OFF")
+            .map_err(map_sqlite_err)?;
+        let rebuilt = conn.execute_batch(&format!(
+            "BEGIN IMMEDIATE;
+             CREATE TABLE decisions_v1 ({DECISIONS_COLUMNS}
+             INSERT INTO decisions_v1 SELECT * FROM decisions;
+             DROP TABLE decisions;
+             ALTER TABLE decisions_v1 RENAME TO decisions;
+             COMMIT;"
+        ));
+        if rebuilt.is_err() {
+            let _ = conn.execute_batch("ROLLBACK");
+        }
+        enable_foreign_keys(conn)?;
+        rebuilt.map_err(map_sqlite_err)?;
+    }
+    conn.pragma_update(None, "user_version", SCHEMA_VERSION)
         .map_err(map_sqlite_err)
 }
 
-/// docs/doppel-judgment.md §6 verbatim.
-const CREATE_SCHEMA_SQL: &str = "
-CREATE TABLE IF NOT EXISTS categories (
-  name        TEXT PRIMARY KEY,
-  description TEXT NOT NULL,
-  state       TEXT NOT NULL DEFAULT 'active',
-  created_at  TEXT NOT NULL,
-  CHECK (state IN ('active','retired'))
-);
-
-CREATE TABLE IF NOT EXISTS decisions (
-  id            TEXT PRIMARY KEY,
+/// The `decisions` columns and constraints, shared by the create and by the
+/// rebuild in [`migrate`] (docs/doppel-judgment.md §6).
+const DECISIONS_COLUMNS: &str = "id            TEXT PRIMARY KEY,
   source        TEXT NOT NULL,
   external_id   TEXT NOT NULL,
   kind          TEXT NOT NULL,
@@ -197,9 +243,20 @@ CREATE TABLE IF NOT EXISTS decisions (
 
   UNIQUE (source, external_id),
   CHECK (source IN ('session','plan','doppel')),
-  CHECK (kind IN ('ask','permission','plan')),
+  CHECK (kind IN ('ask','permission','plan','triage')),
   CHECK ((category IS NULL) = (category_by IS NULL)),
   CHECK (category_by IS NULL OR category_by IN ('human','model'))
+);
+";
+
+/// docs/doppel-judgment.md §6 verbatim.
+const CREATE_SCHEMA_SQL: &str = "
+CREATE TABLE IF NOT EXISTS categories (
+  name        TEXT PRIMARY KEY,
+  description TEXT NOT NULL,
+  state       TEXT NOT NULL DEFAULT 'active',
+  created_at  TEXT NOT NULL,
+  CHECK (state IN ('active','retired'))
 );
 
 CREATE TABLE IF NOT EXISTS golden (
@@ -274,6 +331,37 @@ CREATE TABLE IF NOT EXISTS asks (
   CHECK (state <> 'answered' OR (answers IS NOT NULL AND answered_by IS NOT NULL)),
   CHECK ((state = 'closed') = (closed_at IS NOT NULL)),
   CHECK (state <> 'deferred' OR deferred_at IS NOT NULL)
+);
+
+CREATE TABLE IF NOT EXISTS projects (
+  name        TEXT PRIMARY KEY,
+  path        TEXT NOT NULL,
+  description TEXT NOT NULL DEFAULT '',
+  created_at  TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS cards (
+  id          TEXT PRIMARY KEY,
+  source      TEXT NOT NULL,
+  external_id TEXT NOT NULL,
+  title       TEXT NOT NULL,
+  body        TEXT NOT NULL DEFAULT '',
+  state       TEXT NOT NULL,
+  project     TEXT REFERENCES projects(name),
+  priority    TEXT NOT NULL DEFAULT 'P2',
+  session_id  TEXT,
+  claimed_at  TEXT,
+  outcome     TEXT,
+  last_error  TEXT,
+  created_at  TEXT NOT NULL,
+  updated_at  TEXT NOT NULL,
+
+  UNIQUE (source, external_id),
+  CHECK (state IN ('inbox','triaged','running','review','done')),
+  CHECK (priority IN ('P0','P1','P2','P3')),
+  CHECK (state NOT IN ('triaged','running','review') OR project IS NOT NULL),
+  CHECK (state <> 'running' OR claimed_at IS NOT NULL),
+  CHECK (state <> 'review' OR outcome IS NOT NULL)
 );
 
 CREATE TABLE IF NOT EXISTS briefs (

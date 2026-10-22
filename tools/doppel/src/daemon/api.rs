@@ -4,7 +4,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::common::store::{AskRecord, BriefRecord, SessionFacts};
+use crate::common::store::{AskRecord, BriefRecord, CardRecord, ProjectRecord, SessionFacts};
 use crate::daemon::state::{Thresholds, derive_state};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -197,4 +197,107 @@ impl UiNotice {
         kind: "changed",
         what: "asks",
     };
+    pub(crate) const CARDS: UiNotice = UiNotice {
+        kind: "changed",
+        what: "cards",
+    };
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub(crate) struct ProjectView {
+    pub(crate) name: String,
+    pub(crate) path: String,
+    pub(crate) description: String,
+    pub(crate) created_at: String,
+}
+
+impl From<ProjectRecord> for ProjectView {
+    fn from(p: ProjectRecord) -> Self {
+        ProjectView {
+            name: p.name,
+            path: p.path,
+            description: p.description,
+            created_at: p.created_at,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub(crate) struct ProjectList {
+    pub(crate) projects: Vec<ProjectView>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub(crate) struct CardView {
+    pub(crate) card_id: String,
+    pub(crate) source: String,
+    pub(crate) external_id: String,
+    pub(crate) title: String,
+    pub(crate) body: String,
+    pub(crate) state: String,
+    pub(crate) project: Option<String>,
+    pub(crate) priority: String,
+    pub(crate) session_id: Option<String>,
+    pub(crate) claimed_at: Option<String>,
+    pub(crate) outcome: Option<String>,
+    pub(crate) last_error: Option<String>,
+    pub(crate) created_at: String,
+    pub(crate) updated_at: String,
+}
+
+impl From<CardRecord> for CardView {
+    fn from(c: CardRecord) -> Self {
+        CardView {
+            card_id: c.id,
+            source: c.source,
+            external_id: c.external_id,
+            title: c.title,
+            body: c.body,
+            state: c.state,
+            project: c.project,
+            priority: c.priority,
+            session_id: c.session_id,
+            claimed_at: c.claimed_at,
+            outcome: c.outcome,
+            last_error: c.last_error,
+            created_at: c.created_at,
+            updated_at: c.updated_at,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub(crate) struct CardList {
+    pub(crate) cards: Vec<CardView>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct NewProjectBody {
+    pub(crate) name: String,
+    pub(crate) path: String,
+    #[serde(default)]
+    pub(crate) description: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct NewCardBody {
+    pub(crate) source: String,
+    pub(crate) external_id: String,
+    pub(crate) title: String,
+    #[serde(default)]
+    pub(crate) body: String,
+}
+
+/// `priority` keeps the card's current one when absent; `by` is `human`
+/// unless a model proposed the assignment.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct TriageBody {
+    pub(crate) project: String,
+    pub(crate) priority: Option<String>,
+    pub(crate) by: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct ReleaseBody {
+    pub(crate) reason: Option<String>,
 }

@@ -21,6 +21,7 @@
 | `session` | `permission` | 세션 JSONL 에서 사람이 직접 내린 권한 결정 (`permissionDecision.source` 가 `user` 로 시작) | `<session_id>:<record uuid>` |
 | `plan` | `plan` | `plans/*.md` 의 결정 기록 — 제목·승인 출처·결정·버린 선택지 | `<repo 이름>/<repo 기준 경로>` |
 | `doppel` | `ask`·`permission` | doppel 이 중계한 질문의 답 (P1) | `<session_id>:<tool_use_id>:<질문 순번>` |
+| `doppel` | `triage` | 사람이 정한 카드 배정 — 질문 `작업 배정: <제목>`, 선택지는 그때의 프로젝트, 답은 `[프로젝트, 우선순위]` ([doppel.md §6](./doppel.md)) | `card:<card id>:<배정 순번>` |
 
 ### 세션 JSONL 에서 읽는 것
 
@@ -188,7 +189,7 @@ CREATE TABLE decisions (
   id            TEXT PRIMARY KEY,        -- dec-000001
   source        TEXT NOT NULL,           -- session | plan | doppel
   external_id   TEXT NOT NULL,
-  kind          TEXT NOT NULL,           -- ask | permission | plan
+  kind          TEXT NOT NULL,           -- ask | permission | plan | triage
   project       TEXT,                    -- 세션 cwd 또는 repo 이름
   session_id    TEXT,
   question      TEXT NOT NULL,
@@ -203,7 +204,7 @@ CREATE TABLE decisions (
 
   UNIQUE (source, external_id),
   CHECK (source IN ('session','plan','doppel')),
-  CHECK (kind IN ('ask','permission','plan')),
+  CHECK (kind IN ('ask','permission','plan','triage')),
   CHECK ((category IS NULL) = (category_by IS NULL)),
   CHECK (category_by IS NULL OR category_by IN ('human','model'))
 );

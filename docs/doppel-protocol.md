@@ -182,7 +182,7 @@ doppel 이 띄우는 headless 세션은 `--input-format stream-json` 으로 stdi
   시켜 질문에 답하거나(DNS rebinding·CSRF) 데몬을 끄는 것을 막는다. `/v1/shutdown` 은 Unix
   socket 으로만 받는다.
 - 본문은 JSON 이고, 오류는 `{ "ok": false, "error": { "kind", "message" } }` 와 상태 코드
-  (`400` usage, `404` not_found, `409` conflict, `500` internal)다.
+  (`400` usage, `404` not_found, `409` conflict, `500` config·internal)다.
 
 ### 엔드포인트
 
@@ -200,7 +200,14 @@ doppel 이 띄우는 headless 세션은 `--input-format stream-json` 으로 stdi
 | `POST /v1/asks/{id}/defer` | → `Ask` — `open` 일 때만 |
 | `POST /v1/asks/{id}/close` | `{ answers?, answered_by }` → `Ask` — 이미 `closed` 면 `409` |
 | `GET /v1/attach/{session_id}` | WebSocket. doppel → 세션 메시지(§2) |
-| `GET /v1/ui` | WebSocket. `{ "kind": "changed", "what": "sessions" \| "asks" }` 알림 |
+| `GET /v1/projects` · `POST /v1/projects` | → `{ "projects": [Project] }` · `{ name, path, description? }` → `Project` (경로가 디렉토리가 아니면 `400`, 같은 이름이면 `409`) |
+| `POST /v1/cards` | `{ source, external_id, title, body? }` → `Card` (`inbox`; 같은 `source`·`external_id` 면 `409`) |
+| `GET /v1/cards?state=<state>` · `GET /v1/cards/{id}` | → `{ "cards": [Card] }` (우선순위, 오래된 순) · `Card` |
+| `POST /v1/cards/{id}/triage` | `{ project, priority?, by? }` → `Card` — `inbox`·`triaged` 일 때만. `priority` 가 없으면 지금 값, `by` 는 `human`(기본)·`model`. `human` 이면 원장에 `kind: triage` 로 남는다 |
+| `POST /v1/cards/{id}/dispatch` | → `Card`(`running`) 후 세션을 띄운다 ([doppel.md §6](./doppel.md)). `triaged` 가 아니거나 `--max-running` 이 차면 `409`, 실행 명령이 없으면 `500` config |
+| `POST /v1/cards/{id}/release` | `{ reason? }` → `Card`(`triaged`) — `running`·`review` 일 때만. 도는 세션은 멈춘다 |
+| `POST /v1/cards/{id}/done` | → `Card`(`done`) — 도는 세션은 멈춘다 |
+| `GET /v1/ui` | WebSocket. `{ "kind": "changed", "what": "sessions" \| "asks" \| "cards" }` 알림 |
 | `GET /` | 웹 UI |
 
 `Session`: `{ session_id, cwd, surface, launched_by, state, started_at, last_event_at,
@@ -213,6 +220,12 @@ reversible, rationale, cited, error, accepted }` 다 ([doppel-judgment.md §5](.
 (`[{ question, header, multiSelect, options: [{ label, description }] }]`), `answers` 는
 `{ "<question>": "<label>" | ["<label>", …] }`. 권한 확인(`kind: "permission"`)은 질문 하나
 (`"<도구> 실행 허용: <입력 요약>"`)에 선택지 `allow`·`deny` 다.
+
+`Project`: `{ name, path, description, created_at }`.
+
+`Card`: `{ card_id, source, external_id, title, body, state, project, priority, session_id,
+claimed_at, outcome, last_error, created_at, updated_at }` — `state` 와 전이는
+[doppel.md §6](./doppel.md).
 
 ### ask 상태
 
@@ -311,15 +324,49 @@ CREATE TABLE briefs (
   CHECK (state <> 'failed' OR error IS NOT NULL),
   CHECK (accepted IS NULL OR (state = 'ready' AND recommendation IS NOT NULL))
 );
+
+CREATE TABLE projects (
+  name        TEXT PRIMARY KEY,
+  path        TEXT NOT NULL,                           -- 절대 경로, 세션을 띄우는 곳
+  description TEXT NOT NULL DEFAULT '',
+  created_at  TEXT NOT NULL
+);
+
+CREATE TABLE cards (
+  id          TEXT PRIMARY KEY,                        -- crd-000001
+  source      TEXT NOT NULL,                           -- cli | ui | github | …
+  external_id TEXT NOT NULL,
+  title       TEXT NOT NULL,
+  body        TEXT NOT NULL DEFAULT '',
+  state       TEXT NOT NULL,                           -- inbox | triaged | running | review | done
+  project     TEXT REFERENCES projects(name),
+  priority    TEXT NOT NULL DEFAULT 'P2',              -- P0..P3
+  session_id  TEXT,                                    -- 띄운 세션 (init 을 받은 뒤)
+  claimed_at  TEXT,
+  outcome     TEXT,                                    -- 세션의 마지막 결과 (4000자까지)
+  last_error  TEXT,                                    -- 마지막으로 되돌려진 이유
+  created_at  TEXT NOT NULL,
+  updated_at  TEXT NOT NULL,
+  UNIQUE (source, external_id),
+  CHECK (state IN ('inbox','triaged','running','review','done')),
+  CHECK (priority IN ('P0','P1','P2','P3')),
+  CHECK (state NOT IN ('triaged','running','review') OR project IS NOT NULL),
+  CHECK (state <> 'running' OR claimed_at IS NOT NULL),
+  CHECK (state <> 'review' OR outcome IS NOT NULL)
+);
 ```
+
+스키마 버전은 `PRAGMA user_version` 이다. 열 때 낮은 버전이면 그 자리에서 이관한다 (버전 1:
+`decisions.kind` 에 `triage` 추가 — SQLite 는 CHECK 를 바꿀 수 없어 테이블을 다시 만든다).
 
 ### `doppel` CLI 의 짝
 
 | 명령 | 하는 일 |
 |---|---|
-| `doppel daemon run [--ui-port N] [--no-ui] [--brief \| --brief-command "<cmd>"]` | 데몬을 이 프로세스에서 돌린다. 상태 기준값 `--stall-after-secs`·`--fail-streak`·`--heartbeat-timeout-secs`, 브리프 시간 제한 `--brief-timeout-secs` |
+| `doppel daemon run [--ui-port N] [--no-ui] [--brief \| --brief-command "<cmd>"]` | 데몬을 이 프로세스에서 돌린다. 상태 기준값 `--stall-after-secs`·`--fail-streak`·`--heartbeat-timeout-secs`, 브리프 시간 제한 `--brief-timeout-secs`, 카드 실행 `--launch-command "<cmd>"`(빈 값이면 실행 안 함)·`--max-running N` |
 | `doppel daemon start \| stop \| status` | 분리 실행 · `/v1/shutdown` · `/v1/health` |
 | `doppel attach --session <id>` | `/v1/attach/{id}` 를 열고 받은 메시지를 한 줄에 하나씩 stdout 으로 |
 | `doppel ask wait <ask-id> [--timeout <초>] --json` | `/v1/asks/{id}/wait` 를 감싼다 — hook 이 예산에 세지 않고 기다리는 수단. stdout 은 `{"ok":true,"command":"ask wait","data":<Ask>}` 한 줄이고, 데몬이 답하면 `data.state` 가 아직 `open` 이어도 exit 0 이다 |
 | `doppel ask list [--state <state>]` · `doppel ask answer <ask-id> <label>… [--answer "<q>=<label>"]` | inbox 를 터미널에서 (`answered_by: "doppel-cli"`) |
 | `doppel session list` | 세션 상태 |
+| `doppel project add\|list` · `doppel card add\|list\|show\|triage\|dispatch\|release\|done` | 위 프로젝트·카드 엔드포인트를 감싼다 ([doppel.md §7](./doppel.md)) |

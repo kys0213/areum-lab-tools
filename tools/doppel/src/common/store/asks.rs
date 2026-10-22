@@ -188,6 +188,20 @@ impl Store {
         )
     }
 
+    /// Asks of a session that wait on a late answer: deferred, or answered
+    /// after deferring but not yet delivered and closed. While any remain, a
+    /// session doppel launched is kept able to take a new turn.
+    pub(crate) fn pending_late_answers(&self, session_id: &str) -> Result<u32, AppError> {
+        self.conn
+            .query_row(
+                "SELECT COUNT(*) FROM asks WHERE session_id = ?1
+                   AND (state = 'deferred' OR (state = 'answered' AND deferred_at IS NOT NULL))",
+                params![session_id],
+                |row| row.get(0),
+            )
+            .map_err(map_sqlite_err)
+    }
+
     fn ask_by_call(&self, session_id: &str, tool_use_id: &str) -> Result<AskRecord, AppError> {
         self.query_one(
             &format!("SELECT {ASK_COLUMNS} FROM asks WHERE session_id = ?1 AND tool_use_id = ?2"),

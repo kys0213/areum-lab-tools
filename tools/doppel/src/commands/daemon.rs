@@ -9,6 +9,7 @@ use crate::common::error::{AppError, ErrorKind};
 use crate::common::store::Store;
 use crate::daemon::api::Health;
 use crate::daemon::brief::BriefConfig;
+use crate::daemon::launch::LaunchConfig;
 use crate::daemon::listen::{Bound, DaemonConfig, serve};
 use crate::daemon::state::Thresholds;
 use crate::output::{DaemonData, Payload};
@@ -27,9 +28,18 @@ fn brief_config(options: &DaemonOptions) -> Option<BriefConfig> {
     }
 }
 
+fn launch_config(socket: &Path, options: &DaemonOptions) -> Option<LaunchConfig> {
+    let command = options
+        .launch_command
+        .as_deref()
+        .unwrap_or(LaunchConfig::DEFAULT_COMMAND);
+    LaunchConfig::from_command(command, options.max_running, socket.to_path_buf())
+}
+
 fn config(socket: &Path, options: &DaemonOptions) -> DaemonConfig {
     DaemonConfig {
         brief: brief_config(options),
+        launch: launch_config(socket, options),
         socket: socket.to_path_buf(),
         ui_port: (!options.no_ui).then_some(options.ui_port),
         thresholds: Thresholds {
@@ -122,6 +132,7 @@ pub(crate) fn run_daemon_start(
             "--brief-timeout-secs",
             &options.brief_timeout_secs.to_string(),
         ])
+        .args(["--max-running", &options.max_running.to_string()])
         .stdin(Stdio::null())
         .stdout(log)
         .stderr(log_err);
@@ -133,6 +144,9 @@ pub(crate) fn run_daemon_start(
     }
     if let Some(brief_command) = &options.brief_command {
         command.args(["--brief-command", brief_command]);
+    }
+    if let Some(launch_command) = &options.launch_command {
+        command.args(["--launch-command", launch_command]);
     }
     detach(&mut command);
     let mut child = command

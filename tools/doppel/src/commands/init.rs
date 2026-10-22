@@ -29,7 +29,12 @@ mod tests {
                 assert!(data.created);
                 assert_eq!(
                     data.seeded_categories,
-                    ["design-scope", "naming-api-test", "dependency-review"]
+                    [
+                        "design-scope",
+                        "naming-api-test",
+                        "dependency-review",
+                        "triage"
+                    ]
                 );
             }
             other => panic!("expected Payload::Init, got {other:?}"),

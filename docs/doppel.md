@@ -167,20 +167,50 @@ doppel 은 세션별 이벤트를 누적해 상태를 만든다. 시간·횟수 
 
 ## 6. 칸반
 
-외부 작업(멘션·이슈·메일·수동 입력)은 카드가 된다.
+외부 작업(멘션·이슈·메일·수동 입력)은 카드가 된다. 카드는 등록된 프로젝트(이름 + 로컬
+경로)에 배정되고, doppel 이 그 경로에서 Claude 세션을 띄워 처리한다.
 
-| 상태 | 의미 |
-|---|---|
-| `inbox` | 들어옴, 아직 라벨링 안 됨 |
-| `triaged` | 프로젝트·우선순위·라벨이 붙음 (라벨링 제안은 모델, 확정은 사람 또는 opt-in 자동) |
-| `running` | doppel 이 세션을 띄워 작업 중 (세션 id 를 가짐) |
-| `review` | 세션이 끝나 결과 확인 대기 |
-| `done` | 완료 |
+### 상태
 
-- 같은 원본은 `UNIQUE(source, external_id)` 로 한 번만 들어온다.
-- `running` 진입은 한 SQL 문으로 원자적으로 점유한다.
-- 실패는 상태가 아니다. 점유를 풀어 `triaged` 로 되돌린다.
-- 라벨링·우선순위·분배 결정도 판단 카테고리다. 내가 고친 것이 골든 후보가 된다.
+| 상태 | 의미 | project | session |
+|---|---|---|---|
+| `inbox` | 들어옴, 아직 배정 안 됨 | 없어도 됨 | 없음 |
+| `triaged` | 프로젝트·우선순위가 정해짐 | 있음 | 없음 |
+| `running` | doppel 이 띄운 세션이 처리 중 | 있음 | 있음(시작 직후엔 아직 없을 수 있다) |
+| `review` | 세션이 끝나 결과 확인 대기 | 있음 | 있음 |
+| `done` | 끝 | — | — |
+
+| 전이 | 누가 | 명령 |
+|---|---|---|
+| (유입) → `inbox` | connector·사람 | `card add` |
+| `inbox`·`triaged` → `triaged` | 사람 (P2b 에서 모델 제안 + 사람 확정, opt-in 자동) | `card triage` |
+| `triaged` → `running` | 사람 (P2b 에서 opt-in 자동) | `card dispatch` |
+| `running` → `review` | doppel — 세션이 결과를 내고 끝남 | 자동 |
+| `running` → `triaged` | doppel — 결과 없이 끝남 · 사람 | `card release` |
+| `review` → `triaged` | 사람 — 다시 시킴 | `card release` |
+| 아무 상태 → `done` | 사람 | `card done` |
+
+- 같은 원본은 `UNIQUE(source, external_id)` 로 한 번만 들어온다 (거부, `conflict`).
+- `running` 진입은 한 SQL 문으로 원자적으로 점유하고, 동시에 도는 카드 수는 `--max-running`
+  (기본 2)을 넘지 않는다.
+- 실패는 상태가 아니다. 점유를 풀어 `triaged` 로 되돌리고 이유를 `last_error` 에 남긴다.
+- 사람이 정한 배정(프로젝트·우선순위)은 판단 원장에 `kind: triage` 로 남는다. 이 판단들을 담을
+  시드 카테고리 `triage` 가 있다 (분류는 다른 원장 항목처럼 `decision categorize`).
+
+### 세션 실행
+
+`card dispatch` 는 `--launch-command`(기본 `claude -p --input-format stream-json
+--output-format stream-json --verbose --permission-mode auto --permission-prompt-tool stdio`)를
+프로젝트 경로에서 띄우고 카드 제목·본문을 첫 메시지로 보낸다.
+
+- env: `DOPPEL_LAUNCHED=1`, `DOPPEL_CARD=<card id>`, `DOPPEL_SOCKET=<이 데몬의 socket>`. 부모의
+  `CLAUDE_CODE_SESSION_ID`·`CLAUDE_CODE_REMOTE_SESSION_ID` 는 지운다 — 남아 있으면 띄운 세션이
+  부모의 세션 id 를 이어 쓴다.
+- 세션이 결과(`result`)를 낼 때마다 그 세션의 보류된 질문이 남았는지 본다. 남았으면 stdin 을
+  열어 둬 늦은 답이 새 턴을 열 수 있게 하고, 없으면 stdin 을 닫아 세션을 끝낸다.
+- 끝나면 마지막 결과를 `outcome` 에 남기고 `review` 로, 결과 없이 끝나면 `triaged` 로 되돌린다.
+- 질문·권한 중계는 세션에 깔린 doppel plugin 이 한다 — 다른 세션과 같은 경로다.
+- 데몬이 멈추면 데몬이 띄운 세션도 끝난다. 그 카드들은 다음 시작 때 `triaged` 로 되돌린다.
 
 ---
 
@@ -201,7 +231,7 @@ doppel init                                   # ~/.areum/doppel/ 생성, 시드 
 ```sh
 doppel ingest sessions [--root ~/.claude/projects]   # 세션 JSONL 의 질문 답·권한 결정
 doppel ingest plans <repo>                           # <repo>/plans/*.md 의 결정 기록
-doppel decision list [--kind ask|permission|plan] [--category <name> | --uncategorized] [--limit N]
+doppel decision list [--kind ask|permission|plan|triage] [--category <name> | --uncategorized] [--limit N]
 doppel decision show <id>
 doppel decision categorize <id> <category> [--by human|model]
 ```
@@ -228,12 +258,16 @@ doppel search "<질문>" [--category <name>] [--project <path>] [--limit 5] [--i
 ### 세션·칸반·데몬 (P1 이후)
 
 ```sh
-doppel daemon run | start | stop | status      # --ui-port · --no-ui · 상태 기준값
+doppel daemon run | start | stop | status      # --ui-port · --no-ui · 상태 기준값 · --launch-command · --max-running
 doppel attach --session <id>                   # plugin 이 띄우는 세션별 연결
 doppel ask list | wait | answer                # 질문 inbox (doppel-protocol.md §6)
 doppel session list
 doppel stats                                   # 브리프 추천 수락률 (전체·카테고리별)
-doppel card add | list | triage | claim | done | release   # P2
+doppel project add <name> --path <dir> [--desc "..."] | list
+doppel card add [--source cli] --external-id <id> --title "..." [--body "..." | --body -]
+doppel card list [--state <state>] | show <id>
+doppel card triage <id> --project <name> [--priority P0..P3]
+doppel card dispatch <id> | release <id> [--reason "..."] | done <id>
 ```
 
 ---

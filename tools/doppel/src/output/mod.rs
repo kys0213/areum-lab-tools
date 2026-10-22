@@ -1,7 +1,9 @@
+mod board;
 mod envelope;
 mod payload;
 
 pub(crate) use crate::common::error::{AppError, exit_code};
+pub(crate) use board::{CardListData, ProjectListData};
 // The payload contract is this module's surface: command handlers import the
 // data types from here rather than reaching into `payload` directly.
 pub(crate) use payload::{

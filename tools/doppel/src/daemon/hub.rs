@@ -41,6 +41,10 @@ impl Hub {
         let _ = self.ui.send(UiNotice::SESSIONS);
     }
 
+    pub(super) fn cards_changed(&self) {
+        let _ = self.ui.send(UiNotice::CARDS);
+    }
+
     pub(super) fn to_session(&self, session_id: &str, message: Value) {
         let _ = self.sessions.send((session_id.to_owned(), message));
     }

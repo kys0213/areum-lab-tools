@@ -16,9 +16,10 @@ use crate::daemon::listen::{DaemonConfig, serve};
 use crate::daemon::state::Thresholds;
 
 use crate::daemon::brief::BriefConfig;
+use crate::daemon::launch::LaunchConfig;
 
-struct Running {
-    socket: PathBuf,
+pub(super) struct Running {
+    pub(super) socket: PathBuf,
     task: JoinHandle<Result<(), AppError>>,
 }
 
@@ -27,6 +28,14 @@ async fn start(dir: &TempDir) -> Running {
 }
 
 async fn start_with(dir: &TempDir, brief: Option<BriefConfig>) -> Running {
+    serve_in(dir, brief, None).await
+}
+
+pub(super) async fn serve_in(
+    dir: &TempDir,
+    brief: Option<BriefConfig>,
+    launch: Option<LaunchConfig>,
+) -> Running {
     let socket = dir.path().join("d.sock");
     // The wall clock: the daemon judges session ages against real time.
     let store = Store::open(&dir.db_path()).unwrap();
@@ -35,6 +44,7 @@ async fn start_with(dir: &TempDir, brief: Option<BriefConfig>) -> Running {
         ui_port: None,
         thresholds: Thresholds::default(),
         brief,
+        launch,
     };
     let (ready_tx, ready_rx) = oneshot::channel();
     let task = tokio::spawn(serve(store, config, Some(ready_tx)));
@@ -42,11 +52,11 @@ async fn start_with(dir: &TempDir, brief: Option<BriefConfig>) -> Running {
     Running { socket, task }
 }
 
-async fn post(socket: &Path, path: &str, body: Value) -> Result<Value, AppError> {
+pub(super) async fn post(socket: &Path, path: &str, body: Value) -> Result<Value, AppError> {
     request(socket, "POST", path, Some(&body)).await
 }
 
-async fn get(socket: &Path, path: &str) -> Result<Value, AppError> {
+pub(super) async fn get(socket: &Path, path: &str) -> Result<Value, AppError> {
     request(socket, "GET", path, None).await
 }
 
@@ -67,7 +77,7 @@ async fn open(socket: &Path, tool_use_id: &str) -> String {
     ask["ask_id"].as_str().unwrap().to_owned()
 }
 
-async fn stop(running: Running) {
+pub(super) async fn stop(running: Running) {
     post(&running.socket, "/v1/shutdown", json!({}))
         .await
         .unwrap();
@@ -256,6 +266,7 @@ async fn a_second_daemon_is_refused_and_a_stale_socket_is_replaced() {
             ui_port: None,
             thresholds: Thresholds::default(),
             brief: None,
+            launch: None,
         },
         None,
     )

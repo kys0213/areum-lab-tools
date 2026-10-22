@@ -8,7 +8,7 @@ use super::{Store, conflict, constraint_err, map_sqlite_err, not_found};
 use crate::common::error::AppError;
 
 /// The seed set `init` registers (docs/doppel-judgment.md §2).
-pub(crate) const SEED_CATEGORIES: [(&str, &str); 3] = [
+pub(crate) const SEED_CATEGORIES: [(&str, &str); 4] = [
     (
         "design-scope",
         "설계 승인·범위 자르기 — plan 승인·거절, 범위 밖 판정, 버린 선택지",
@@ -21,6 +21,7 @@ pub(crate) const SEED_CATEGORIES: [(&str, &str); 3] = [
         "dependency-review",
         "의존성·리뷰 판정 — 라이브러리 선택, 리뷰 finding 수용·거절",
     ),
+    ("triage", "작업 배정 — 들어온 작업의 프로젝트·우선순위"),
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq)]

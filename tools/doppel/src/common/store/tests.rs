@@ -43,12 +43,56 @@ fn seeding_is_idempotent_and_keeps_a_retired_seed_retired() {
     let first = store.seed_categories().unwrap();
     assert_eq!(
         first,
-        ["design-scope", "naming-api-test", "dependency-review"]
+        [
+            "design-scope",
+            "naming-api-test",
+            "dependency-review",
+            "triage"
+        ]
     );
 
     store.retire_category("design-scope").unwrap();
     assert!(store.seed_categories().unwrap().is_empty());
     assert_eq!(store.get_category("design-scope").unwrap().state, "retired");
+}
+
+#[test]
+fn an_older_ledger_is_migrated_in_place() {
+    let dir = TempDir::new("migrate");
+    std::fs::create_dir_all(dir.path()).unwrap();
+    {
+        // The ledger as the first release wrote it: `kind` without `triage`.
+        let conn = Connection::open(dir.db_path()).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE categories (name TEXT PRIMARY KEY, description TEXT NOT NULL,
+               state TEXT NOT NULL DEFAULT 'active', created_at TEXT NOT NULL);
+             CREATE TABLE decisions (
+               id TEXT PRIMARY KEY, source TEXT NOT NULL, external_id TEXT NOT NULL,
+               kind TEXT NOT NULL, project TEXT, session_id TEXT, question TEXT NOT NULL,
+               options TEXT NOT NULL, answers TEXT NOT NULL, rationale TEXT, context TEXT,
+               category TEXT REFERENCES categories(name), category_by TEXT,
+               decided_at TEXT NOT NULL, created_at TEXT NOT NULL,
+               UNIQUE (source, external_id),
+               CHECK (source IN ('session','plan','doppel')),
+               CHECK (kind IN ('ask','permission','plan')),
+               CHECK ((category IS NULL) = (category_by IS NULL)),
+               CHECK (category_by IS NULL OR category_by IN ('human','model')));
+             INSERT INTO decisions VALUES ('dec-000001','session','s:1:0','ask',NULL,NULL,'q?',
+               '[]','[\"A\"]',NULL,NULL,NULL,NULL,'2026-01-01T00:00:00Z','2026-01-01T00:00:00Z');",
+        )
+        .unwrap();
+    }
+    let mut store = Store::open(&dir.db_path()).unwrap();
+    assert_eq!(store.get_decision("dec-000001").unwrap().answers, ["A"]);
+    let version: i64 = store
+        .conn
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(version, SCHEMA_VERSION);
+    let mut triage = sample_decision("card:crd-000001:1", "배정", "2026-01-02T00:00:00Z");
+    triage.kind = "triage";
+    triage.source = "doppel";
+    assert_eq!(store.insert_decisions(&[triage]).unwrap().added, 1);
 }
 
 #[test]

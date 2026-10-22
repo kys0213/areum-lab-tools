@@ -9,7 +9,11 @@ use std::collections::BTreeMap;
 
 use serde::Serialize;
 
-use crate::daemon::api::{AskView, SessionView};
+use super::board::{
+    CardListData, ProjectListData, format_card, format_card_list, format_project,
+    format_project_list,
+};
+use crate::daemon::api::{AskView, CardView, ProjectView, SessionView};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct OptionData {
@@ -243,6 +247,15 @@ pub enum Payload {
     AskWait(AskView),
     AskAnswer(AskView),
     SessionList(SessionListData),
+    ProjectAdd(ProjectView),
+    ProjectList(ProjectListData),
+    CardAdd(CardView),
+    CardList(CardListData),
+    CardShow(CardView),
+    CardTriage(CardView),
+    CardDispatch(CardView),
+    CardRelease(CardView),
+    CardDone(CardView),
     Stats(StatsData),
 }
 
@@ -369,6 +382,15 @@ impl Payload {
                 text
             }
             Payload::AskWait(ask) | Payload::AskAnswer(ask) => format_ask(ask),
+            Payload::ProjectAdd(p) => format!("project added: {}", format_project(p)),
+            Payload::ProjectList(d) => format_project_list(d),
+            Payload::CardList(d) => format_card_list(d),
+            Payload::CardAdd(c)
+            | Payload::CardShow(c)
+            | Payload::CardTriage(c)
+            | Payload::CardDispatch(c)
+            | Payload::CardRelease(c)
+            | Payload::CardDone(c) => format_card(c),
             Payload::SessionList(d) => {
                 let mut text = format!("{} session(s)", d.count);
                 for s in &d.sessions {

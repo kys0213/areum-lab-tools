@@ -24,6 +24,7 @@ use crate::daemon::api::{
 };
 use crate::daemon::brief::{self, BriefConfig};
 use crate::daemon::hub::Hub;
+use crate::daemon::launch::{LaunchConfig, Runs};
 use crate::daemon::state::Thresholds;
 
 /// Longest a single `wait` may hold the connection; the hook's own limit
@@ -39,6 +40,10 @@ pub(super) struct AppState {
     pub(super) thresholds: Thresholds,
     /// `None` writes no briefs.
     pub(super) brief: Option<BriefConfig>,
+    /// `None` refuses to dispatch cards.
+    pub(super) launch: Option<LaunchConfig>,
+    /// Card runs in flight, so a person can stop one.
+    pub(super) runs: Runs,
     /// Flips to `true` once to stop the daemon: both listeners drain and
     /// every WebSocket loop returns so the drain can finish.
     pub(super) stop: watch::Sender<bool>,
@@ -49,12 +54,15 @@ impl AppState {
         store: Store,
         thresholds: Thresholds,
         brief: Option<BriefConfig>,
+        launch: Option<LaunchConfig>,
     ) -> AppState {
         AppState {
             store: Arc::new(Mutex::new(store)),
             hub: Hub::new(),
             thresholds,
             brief,
+            launch,
+            runs: Runs::default(),
             stop: watch::channel(false).0,
         }
     }
@@ -93,7 +101,7 @@ impl IntoResponse for ApiError {
     }
 }
 
-type ApiResult<T> = Result<Json<T>, ApiError>;
+pub(super) type ApiResult<T> = Result<Json<T>, ApiError>;
 
 fn view(store: &Store, ask: AskRecord) -> Result<AskView, AppError> {
     let brief = store.get_brief(&ask.id)?;
@@ -121,6 +129,7 @@ pub(super) fn shared_routes() -> Router<AppState> {
         .route("/v1/attach/{session_id}", get(attach))
         .route("/v1/ui", get(ui_socket))
         .route("/", get(super::ui::page))
+        .merge(super::board::routes())
 }
 
 /// The Unix socket additionally takes `shutdown`; a web page must never be
@@ -148,7 +157,7 @@ pub(super) async fn stopped(mut stop: watch::Receiver<bool>) {
     let _ = stop.wait_for(|stopping| *stopping).await;
 }
 
-fn usage(message: impl Into<String>) -> ApiError {
+pub(super) fn usage(message: impl Into<String>) -> ApiError {
     ApiError(AppError::new(ErrorKind::Usage, message))
 }
 
@@ -183,7 +192,7 @@ fn session_event(body: &EventBody) -> Result<SessionEvent, ApiError> {
 
 /// `value` when it is one of `allowed`, `default` when absent, `None` when it
 /// is something else.
-fn one_of(value: Option<&str>, allowed: &[&str], default: &str) -> Option<String> {
+pub(super) fn one_of(value: Option<&str>, allowed: &[&str], default: &str) -> Option<String> {
     match value {
         None => Some(default.to_owned()),
         Some(v) if allowed.contains(&v) => Some(v.to_owned()),
@@ -216,8 +225,8 @@ async fn list_sessions(State(app): State<AppState>) -> ApiResult<SessionList> {
 }
 
 #[derive(Deserialize)]
-struct StateQuery {
-    state: Option<String>,
+pub(super) struct StateQuery {
+    pub(super) state: Option<String>,
 }
 
 async fn list_asks(

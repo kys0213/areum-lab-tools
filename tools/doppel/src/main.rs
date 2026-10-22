@@ -10,8 +10,8 @@ use std::path::Path;
 use clap::Parser;
 
 use cli::{
-    AskCommand, CategoryCommand, Cli, Command, DaemonCommand, DecisionCommand, GoldenCommand,
-    IngestCommand, SessionCommand,
+    AskCommand, CardCommand, CategoryCommand, Cli, Command, DaemonCommand, DecisionCommand,
+    GoldenCommand, IngestCommand, ProjectCommand, SessionCommand,
 };
 use common::config::{resolve_db_path, resolve_socket_path, resolve_transcript_root};
 use common::store::{DecisionFilter, GoldenFilter, SearchFilter};
@@ -138,6 +138,42 @@ fn run(cli: Cli) -> Result<Payload, AppError> {
             ref answers,
         }) => commands::run_ask_answer(&socket()?, id, labels, answers),
         Command::Session(SessionCommand::List) => commands::run_session_list(&socket()?),
+        Command::Project(ProjectCommand::Add {
+            ref name,
+            ref path,
+            ref description,
+        }) => commands::run_project_add(&socket()?, name, path, description),
+        Command::Project(ProjectCommand::List) => commands::run_project_list(&socket()?),
+        Command::Card(CardCommand::Add {
+            ref source,
+            ref external_id,
+            ref title,
+            ref body,
+        }) => commands::run_card_add(
+            &socket()?,
+            &commands::CardInput {
+                source,
+                external_id,
+                title,
+                body,
+            },
+        ),
+        Command::Card(CardCommand::List { ref state }) => {
+            commands::run_card_list(&socket()?, state.as_deref())
+        }
+        Command::Card(CardCommand::Show { ref id }) => commands::run_card_show(&socket()?, id),
+        Command::Card(CardCommand::Triage {
+            ref id,
+            ref project,
+            priority,
+        }) => commands::run_card_triage(&socket()?, id, project, priority.map(|p| p.as_str())),
+        Command::Card(CardCommand::Dispatch { ref id }) => {
+            commands::run_card_dispatch(&socket()?, id)
+        }
+        Command::Card(CardCommand::Release { ref id, ref reason }) => {
+            commands::run_card_release(&socket()?, id, reason.as_deref())
+        }
+        Command::Card(CardCommand::Done { ref id }) => commands::run_card_done(&socket()?, id),
         Command::Stats => commands::run_stats(db),
     }
 }

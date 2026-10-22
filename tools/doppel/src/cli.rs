@@ -93,6 +93,14 @@ pub enum Command {
     #[command(subcommand)]
     Session(SessionCommand),
 
+    /// Where cards are worked on: a name and a local directory.
+    #[command(subcommand)]
+    Project(ProjectCommand),
+
+    /// Incoming work on the board: add, assign, run, finish.
+    #[command(subcommand)]
+    Card(CardCommand),
+
     /// How often briefs' recommendations were taken, overall and per
     /// category. Reads the database; no daemon needed.
     Stats,
@@ -128,6 +136,15 @@ pub struct DaemonOptions {
     /// How long one brief may take before it is marked failed.
     #[arg(long = "brief-timeout-secs", default_value_t = 180)]
     pub brief_timeout_secs: u64,
+    /// Launch card sessions with this command instead of the default
+    /// (`claude -p --input-format stream-json --output-format stream-json
+    /// --verbose --permission-mode auto --permission-prompt-tool stdio`).
+    /// Split on whitespace, no shell; an empty command dispatches nothing.
+    #[arg(long = "launch-command")]
+    pub launch_command: Option<String>,
+    /// At most this many cards run at once.
+    #[arg(long = "max-running", default_value_t = 2)]
+    pub max_running: u32,
 }
 
 #[derive(Subcommand, Debug)]
@@ -176,6 +193,94 @@ pub enum AskCommand {
 pub enum SessionCommand {
     /// List sessions with their derived state, most recently active first.
     List,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum ProjectCommand {
+    /// Register a project; sessions for its cards start in --path.
+    Add {
+        name: String,
+        /// Existing local directory.
+        #[arg(long)]
+        path: String,
+        #[arg(long = "desc", default_value = "")]
+        description: String,
+    },
+    /// List projects by name.
+    List,
+}
+
+/// Card priority, P0 most urgent.
+#[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Priority {
+    #[value(name = "P0")]
+    P0,
+    #[value(name = "P1")]
+    P1,
+    #[value(name = "P2")]
+    P2,
+    #[value(name = "P3")]
+    P3,
+}
+
+impl Priority {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Priority::P0 => "P0",
+            Priority::P1 => "P1",
+            Priority::P2 => "P2",
+            Priority::P3 => "P3",
+        }
+    }
+}
+
+#[derive(Subcommand, Debug)]
+pub enum CardCommand {
+    /// Add incoming work to the inbox. The same --source/--external-id is
+    /// one card; adding it again is a conflict.
+    Add {
+        /// Where the work came from (cli, github, mail, ...).
+        #[arg(long, default_value = "cli")]
+        source: String,
+        /// The work's id at its source.
+        #[arg(long = "external-id")]
+        external_id: String,
+        #[arg(long)]
+        title: String,
+        /// Details; `-` reads them from stdin.
+        #[arg(long, default_value = "")]
+        body: String,
+    },
+    /// List cards, most urgent and oldest first.
+    List {
+        /// Only cards in this state (inbox | triaged | running | review | done).
+        #[arg(long)]
+        state: Option<String>,
+    },
+    /// Show one card with its outcome.
+    Show {
+        /// Card id (crd-000001).
+        id: String,
+    },
+    /// Assign a project and priority. Recorded in the decision ledger.
+    Triage {
+        id: String,
+        #[arg(long)]
+        project: String,
+        /// Keeps the card's current priority when absent.
+        #[arg(long, value_enum)]
+        priority: Option<Priority>,
+    },
+    /// Launch a session for a triaged card in its project.
+    Dispatch { id: String },
+    /// Back to triaged, stopping its session if one runs.
+    Release {
+        id: String,
+        #[arg(long)]
+        reason: Option<String>,
+    },
+    /// Close the card, stopping its session if one runs.
+    Done { id: String },
 }
 
 #[derive(Subcommand, Debug)]
@@ -297,6 +402,7 @@ pub enum DecisionKind {
     Ask,
     Permission,
     Plan,
+    Triage,
 }
 
 impl DecisionKind {
@@ -306,6 +412,7 @@ impl DecisionKind {
             DecisionKind::Ask => "ask",
             DecisionKind::Permission => "permission",
             DecisionKind::Plan => "plan",
+            DecisionKind::Triage => "triage",
         }
     }
 }
@@ -394,6 +501,15 @@ impl Command {
             Command::Ask(AskCommand::Wait { .. }) => "ask wait",
             Command::Ask(AskCommand::Answer { .. }) => "ask answer",
             Command::Session(SessionCommand::List) => "session list",
+            Command::Project(ProjectCommand::Add { .. }) => "project add",
+            Command::Project(ProjectCommand::List) => "project list",
+            Command::Card(CardCommand::Add { .. }) => "card add",
+            Command::Card(CardCommand::List { .. }) => "card list",
+            Command::Card(CardCommand::Show { .. }) => "card show",
+            Command::Card(CardCommand::Triage { .. }) => "card triage",
+            Command::Card(CardCommand::Dispatch { .. }) => "card dispatch",
+            Command::Card(CardCommand::Release { .. }) => "card release",
+            Command::Card(CardCommand::Done { .. }) => "card done",
             Command::Stats => "stats",
         }
     }
@@ -414,6 +530,25 @@ mod tests {
             Cli::try_parse_from(["doppel", "review", "--json", "--db", "/tmp/d.db"]).unwrap();
         assert!(after.json);
         assert_eq!(after.db.as_deref(), Some("/tmp/d.db"));
+    }
+
+    #[test]
+    fn priorities_are_spelled_as_the_board_shows_them() {
+        let cli = Cli::try_parse_from([
+            "doppel",
+            "card",
+            "triage",
+            "crd-000001",
+            "--project",
+            "areum",
+            "--priority",
+            "P1",
+        ])
+        .unwrap();
+        let Command::Card(CardCommand::Triage { priority, .. }) = cli.command else {
+            panic!("expected card triage");
+        };
+        assert_eq!(priority.map(Priority::as_str), Some("P1"));
     }
 
     #[test]
