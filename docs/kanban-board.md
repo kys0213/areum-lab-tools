@@ -339,24 +339,26 @@ tools/kanban/src/
 │   └── ticker.rs           # 틱 루프 · pid · SIGTERM
 ├── output/
 │   ├── mod.rs
-│   ├── envelope.rs         # JSON 봉투 (discord 와 동일 규약)
+│   ├── envelope.rs         # JSON 봉투 계약 테스트 (봉투 자체는 libs/cli-contract)
 │   └── payload.rs
 └── common/                 # 2개 이상 기능이 공유하는 기반만
     ├── mod.rs
     ├── config.rs           # ~/.areum/kanban/config.json
     ├── error.rs            # AppError + ErrorKind → exit code
-    ├── store.rs            # SQLite 접근 · 상태 전이
-    └── time.rs
+    └── store.rs            # SQLite 접근 · 상태 전이
 ```
+
+타임스탬프는 `cli_contract::time`을 쓴다.
 
 `store.rs`는 테이블이 다섯이라 프로덕션 300줄을 넘길 가능성이 높다. 넘기면
 `common/store/`로 승격하고 `tests.rs`를 자식 모듈로 분리한다.
 
-### discord와의 코드 중복
+### 다른 도구와의 코드 공유
 
-`output/envelope.rs`·`common/error.rs`·`daemon`의 pid 처리는 discord와 구조가 같다.
-`tool-crate.md`의 Rule of 3에 따라 **지금은 추출하지 않는다** — 이번이 두 번째다.
-세 번째 도구에서 같은 코드가 필요해지면 그때 `libs/`로 뺀다.
+JSON 봉투·render(sink + exit code)·공유 error kind의 이름과 번호·타임스탬프는
+`libs/cli-contract`에서 가져온다. doppel이 세 번째 사본이 된 시점에 추출했다
+(`tool-crate.md` Rule of 3). `ErrorKind`·`AppError`·`Payload`는 kanban에 남는다.
+`daemon`의 pid 처리는 아직 discord와 두 벌이라 각 도구에 둔다.
 
 ---
 

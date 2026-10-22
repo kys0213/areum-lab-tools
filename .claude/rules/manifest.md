@@ -2,6 +2,7 @@
 paths:
   - "Cargo.toml"
   - "tools/*/Cargo.toml"
+  - "libs/*/Cargo.toml"
 ---
 
 # Manifest Convention
@@ -13,8 +14,9 @@ paths:
 1. **공용 의존성은 `[workspace.dependencies]`에서만 버전을 정한다**: crate의 `[dependencies]`는 `{ workspace = true }`로 참조한다. crate에 개별 버전을 명시하지 않는다.
 2. **`edition`/`rust-version`은 워크스페이스 상속**: `edition.workspace = true`, `rust-version.workspace = true`로 SSOT를 유지한다.
 3. **`version`은 crate별 리터럴, 워크스페이스 상속 금지**: 릴리스 태그(`<tool>-vX.Y.Z`)와 `make dist-tag`/`make dist-build`의 버전 추출(`grep -m1 '^version = '`)이 리터럴 문자열을 전제로 동작한다.
-4. **`members = ["tools/*"]` glob은 0매칭이면 전체가 깨진다**: 이 glob이 비면 `cargo` 명령 전체가 실패한다. `tools/hello`는 구조적 placeholder이므로 삭제하지 않는다 (삭제하려면 먼저 `members`를 명시 리스트로 전환해야 한다).
+4. **`members = ["tools/*", "libs/*"]` glob은 0매칭이면 전체가 깨진다**: 어느 glob이든 비면 `cargo` 명령 전체가 실패한다. `tools/hello`는 구조적 placeholder이므로 삭제하지 않는다 (삭제하려면 먼저 `members`를 명시 리스트로 전환해야 한다). `libs/`의 마지막 crate를 지울 때도 같은 이유로 glob을 먼저 뺀다.
 5. **`Cargo.lock`은 커밋 대상**: 워크스페이스 루트의 `Cargo.lock`을 `.gitignore`에 추가하지 않는다.
+6. **`libs/` crate는 `version = "0.0.0"` + `publish = false`, 도구는 workspace 경유로 참조한다**: lib은 릴리스 태그 대상이 아니라 버전이 의미 없다. 경로는 `[workspace.dependencies]`에 `{ path = "libs/<name>" }`로 한 번만 쓰고, 도구는 `{ workspace = true }`로 참조한다.
 
 ## DO
 
@@ -23,13 +25,14 @@ paths:
 ```toml
 [workspace]
 resolver = "3"
-members = ["tools/*"]
+members = ["tools/*", "libs/*"]
 
 [workspace.package]
 edition = "2024"
 rust-version = "1.96"
 
 [workspace.dependencies]
+cli-contract = { path = "libs/cli-contract" }
 clap = { version = "4", features = ["derive"] }
 anyhow = "1"
 ```
@@ -76,3 +79,4 @@ version.workspace = true # 태그 파싱(grep -m1 '^version = ')과 dist-tag가 
 - [ ] `version`이 crate별 리터럴 문자열인가 (워크스페이스 상속 아님)
 - [ ] `members` glob이 최소 1개 이상 매칭되는가
 - [ ] `Cargo.lock`이 `.gitignore`에 없는가
+- [ ] `libs/` crate가 `version = "0.0.0"`·`publish = false`이고 도구가 workspace 경유로 참조하는가
