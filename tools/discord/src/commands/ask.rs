@@ -6,9 +6,11 @@
 use std::path::Path;
 use std::time::Duration;
 
+use cli_contract::time::now_rfc3339;
+
 use crate::common::api::{DiscordApi, SendRequest};
 use crate::common::store::{AskRecord, AskStatus, AskStore, NewAsk};
-use crate::common::time::{now_rfc3339, rfc3339_after_secs};
+use crate::common::time::rfc3339_after_secs;
 use crate::output::{AppError, AskCreateData, AskResultData, AskWaitData, ErrorKind, Payload};
 
 use super::wait::Sleeper;

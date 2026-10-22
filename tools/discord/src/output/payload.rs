@@ -1,3 +1,4 @@
+use cli_contract::HumanText;
 use serde::{Deserialize, Serialize};
 
 use crate::common::api::{Attachment, Message};
@@ -144,9 +145,8 @@ pub enum Payload {
     AskWait(AskWaitData),
 }
 
-impl Payload {
-    // Called from `crate::output::render`, the parent module.
-    pub(super) fn to_human(&self) -> String {
+impl HumanText for Payload {
+    fn to_human(&self) -> String {
         match self {
             Payload::Send(d) => {
                 let mut text = format!(

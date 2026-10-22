@@ -714,13 +714,13 @@ fn two_connections_racing_click_and_expire_exactly_one_wins() {
 
 /// Cross-module contract: `now_rfc3339()`'s output must be a shape
 /// `normalize_utc` accepts unchanged. The two are tested independently
-/// elsewhere (`common::time`'s format tests, this module's offset-normalizing
+/// elsewhere (`cli_contract::time`'s format tests, this module's offset-normalizing
 /// tests); this pins the boundary between them so a format drift in either
 /// one is caught here even if each unit's own tests still pass.
 #[test]
 fn now_rfc3339_roundtrips_unchanged_through_insert_ask() {
     let store = AskStore::open_in_memory().unwrap();
-    let now = crate::common::time::now_rfc3339();
+    let now = cli_contract::time::now_rfc3339();
     let mut ask = sample_ask("now-roundtrip", &now);
     ask.created_at = now.clone();
     store.insert_ask(ask).unwrap();

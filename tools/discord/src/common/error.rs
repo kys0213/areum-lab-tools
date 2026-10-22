@@ -1,7 +1,10 @@
+use cli_contract::{CommonKind, ExitStatus, HumanText};
 use serde::{Deserialize, Serialize};
 
 /// Error taxonomy that drives both the JSON `error.kind` and the process
-/// exit code (see [`exit_code`]).
+/// exit code (see [`exit_code`]). Shared kinds take their name and exit code
+/// from [`CommonKind`]; `auth` deliberately shares `config`'s exit code, and
+/// `api`/`rate_limit` are discord's own.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ErrorKind {
@@ -17,13 +20,13 @@ pub enum ErrorKind {
 impl ErrorKind {
     fn as_str(self) -> &'static str {
         match self {
-            ErrorKind::Usage => "usage",
-            ErrorKind::Config => "config",
+            ErrorKind::Usage => CommonKind::Usage.name(),
+            ErrorKind::Config => CommonKind::Config.name(),
             ErrorKind::Auth => "auth",
             ErrorKind::Api => "api",
             ErrorKind::RateLimit => "rate_limit",
-            ErrorKind::Network => "network",
-            ErrorKind::Internal => "internal",
+            ErrorKind::Network => CommonKind::Network.name(),
+            ErrorKind::Internal => CommonKind::Internal.name(),
         }
     }
 }
@@ -67,12 +70,24 @@ impl AppError {
 /// Maps a failure to the process exit code documented in the CLI contract.
 pub fn exit_code(err: &AppError) -> i32 {
     match err.kind {
-        ErrorKind::Usage => 2,
-        ErrorKind::Config | ErrorKind::Auth => 3,
+        ErrorKind::Usage => CommonKind::Usage.exit_code(),
+        ErrorKind::Config | ErrorKind::Auth => CommonKind::Config.exit_code(),
         ErrorKind::Api => 4,
         ErrorKind::RateLimit => 5,
-        ErrorKind::Network => 6,
-        ErrorKind::Internal => 1,
+        ErrorKind::Network => CommonKind::Network.exit_code(),
+        ErrorKind::Internal => CommonKind::Internal.exit_code(),
+    }
+}
+
+impl HumanText for AppError {
+    fn to_human(&self) -> String {
+        AppError::to_human(self)
+    }
+}
+
+impl ExitStatus for AppError {
+    fn exit_code(&self) -> i32 {
+        exit_code(self)
     }
 }
 

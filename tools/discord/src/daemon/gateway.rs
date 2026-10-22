@@ -14,6 +14,7 @@
 
 use std::time::Duration;
 
+use cli_contract::time::now_rfc3339;
 use tokio::signal::unix::{SignalKind, signal};
 use twilight_gateway::{
     Event, EventTypeFlags, Intents, Shard, ShardId, ShardState, StreamExt as _,
@@ -24,7 +25,6 @@ use twilight_model::gateway::payload::incoming::{InteractionCreate, MessageCreat
 use crate::common::api::DiscordApi;
 use crate::common::error::{AppError, ErrorKind};
 use crate::common::store::AskStore;
-use crate::common::time::now_rfc3339;
 
 use super::hook_runner::{HookRunner, ProcessHookRunner};
 use super::interactions::{ExpireRetryQueue, expire_and_disable, handle_interaction};
