@@ -233,7 +233,7 @@ doppel attach --session <id>                   # plugin 이 띄우는 세션별 
 doppel ask list | wait | answer                # 질문 inbox (doppel-protocol.md §6)
 doppel session list
 doppel stats                                   # 브리프 추천 수락률 (전체·카테고리별)
-doppel card add | list | triage | claim | done | release   # P3
+doppel card add | list | triage | claim | done | release   # P2
 ```
 
 ---
@@ -245,7 +245,7 @@ doppel card add | list | triage | claim | done | release   # P3
 
 판단 원장·카테고리·골든셋·검색 색인은 [doppel-judgment.md §6](./doppel-judgment.md)에,
 세션·ask 테이블은 [doppel-protocol.md §6](./doppel-protocol.md)에 정의한다. 카드 테이블은
-P3 에서 더한다.
+P2 에서 더한다.
 
 ---
 
