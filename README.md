@@ -40,8 +40,10 @@ CI는 ubuntu 전용으로 동작한다. **macOS/Apple Silicon 환경에서의 �
 
 ### 릴리스 설치 (권장)
 
-GitHub Release에서 미리 빌드된 바이너리를 받아 설치한다. 현재
-**Apple Silicon macOS**만 지원한다.
+GitHub Release에서 미리 빌드된 바이너리를 받아 설치한다. 현재 **macOS**만
+지원한다. `install.sh`가 머신의 arch로 target(`aarch64-apple-darwin`·
+`x86_64-apple-darwin`)을 고르고, 그 도구가 해당 target을 내지 않으면 받기 전에
+실패한다. 도구별로 내는 target은 아래 [릴리스 target](#릴리스-target)을 본다.
 
 **curl 원라이너** (레포 클론 불필요, 새 머신에서 부트스트랩):
 
@@ -106,9 +108,24 @@ make dist-tag TOOL=hello   # hello-vX.Y.Z 태그 push → release.yml 이 빌드
 ```
 
 `dist-tag`가 `hello-v0.0.0` 같은 태그를 push하면 GitHub Actions
-(`.github/workflows/release.yml`)가 macOS arm64(`aarch64-apple-darwin`)
-러너에서 바이너리를 빌드해 tar.gz로 패키징하고, 해당 태그의 GitHub Release에
-첨부한다.
+(`.github/workflows/release.yml`)가 그 도구의 target마다 바이너리를 빌드해
+tar.gz로 패키징하고, 모두 빌드된 뒤 해당 태그의 GitHub Release에 한 번에 첨부한다.
+
+### 릴리스 target
+
+도구가 내는 target은 `tools/<tool>/release-targets`에 한 줄에 하나씩 선언한다
+(`#` 주석 허용). 파일이 없으면 `aarch64-apple-darwin` 하나만 낸다.
+
+```
+# tools/doppel/release-targets
+aarch64-apple-darwin
+x86_64-apple-darwin
+```
+
+`scripts/release_targets.sh <tool>`이 이 선언을 빌드 matrix로 바꾼다. 빌드할
+러너가 정해지지 않은 target(지금은 macOS 외 전부)은 빌드를 시작하기 전에 실패한다.
+다른 OS를 지원할 때는 이 스크립트에 러너를, `install.sh`에 OS 매핑(Linux)이나
+별도 설치 스크립트(Windows `install.ps1`)를 더한다.
 
 ### 다른 머신에 설치하기
 
@@ -118,11 +135,12 @@ make dist-tag TOOL=hello   # hello-vX.Y.Z 태그 push → release.yml 이 빌드
 
 ### 무설정 경로 (CI 없이 로컬에서)
 
-같은 아키텍처(macOS arm64) 머신에 직접 배포할 때는 CI 없이 로컬 빌드 후
-scp로 옮기면 된다.
+macOS 머신에 직접 배포할 때는 CI 없이 로컬 빌드 후 scp로 옮기면 된다. target
+기본값은 `aarch64-apple-darwin`이고 `TARGET=`으로 바꾼다.
 
 ```sh
 make dist-build TOOL=hello   # dist/hello-0.0.0-aarch64-apple-darwin.tar.gz 생성
+make dist-build TOOL=hello TARGET=x86_64-apple-darwin   # Intel mac 용
 scp dist/hello-0.0.0-aarch64-apple-darwin.tar.gz user@host:/tmp/
 ```
 

@@ -6,8 +6,9 @@
 .DEFAULT_GOAL := help
 
 INSTALL_ROOT ?= $(HOME)/.local
+TARGET ?= aarch64-apple-darwin
 
-.PHONY: help build release test lint fmt fmt-check check install install-all install-release test-install new clean dist-build dist-tag
+.PHONY: help build release test lint fmt fmt-check check install install-all install-release test-install test-release-targets new clean dist-build dist-tag
 
 help: ## Show this help message
 	@echo "Available targets:"
@@ -57,6 +58,9 @@ install-release: ## Install a tool from GitHub Release: make install-release TOO
 test-install: ## Run install.sh smoke tests
 	./scripts/install_test.sh
 
+test-release-targets: ## Run release_targets.sh tests
+	./scripts/release_targets_test.sh
+
 new: ## Scaffold a new tool from templates/: make new NAME=<name>
 	@if [ -z "$(NAME)" ]; then \
 		echo "error: NAME is required. usage: make new NAME=<name>" >&2; \
@@ -74,7 +78,7 @@ new: ## Scaffold a new tool from templates/: make new NAME=<name>
 clean: ## Remove build artifacts
 	cargo clean
 
-dist-build: ## Package a release tarball into dist/: make dist-build TOOL=<name>
+dist-build: ## Package a release tarball into dist/: make dist-build TOOL=<name> [TARGET=<triple>]
 	@if [ -z "$(TOOL)" ]; then \
 		echo "error: TOOL is required. usage: make dist-build TOOL=<name>" >&2; \
 		exit 1; \
@@ -84,10 +88,10 @@ dist-build: ## Package a release tarball into dist/: make dist-build TOOL=<name>
 		echo "error: could not read version from tools/$(TOOL)/Cargo.toml" >&2; \
 		exit 1; \
 	fi; \
-	cargo build --release -p $(TOOL) --target aarch64-apple-darwin && \
+	cargo build --release -p $(TOOL) --target $(TARGET) && \
 	mkdir -p dist && \
-	tar czf "dist/$(TOOL)-$$VERSION-aarch64-apple-darwin.tar.gz" -C target/aarch64-apple-darwin/release $(TOOL) && \
-	echo "created dist/$(TOOL)-$$VERSION-aarch64-apple-darwin.tar.gz"
+	tar czf "dist/$(TOOL)-$$VERSION-$(TARGET).tar.gz" -C target/$(TARGET)/release $(TOOL) && \
+	echo "created dist/$(TOOL)-$$VERSION-$(TARGET).tar.gz"
 
 dist-tag: ## Tag + push a release: make dist-tag TOOL=<name> (needs clean tree on main)
 	@if [ -z "$(TOOL)" ]; then \
