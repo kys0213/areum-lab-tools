@@ -103,6 +103,21 @@ pub enum Command {
     #[command(subcommand)]
     Thread(ThreadCommand),
 
+    /// Add the bot's emoji reaction to a message, or remove it with --remove.
+    ///
+    /// Needs the Add Reactions and Read Message History permissions.
+    React {
+        /// Channel id, or an alias defined in config.channels.
+        channel: String,
+        /// Id of the message to react to.
+        message_id: String,
+        /// A unicode emoji (e.g. ✅), or a custom emoji as name:id.
+        emoji: String,
+        /// Remove the bot's own reaction instead of adding it.
+        #[arg(long)]
+        remove: bool,
+    },
+
     /// Manage the resident gateway daemon that answers HITL interactions.
     #[command(subcommand)]
     Daemon(DaemonCommand),
@@ -207,6 +222,7 @@ impl Command {
             Command::Read { .. } => "read",
             Command::Wait { .. } => "wait",
             Command::Thread(_) => "thread",
+            Command::React { .. } => "react",
             Command::Daemon(_) => "daemon",
             Command::Ask(_) => "ask",
         }
@@ -504,6 +520,34 @@ mod tests {
         // --force is init-only; clap must reject it on send as an unknown
         // argument rather than silently accepting and ignoring it.
         assert!(Cli::try_parse_from(["discord", "send", "123", "hi", "--force"]).is_err());
+    }
+
+    #[test]
+    fn react_parses_positionals_and_remove_flag() {
+        let cli =
+            Cli::try_parse_from(["discord", "react", "dev", "42", "✅", "--remove", "--json"])
+                .unwrap();
+        assert_eq!(cli.command.name(), "react");
+        assert!(cli.json);
+        match cli.command {
+            Command::React {
+                channel,
+                message_id,
+                emoji,
+                remove,
+            } => {
+                assert_eq!(channel, "dev");
+                assert_eq!(message_id, "42");
+                assert_eq!(emoji, "✅");
+                assert!(remove);
+            }
+            other => panic!("expected React, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn react_requires_an_emoji() {
+        assert!(Cli::try_parse_from(["discord", "react", "dev", "42"]).is_err());
     }
 
     #[test]

@@ -228,6 +228,62 @@ impl DiscordApi for HttpDiscordApi {
         let request = self.authorized(self.client.get(url));
         self.execute(request).await
     }
+
+    async fn add_reaction(
+        &self,
+        channel_id: &str,
+        message_id: &str,
+        emoji: &str,
+    ) -> Result<(), AppError> {
+        let url = reaction_url(&self.base_url, channel_id, message_id, emoji);
+        let request = self.authorized(self.client.put(url));
+        self.execute_unit(request).await.map_err(reaction_error)
+    }
+
+    async fn remove_reaction(
+        &self,
+        channel_id: &str,
+        message_id: &str,
+        emoji: &str,
+    ) -> Result<(), AppError> {
+        let url = reaction_url(&self.base_url, channel_id, message_id, emoji);
+        let request = self.authorized(self.client.delete(url));
+        self.execute_unit(request).await.map_err(reaction_error)
+    }
+}
+
+/// The emoji goes in as one percent-encoded path segment, so a stray `/` or
+/// `?` in user input cannot change which endpoint is called. `:` stays as-is,
+/// which is the `name:id` form Discord expects for a custom emoji.
+fn reaction_url(base_url: &str, channel_id: &str, message_id: &str, emoji: &str) -> String {
+    let mut url = reqwest::Url::parse(base_url).expect("API base url is a valid absolute url");
+    url.path_segments_mut()
+        .expect("an http(s) url always has path segments")
+        .extend([
+            "channels",
+            channel_id,
+            "messages",
+            message_id,
+            "reactions",
+            emoji,
+            "@me",
+        ]);
+    url.into()
+}
+
+/// A bare 403 on a reaction says only "Missing Permissions"/"Missing Access";
+/// name the two permissions a reaction needs so the operator knows the fix.
+fn reaction_error(err: AppError) -> AppError {
+    if err.http_status != Some(403) {
+        return err;
+    }
+    AppError {
+        message: format!(
+            "{} — the bot needs Add Reactions and Read Message History permissions in this channel",
+            err.message
+        ),
+        ..err
+    }
 }
 
 fn get_channel_url(base_url: &str, channel_id: &str) -> String {
@@ -742,6 +798,57 @@ mod tests {
             url,
             "https://discord.com/api/v10/channels/chan1/messages/msg1"
         );
+    }
+
+    #[test]
+    fn reaction_url_percent_encodes_a_unicode_emoji() {
+        let url = reaction_url(API_BASE, "chan1", "msg1", "✅");
+        assert_eq!(
+            url,
+            "https://discord.com/api/v10/channels/chan1/messages/msg1/reactions/%E2%9C%85/@me"
+        );
+    }
+
+    #[test]
+    fn reaction_url_keeps_a_custom_emoji_name_and_id() {
+        let url = reaction_url(API_BASE, "chan1", "msg1", "party:123456");
+        assert_eq!(
+            url,
+            "https://discord.com/api/v10/channels/chan1/messages/msg1/reactions/party:123456/@me"
+        );
+    }
+
+    #[test]
+    fn reaction_url_cannot_be_redirected_by_a_slash_in_the_emoji() {
+        let url = reaction_url(API_BASE, "chan1", "msg1", "a/../../x");
+        assert!(url.ends_with("/reactions/a%2F..%2F..%2Fx/@me"), "{url}");
+    }
+
+    #[test]
+    fn reaction_error_names_the_missing_permissions_on_403() {
+        let err = reaction_error(status_error(
+            403,
+            r#"{"message":"Missing Permissions","code":50013}"#,
+        ));
+        assert_eq!(err.kind, ErrorKind::Auth);
+        assert_eq!(err.http_status, Some(403));
+        assert!(
+            err.message.contains("Missing Permissions"),
+            "{}",
+            err.message
+        );
+        assert!(err.message.contains("Add Reactions"), "{}", err.message);
+        assert!(
+            err.message.contains("Read Message History"),
+            "{}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn reaction_error_leaves_other_failures_unchanged() {
+        let original = status_error(400, r#"{"message":"Unknown Emoji","code":10014}"#);
+        assert_eq!(reaction_error(original.clone()), original);
     }
 
     #[test]

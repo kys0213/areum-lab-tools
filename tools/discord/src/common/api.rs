@@ -45,6 +45,24 @@ pub(crate) trait DiscordApi {
     /// message trigger uses it to tell a thread from a top-level channel,
     /// which a gateway `MESSAGE_CREATE` payload does not say.
     async fn get_channel(&self, channel_id: &str) -> Result<ChannelInfo, AppError>;
+
+    /// Adds the bot's own reaction via
+    /// `PUT /channels/{ch}/messages/{mid}/reactions/{emoji}/@me`. `emoji` is a
+    /// unicode emoji or a custom emoji as `name:id`; the transport encodes it.
+    async fn add_reaction(
+        &self,
+        channel_id: &str,
+        message_id: &str,
+        emoji: &str,
+    ) -> Result<(), AppError>;
+
+    /// Removes the bot's own reaction (same path, `DELETE`).
+    async fn remove_reaction(
+        &self,
+        channel_id: &str,
+        message_id: &str,
+        emoji: &str,
+    ) -> Result<(), AppError>;
 }
 
 /// A file to upload as a message attachment. `bytes` is [`bytes::Bytes`] (an

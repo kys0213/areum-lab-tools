@@ -984,3 +984,165 @@ async fn orca_start_failure_is_reported_after_the_hook_ran() {
     assert_eq!(hook_calls(&runner), 1);
     assert_eq!(orca_calls(&runner).len(), 1);
 }
+
+// ---- ack reaction ----
+
+/// `on_message` (default workdir) with `ack_reaction` set to 👀.
+fn ack_settings() -> MessageTriggerSettings {
+    settings_from(&format!(
+        r#","default_workdir":{},"ack_reaction":"👀""#,
+        serde_json::to_string(default_dir().to_str().unwrap()).unwrap()
+    ))
+}
+
+fn reactions(api: &MockDiscordApi) -> Vec<(bool, String, String, String)> {
+    api.reaction_calls
+        .borrow()
+        .iter()
+        .map(|c| {
+            (
+                c.remove,
+                c.channel_id.clone(),
+                c.message_id.clone(),
+                c.emoji.clone(),
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn settings_reject_an_empty_ack_reaction() {
+    let config = parse(&format!(
+        r#"{{"on_message_orca":{{"cli":"{ORCA}","bot":"요라"}},"ack_reaction":" "}}"#
+    ));
+    let err = MessageTriggerSettings::from_config(&config).unwrap_err();
+    assert_eq!(err.kind, ErrorKind::Config);
+    assert!(err.message.contains("ack_reaction"), "{}", err.message);
+}
+
+#[tokio::test]
+async fn detected_message_gets_the_ack_reaction_after_the_hook_started() {
+    let runner = FakeRunner::new();
+    let api = api_with_channels(vec![text_channel("c1")]);
+
+    let outcome = trigger_with(ack_settings(), &runner)
+        .handle(&api, &message("c1", &[BOT]))
+        .await
+        .unwrap();
+
+    assert_eq!(outcome, Some(Trigger::Mention));
+    assert_eq!(runner.calls.borrow().len(), 1);
+    assert_eq!(
+        reactions(&api),
+        vec![(false, "c1".into(), "m1".into(), "👀".into())]
+    );
+}
+
+#[tokio::test]
+async fn issue_channel_post_gets_the_ack_reaction() {
+    let runner = FakeRunner::new();
+    let api = api_with_channels(vec![text_channel(ISSUE)]);
+
+    let outcome = trigger_with(ack_settings(), &runner)
+        .handle(&api, &message(ISSUE, &[]))
+        .await
+        .unwrap();
+
+    assert_eq!(outcome, Some(Trigger::IssueChannel));
+    assert_eq!(reactions(&api).len(), 1);
+}
+
+#[tokio::test]
+async fn filtered_message_gets_no_ack_reaction() {
+    let runner = FakeRunner::new();
+    let api = MockDiscordApi::new();
+
+    let outcome = trigger_with(ack_settings(), &runner)
+        .handle(&api, &message("c1", &["someone-else"]))
+        .await
+        .unwrap();
+
+    assert_eq!(outcome, None);
+    assert!(reactions(&api).is_empty());
+}
+
+#[tokio::test]
+async fn thread_message_without_mention_gets_no_ack_reaction() {
+    let runner = FakeRunner::new();
+    let api = api_with_channels(vec![thread("t1", ISSUE)]);
+
+    let outcome = trigger_with(ack_settings(), &runner)
+        .handle(&api, &message("t1", &[]))
+        .await
+        .unwrap();
+
+    assert_eq!(outcome, None);
+    assert!(reactions(&api).is_empty());
+}
+
+#[tokio::test]
+async fn no_ack_reaction_configured_means_no_reaction() {
+    let runner = FakeRunner::new();
+    let api = api_with_channels(vec![text_channel("c1")]);
+
+    let outcome = trigger(&runner)
+        .handle(&api, &message("c1", &[BOT]))
+        .await
+        .unwrap();
+
+    assert_eq!(outcome, Some(Trigger::Mention));
+    assert!(reactions(&api).is_empty());
+}
+
+#[tokio::test]
+async fn ack_reaction_failure_does_not_fail_the_dispatch() {
+    let runner = FakeRunner::new();
+    let api = api_with_channels(vec![text_channel("c1")]);
+    api.reaction_responses
+        .borrow_mut()
+        .push_back(Err(AppError::new(ErrorKind::Auth, "Missing Permissions")));
+
+    let outcome = trigger_with(ack_settings(), &runner)
+        .handle(&api, &message("c1", &[BOT]))
+        .await
+        .unwrap();
+
+    assert_eq!(outcome, Some(Trigger::Mention));
+    assert_eq!(runner.calls.borrow().len(), 1);
+    assert_eq!(reactions(&api).len(), 1, "no retry after a failure");
+}
+
+#[tokio::test]
+async fn target_start_failure_still_gets_the_ack_reaction() {
+    let runner = FakeRunner::failing_once();
+    let api = api_with_channels(vec![text_channel("c1")]);
+
+    let outcome = trigger_with(ack_settings(), &runner)
+        .handle(&api, &message("c1", &[BOT]))
+        .await;
+
+    assert!(outcome.is_err());
+    assert_eq!(reactions(&api).len(), 1);
+}
+
+/// A hung reaction call must not stall the event loop: the hook has already
+/// started, and `handle` gives up on the reaction by itself.
+#[tokio::test(start_paused = true)]
+async fn hung_ack_reaction_times_out_after_the_hook_started() {
+    let runner = FakeRunner::new();
+    let api = api_with_channels(vec![text_channel("c1")]);
+    api.reaction_hangs.set(true);
+    let mut trigger = trigger_with(ack_settings(), &runner);
+
+    let started = tokio::time::Instant::now();
+    let outcome = tokio::time::timeout(
+        std::time::Duration::from_secs(60),
+        trigger.handle(&api, &message("c1", &[BOT])),
+    )
+    .await
+    .expect("handle must give up on a hung reaction by itself");
+
+    assert_eq!(outcome.unwrap(), Some(Trigger::Mention));
+    assert_eq!(started.elapsed(), ACK_REACTION_TIMEOUT);
+    assert_eq!(runner.calls.borrow().len(), 1);
+}
