@@ -22,6 +22,10 @@ pub struct Config {
     /// message detection entirely.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub on_message: Option<Vec<String>>,
+    /// Orca bot that also receives each detected message, independent of
+    /// `on_message`. Either one enables message detection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on_message_orca: Option<OrcaForwardConfig>,
     /// Channel id or `channels` alias -> directory `on_message` runs in.
     /// Absolute or `~/`-prefixed.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
@@ -33,6 +37,14 @@ pub struct Config {
     /// Directory for channels without a `workdirs` entry.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_workdir: Option<String>,
+}
+
+/// `on_message_orca`: which local `orca` CLI to run and which bot to hand
+/// detected messages to. Both are required so a typo fails at parse time.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct OrcaForwardConfig {
+    pub cli: String,
+    pub bot: String,
 }
 
 /// Resolves the bot token by precedence: flag > env > config. Fails fast when
@@ -289,6 +301,29 @@ mod tests {
         let cfg = parse_config(r#"{"token":"t","on_message":["/bin/run"]}"#).unwrap();
         assert!(cfg.workdirs.is_empty());
         assert!(cfg.default_workdir.is_none());
+    }
+
+    #[test]
+    fn parse_config_reads_on_message_orca() {
+        let cfg = parse_config(
+            r#"{"on_message_orca":{"cli":"/Applications/Orca.app/bin/orca","bot":"요라"}}"#,
+        )
+        .unwrap();
+        let orca = cfg.on_message_orca.expect("on_message_orca is set");
+        assert_eq!(orca.cli, "/Applications/Orca.app/bin/orca");
+        assert_eq!(orca.bot, "요라");
+    }
+
+    #[test]
+    fn parse_config_without_on_message_orca_leaves_it_empty() {
+        let cfg = parse_config(r#"{"token":"t","on_message":["/bin/run"]}"#).unwrap();
+        assert!(cfg.on_message_orca.is_none());
+    }
+
+    #[test]
+    fn parse_config_rejects_on_message_orca_without_bot() {
+        let err = parse_config(r#"{"on_message_orca":{"cli":"/bin/orca"}}"#).unwrap_err();
+        assert_eq!(err.kind, ErrorKind::Config);
     }
 
     #[test]

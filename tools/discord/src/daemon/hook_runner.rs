@@ -1,5 +1,5 @@
-//! Runs the configured `on_message` command for a detected message: spawns the
-//! argv without a shell, writes one JSON line to its stdin, and never waits on
+//! Runs a command for a detected message (the `on_message` hook or the Orca
+//! forward): spawns the argv without a shell, writes its stdin, and never waits on
 //! the daemon's event loop. A detached reaper thread writes stdin, closes it,
 //! and `wait()`s the child so finished hooks do not linger as zombies.
 
@@ -24,9 +24,9 @@ pub(super) struct ProcessHookRunner;
 
 impl HookRunner for ProcessHookRunner {
     fn run(&self, argv: &[String], workdir: &Path, stdin_line: String) -> Result<(), AppError> {
-        let (program, args) = argv.split_first().ok_or_else(|| {
-            AppError::new(ErrorKind::Config, "on_message must not be an empty array")
-        })?;
+        let (program, args) = argv
+            .split_first()
+            .ok_or_else(|| AppError::new(ErrorKind::Config, "command argv must not be empty"))?;
         // The hook is arbitrary user code; it must not see the bot token the
         // daemon may carry in its own environment.
         let mut child = Command::new(program)
@@ -40,7 +40,7 @@ impl HookRunner for ProcessHookRunner {
             .map_err(|e| {
                 AppError::new(
                     ErrorKind::Internal,
-                    format!("failed to spawn on_message command {program:?}: {e}"),
+                    format!("failed to spawn command {program:?}: {e}"),
                 )
             })?;
         let mut stdin = child
@@ -51,25 +51,25 @@ impl HookRunner for ProcessHookRunner {
         // A dedicated thread (not the event loop) owns the blocking stdin write
         // and `wait()`: a hook that never reads stdin must not stall the daemon.
         std::thread::Builder::new()
-            .name("on-message-reaper".to_owned())
+            .name("message-command-reaper".to_owned())
             .spawn(move || {
                 if let Err(e) = stdin.write_all(stdin_line.as_bytes()) {
-                    eprintln!("daemon: on_message {label:?}: failed to write stdin: {e}");
+                    eprintln!("daemon: command {label:?}: failed to write stdin: {e}");
                 }
                 drop(stdin);
                 match child.wait() {
                     Ok(status) if !status.success() => {
-                        eprintln!("daemon: on_message {label:?} exited with {status}");
+                        eprintln!("daemon: command {label:?} exited with {status}");
                     }
                     Ok(_) => {}
-                    Err(e) => eprintln!("daemon: on_message {label:?}: wait failed: {e}"),
+                    Err(e) => eprintln!("daemon: command {label:?}: wait failed: {e}"),
                 }
             })
             .map(|_| ())
             .map_err(|e| {
                 AppError::new(
                     ErrorKind::Internal,
-                    format!("failed to start on_message reaper thread: {e}"),
+                    format!("failed to start command reaper thread: {e}"),
                 )
             })
     }

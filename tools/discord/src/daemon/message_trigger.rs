@@ -1,7 +1,8 @@
-//! Message detection: decides whether a gateway `MESSAGE_CREATE` should fire
-//! the configured `on_message` command, and builds the JSON line handed to it
-//! on stdin. The daemon knows nothing about what the command does — it only
-//! guarantees the filter rules and the payload contract (see
+//! Message detection: decides whether a gateway `MESSAGE_CREATE` should fire,
+//! then hands the message to each configured target — the `on_message`
+//! command (JSON line on stdin) and/or an Orca bot (`on_message_orca`). The
+//! daemon knows nothing about what a target does — it only guarantees the
+//! filter rules and the payload contract (see
 //! `docs/discord-message-trigger.md`).
 //!
 //! Filter rules: bots (including this bot) never trigger unless listed in
@@ -20,6 +21,7 @@ use crate::common::config::{Config, resolve_channel};
 use crate::common::error::{AppError, ErrorKind};
 
 use super::hook_runner::HookRunner;
+use super::orca_forward::{ForwardedMessage, OrcaForward};
 use super::workdir::Workdirs;
 
 /// Discord message types a person produces by posting (`DEFAULT`, `REPLY`).
@@ -33,31 +35,38 @@ const THREAD_CHANNEL_TYPES: [u8; 3] = [10, 11, 12];
 /// event loop, so a slow Discord response must not stall every other event.
 const CHANNEL_LOOKUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 
+/// The Orca CLI does not depend on its working directory, so the forward runs
+/// in a fixed one and never waits on `workdirs` resolution.
+const ORCA_FORWARD_DIR: &str = "/";
+
 /// Validated message-trigger settings derived from config. Exists only when
-/// `on_message` is configured — its absence is how the feature is disabled.
+/// `on_message` or `on_message_orca` is configured — absence of both is how
+/// the feature is disabled.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct MessageTriggerSettings {
     issue_channels: HashSet<String>,
     trigger_bots: HashSet<String>,
-    on_message: Vec<String>,
+    hook: Option<HookTarget>,
+    orca: Option<OrcaForward>,
+}
+
+/// `on_message` argv and where it runs. Workdirs belong to the hook only.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HookTarget {
+    argv: Vec<String>,
     workdirs: Workdirs,
 }
 
 impl MessageTriggerSettings {
-    /// `Ok(None)` when `on_message` is absent (feature off). Issue-channel
-    /// aliases resolve through `channels` the same way `send`/`read` do. An
-    /// empty `on_message` array, or no working directory setting at all,
-    /// cannot be executed, so both fail fast, as does a `trigger_bots` entry
-    /// that is not a numeric user id.
+    /// `Ok(None)` when neither `on_message` nor `on_message_orca` is set
+    /// (feature off). Issue-channel aliases resolve through `channels` the
+    /// same way `send`/`read` do. An empty `on_message` array, an
+    /// `on_message` without any working directory setting, or an invalid
+    /// `on_message_orca` cannot be executed, so each fails fast, as does a
+    /// `trigger_bots` entry that is not a numeric user id.
     pub(crate) fn from_config(config: &Config) -> Result<Option<Self>, AppError> {
-        let Some(on_message) = &config.on_message else {
+        if config.on_message.is_none() && config.on_message_orca.is_none() {
             return Ok(None);
-        };
-        if on_message.is_empty() {
-            return Err(AppError::new(
-                ErrorKind::Config,
-                "on_message must be a non-empty argv array, e.g. [\"/path/to/command\"]",
-            ));
         }
         if let Some(bad) = config
             .trigger_bots
@@ -74,14 +83,39 @@ impl MessageTriggerSettings {
             .iter()
             .map(|entry| resolve_channel(entry, &config.channels))
             .collect();
-        let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
-        let workdirs = Workdirs::from_config(config, home.as_deref())?;
+        let hook = config
+            .on_message
+            .as_deref()
+            .map(|argv| HookTarget::from_config(argv, config))
+            .transpose()?;
+        let orca = config
+            .on_message_orca
+            .as_ref()
+            .map(|orca| OrcaForward::from_config(orca, &config.channels))
+            .transpose()?;
         Ok(Some(Self {
             issue_channels,
             trigger_bots: config.trigger_bots.iter().cloned().collect(),
-            on_message: on_message.clone(),
-            workdirs,
+            hook,
+            orca,
         }))
+    }
+}
+
+impl HookTarget {
+    fn from_config(argv: &[String], config: &Config) -> Result<Self, AppError> {
+        if argv.is_empty() {
+            return Err(AppError::new(
+                ErrorKind::Config,
+                "on_message must be a non-empty argv array, e.g. [\"/path/to/command\"]",
+            ));
+        }
+        let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+        let workdirs = Workdirs::from_config(config, home.as_deref())?;
+        Ok(Self {
+            argv: argv.to_vec(),
+            workdirs,
+        })
     }
 }
 
@@ -91,6 +125,16 @@ impl MessageTriggerSettings {
 pub(super) enum Trigger {
     Mention,
     IssueChannel,
+}
+
+impl Trigger {
+    /// Short Korean label for the Orca chat title.
+    fn label(self) -> &'static str {
+        match self {
+            Trigger::Mention => "멘션",
+            Trigger::IssueChannel => "이슈 채널",
+        }
+    }
 }
 
 /// Where a message lives: a top-level channel or a thread under `parent_id`.
@@ -147,13 +191,15 @@ struct TriggerEvent<'a> {
     parent_channel_id: Option<&'a str>,
     is_thread: bool,
     message_id: &'a str,
+    message_url: &'a str,
     content: &'a str,
     author: EventAuthor<'a>,
     timestamp: &'a str,
     bot_user_id: &'a str,
     message_reference: Option<&'a str>,
-    /// Canonical absolute directory the hook was started in.
-    cwd: &'a str,
+    /// Canonical absolute directory the hook was started in; `null` in the
+    /// copy forwarded to Orca, which runs no command in a workdir.
+    cwd: Option<&'a str>,
 }
 
 #[derive(Debug, Serialize)]
@@ -188,10 +234,11 @@ impl<R: HookRunner> MessageTrigger<R> {
         self.bot_user_id = Some(id);
     }
 
-    /// Handles one raw `MESSAGE_CREATE` payload. `Ok(Some(trigger))` means the
-    /// hook was started; `Ok(None)` means the filter dropped the message;
-    /// `Err` means the message could not be judged or the hook could not be
-    /// started (the caller logs it and keeps serving).
+    /// Handles one raw `MESSAGE_CREATE` payload. `Ok(Some(trigger))` means
+    /// every configured target was started; `Ok(None)` means the filter
+    /// dropped the message; `Err` means the message could not be judged or at
+    /// least one target could not be started (the caller logs it and keeps
+    /// serving). Targets are independent: one failing never skips the other.
     pub(super) async fn handle(
         &mut self,
         api: &impl DiscordApi,
@@ -267,25 +314,86 @@ impl<R: HookRunner> MessageTrigger<R> {
         ) else {
             return Ok(None);
         };
-        let parent_id = match &placement {
-            Placement::TopLevel => None,
-            Placement::Thread { parent_id } => Some(parent_id.as_str()),
-        };
-        let cwd = self
-            .settings
-            .workdirs
-            .resolve(&message.channel_id, parent_id)
-            .map_err(|e| {
-                AppError::new(
-                    e.kind,
-                    format!("message {} not published: {}", message.id, e.message),
-                )
-            })?;
-        let line = event_line(&message, trigger, &placement, bot_user_id, &cwd);
-        self.runner
-            .run(&self.settings.on_message, Path::new(&cwd), line)?;
-        Ok(Some(trigger))
+        let failures: Vec<String> = [
+            self.run_hook(&message, trigger, &placement, bot_user_id),
+            self.forward_to_orca(&message, trigger, &placement, bot_user_id),
+        ]
+        .into_iter()
+        .filter_map(Result::err)
+        .collect();
+        if failures.is_empty() {
+            Ok(Some(trigger))
+        } else {
+            Err(AppError::new(
+                ErrorKind::Internal,
+                format!("message {}: {}", message.id, failures.join("; ")),
+            ))
+        }
     }
+
+    /// `Err` carries a one-line reason naming the target.
+    fn run_hook(
+        &self,
+        message: &IncomingMessage,
+        trigger: Trigger,
+        placement: &Placement,
+        bot_user_id: &str,
+    ) -> Result<(), String> {
+        let Some(hook) = &self.settings.hook else {
+            return Ok(());
+        };
+        let not_started = |e: AppError| format!("on_message not started: {}", e.message);
+        let cwd = hook
+            .workdirs
+            .resolve(&message.channel_id, parent_id_of(placement))
+            .map_err(not_started)?;
+        let mut line = event_json(message, trigger, placement, bot_user_id, Some(&cwd));
+        line.push('\n');
+        self.runner
+            .run(&hook.argv, Path::new(&cwd), line)
+            .map_err(not_started)
+    }
+
+    /// `Err` carries a one-line reason naming the target.
+    fn forward_to_orca(
+        &self,
+        message: &IncomingMessage,
+        trigger: Trigger,
+        placement: &Placement,
+        bot_user_id: &str,
+    ) -> Result<(), String> {
+        let Some(orca) = &self.settings.orca else {
+            return Ok(());
+        };
+        let event_json = event_json(message, trigger, placement, bot_user_id, None);
+        let message_url = message_url(message);
+        let (argv, body) = orca.command(&ForwardedMessage {
+            trigger_label: trigger.label(),
+            author_username: &message.author.username,
+            channel_id: &message.channel_id,
+            parent_channel_id: parent_id_of(placement),
+            message_id: &message.id,
+            message_url: &message_url,
+            event_json: &event_json,
+        });
+        self.runner
+            .run(&argv, Path::new(ORCA_FORWARD_DIR), body)
+            .map_err(|e| format!("on_message_orca not started: {}", e.message))
+    }
+}
+
+fn parent_id_of(placement: &Placement) -> Option<&str> {
+    match placement {
+        Placement::TopLevel => None,
+        Placement::Thread { parent_id } => Some(parent_id.as_str()),
+    }
+}
+
+fn message_url(message: &IncomingMessage) -> String {
+    format!(
+        "https://discord.com/channels/{}/{}/{}",
+        message.guild_id, message.channel_id, message.id
+    )
 }
 
 /// The filter table. Pure: given the message, the bot's id, and where the
@@ -337,18 +445,16 @@ fn placement_of(info: &ChannelInfo) -> Result<Placement, AppError> {
     }
 }
 
-/// Serializes the stdin contract as exactly one line terminated by `\n`.
-fn event_line(
+/// Serializes the payload contract as one JSON line (no trailing newline).
+fn event_json(
     message: &IncomingMessage,
     trigger: Trigger,
     placement: &Placement,
     bot_user_id: &str,
-    cwd: &str,
+    cwd: Option<&str>,
 ) -> String {
-    let parent_channel_id = match placement {
-        Placement::TopLevel => None,
-        Placement::Thread { parent_id } => Some(parent_id.as_str()),
-    };
+    let parent_channel_id = parent_id_of(placement);
+    let message_url = message_url(message);
     let event = TriggerEvent {
         trigger,
         guild_id: &message.guild_id,
@@ -356,6 +462,7 @@ fn event_line(
         parent_channel_id,
         is_thread: parent_channel_id.is_some(),
         message_id: &message.id,
+        message_url: &message_url,
         content: &message.content,
         author: EventAuthor {
             id: &message.author.id,
@@ -372,10 +479,8 @@ fn event_line(
     };
     // serde_json escapes control characters, so the output never contains a
     // raw newline and stays a single line.
-    let mut line = serde_json::to_string(&event)
-        .expect("TriggerEvent holds only strings and bools; serialization is infallible");
-    line.push('\n');
-    line
+    serde_json::to_string(&event)
+        .expect("TriggerEvent holds only strings and bools; serialization is infallible")
 }
 
 #[cfg(test)]
