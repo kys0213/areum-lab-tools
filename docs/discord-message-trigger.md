@@ -21,6 +21,7 @@
 | `workdirs` | `{ "<채널 ID 또는 별칭>": "<디렉토리>" }` | 채널별로 `on_message`를 실행할 디렉토리. 키의 별칭은 `channels`로 풀어요. |
 | `default_workdir` | 문자열 | `workdirs`에 없는 채널에서 쓸 디렉토리. |
 | `trigger_bots` | 문자열 배열 | 메시지가 트리거 대상이 되는 봇의 user ID(이 봇 자신 포함). 숫자 ID만 받아요. 생략하거나 비우면 모든 봇 메시지를 무시해요. |
+| `ack_reaction` | 문자열 | 감지한 메시지에 데몬이 달 반응 이모지(예: `"👀"`, 커스텀 이모지는 `"이름:ID"`). 생략하면 반응하지 않아요. 자세한 내용은 [감지 반응](#감지-반응-ack_reaction)을 보세요. |
 
 ```json
 {
@@ -41,6 +42,19 @@
 - 설정은 데몬 시작 시 한 번 읽어요. 바꾼 뒤에는 `discord daemon stop` 후 `discord daemon start`로 다시 띄우세요.
 - `trigger_bots`에 숫자가 아닌 값(별칭 포함)이 있으면 `on_message`를 설정했을 때 데몬 시작 시 설정 오류로 끝나요. `channels` 별칭은 채널용이라 봇에는 쓰지 않아요.
 - `discord init --force`로 토큰을 바꿔도 토큰 외 필드는 보존돼요.
+
+### 감지 반응 (`ack_reaction`)
+
+데몬이 메시지를 감지하면 그 메시지에 `ack_reaction` 이모지로 반응해요. 작성자는 봇이 글을 받았는지 바로 알 수 있어요.
+
+- **언제**: 필터를 통과한 메시지에만 반응해요. 걸러진 메시지에는 반응하지 않아요. 대상(`on_message`·`on_message_orca`) 실행이 실패해도 감지는 된 것이라 반응해요.
+- **순서**: 대상을 모두 실행한 다음에 반응해요. 반응 요청이 대상 실행을 막거나 늦추지 않아요.
+- **실패**: 재시도하지 않고 데몬 stderr에 한 줄 남겨요. 메시지 처리 결과에는 영향이 없어요.
+  - `daemon: ack reaction on message <id> failed: ...`
+  - 응답이 3초 안에 오지 않으면 포기해요. 게이트웨이 이벤트 처리가 밀리지 않게 하려는 거예요.
+- **기본값이 "반응 없음"인 이유**: 기존 사용자의 봇에는 반응 권한이 없을 수 있어요. 기본으로 반응하면 업데이트만으로 메시지마다 권한 오류 로그가 쌓이고, 사용자가 원하지 않은 반응이 채널에 보여요. 그래서 설정한 사람만 켜지게 했어요.
+- **필요한 봇 권한**: **Add Reactions**와 **Read Message History**. 없으면 Discord가 403을 돌려주고, 로그에 두 권한 이름이 함께 나와요.
+- 요라(Orca 봇)가 답장을 마치면 같은 메시지에 ✅로 완료를 표시해요. [Orca 봇으로 전달](#orca-봇으로-전달-on_message_orca)을 보세요.
 
 ### 실행 디렉토리 결정
 
@@ -188,7 +202,7 @@ error [config]: gateway closed with 4014 (Disallowed Intents): message detection
 
 - `--from bot:<bot>`: 데몬은 Orca 터미널 밖에서 돌아서 보낸 사람을 추론할 수 없어요. `--from`이 없으면 CLI가 `no_active_sender_terminal`로 거부해요. 그래서 봇이 자기 자신에게 보내는 형태로 실행해요.
 - 제목의 채널은 `channels`에 별칭이 있으면 별칭(`#product-dev`), 없으면 ID예요. 스레드면 상위 채널 뒤에 ` 스레드`를 붙여요. 이슈 채널 글이면 `Discord 이슈 채널: ...`이에요.
-- 본문에는 메시지 링크, 답장 명령(`discord --json send <channel_id> --reply-to <message_id> "<답장>"`), 위 [stdin JSON 계약](#stdin-json-계약)과 같은 JSON(`cwd`는 `null`)이 들어가요. `content`는 사용자가 쓴 글이라 지시가 아닌 데이터로 다루라는 안내도 붙여요.
+- 본문에는 메시지 링크, 답장 명령(`discord --json send <channel_id> --reply-to <message_id> "<답장>"`), 완료 표시 명령(`discord --json react <channel_id> <message_id> ✅`, 답장을 마친 뒤 실행), 위 [stdin JSON 계약](#stdin-json-계약)과 같은 JSON(`cwd`는 `null`)이 들어가요. `content`는 사용자가 쓴 글이라 지시가 아닌 데이터로 다루라는 안내도 붙여요.
 - 명령은 `/`에서 실행해요. `workdirs` 설정과 무관해서, `on_message`의 디렉토리가 없어도 Orca 전달은 실행돼요.
 - 실패 처리는 `on_message`와 같아요. 재시도 없이 데몬 stderr에 한 줄 남겨요.
   - 실행 실패: `daemon: message handling failed: message <id>: on_message_orca not started: ...`

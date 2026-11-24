@@ -44,7 +44,7 @@ CLI가 대신할 수 없는 1회성 수동 작업:
 3. **Privileged Gateway Intents → MESSAGE CONTENT INTENT 활성화**
    - gateway로 메시지 본문을 실시간 수신하려면 필수.
    - REST로 과거 메시지 본문을 읽는 데도 필요한지는 실사용 시 검증 필요(§2, §6).
-4. OAuth2 → URL Generator에서 `bot` scope + 권한(최소: View Channels, Send Messages, Read Message History) 선택 → 생성된 초대 링크로 봇을 **대상 서버에 초대**
+4. OAuth2 → URL Generator에서 `bot` scope + 권한(최소: View Channels, Send Messages, Read Message History. `react`와 감지 반응을 쓰면 Add Reactions도) 선택 → 생성된 초대 링크로 봇을 **대상 서버에 초대**
 5. 봇이 접근할 채널의 **Channel ID** 확보 (Discord 개발자 모드 → 채널 우클릭 → ID 복사)
 
 ---
@@ -88,12 +88,21 @@ discord [--token <TOKEN>] [--config <PATH>] [--json] <COMMAND>
   send <CHANNEL> [BODY] [--reply-to <MSG_ID>] [--file <PATH>]... [--split]   # BODY 생략/'-' → stdin. --text <TEXT>는 BODY와 상호배타. --file 최대 10회 반복. --split은 2000자 초과 본문을 여러 메시지로 분할
   read <CHANNEL> [--after <MSG_ID>] [--limit N]          # limit 기본 50, 1..=100
   wait <CHANNEL> [--after <MSG_ID>] [--timeout SECS] [--interval SECS] [--limit N]  # 기본 60/5/50
+  react <CHANNEL> <MESSAGE_ID> <EMOJI> [--remove]         # 봇의 반응 추가(--remove면 제거)
 ```
 
 - `CHANNEL` = raw channel id 또는 config alias.
 - `--token`/`--config`/`--json`은 전역 플래그로, 서브커맨드 앞뒤 어디서나 지정 가능.
 - 긴 본문은 `echo "..." | discord send ops -` (셸 이스케이프 회피).
 - `--reply-to <MSG_ID>`는 같은 채널의 메시지에 답글을 단다. 대상 메시지가 삭제되었으면 Discord가 400을 반환해 `kind:"api"`/exit 4로 매핑된다. 빈 문자열(`--reply-to ""`)은 usage 오류(exit 2).
+
+#### 반응 (`react`)
+
+- `EMOJI`는 유니코드 이모지(`✅`)나 커스텀 이모지(`이름:ID`)예요. 경로에 넣을 때 CLI가 인코딩해요.
+- `--remove`는 봇 자신이 단 반응만 지워요. 이미 단 반응을 다시 달거나 없는 반응을 지워도 성공이에요.
+- 성공 봉투: `{"ok":true,"command":"react","data":{"channel_id":"...","message_id":"...","emoji":"✅","removed":false}}`
+- 봇에 **Add Reactions**와 **Read Message History** 권한이 필요해요. 없으면 `kind:"auth"`/exit 3이고, 메시지에 두 권한 이름이 나와요.
+- 빈 `MESSAGE_ID`나 빈 `EMOJI`는 usage 오류(exit 2)예요.
 
 #### 긴 본문 분할 (`--split`)
 
