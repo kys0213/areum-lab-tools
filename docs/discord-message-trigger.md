@@ -1,6 +1,9 @@
 # Discord 메시지 트리거 (`on_message`)
 
-상주 데몬(`discord daemon`)이 봇 멘션이나 "이슈 채널"의 새 글을 감지하면, 설정한 외부 명령을 실행하고 메시지 정보를 JSON 한 줄로 stdin에 넘겨요.
+상주 데몬(`discord daemon`)이 봇 멘션이나 "이슈 채널"의 새 글을 감지하면, 메시지 정보를 설정한 대상에 넘겨요. 대상은 두 가지이고 함께 쓸 수 있어요.
+
+- `on_message`: 외부 명령을 실행하고 메시지 정보를 JSON 한 줄로 stdin에 넘겨요.
+- `on_message_orca`: 같은 컴퓨터의 Orca 봇에게 새 채팅으로 메시지를 넘겨요. 자세한 내용은 [Orca 봇으로 전달](#orca-봇으로-전달-on_message_orca)을 보세요.
 
 - **왜**: Discord에서 봇을 부르면 다른 프로그램(런처 등)이 작업을 시작할 수 있게 하려고요. 게이트웨이 연결은 데몬 하나만 가지므로, 감지도 데몬이 맡아요.
 - **CLI가 하는 일**: 메시지를 거르고, 명령을 실행하고, JSON을 넘기는 것까지예요. 명령이 무엇을 하는지는 몰라요.
@@ -8,11 +11,12 @@
 
 ## 설정
 
-`~/.areum/discord/config.json`에 다섯 필드를 더해요.
+`~/.areum/discord/config.json`에 아래 필드를 더해요.
 
 | 필드 | 형식 | 설명 |
 |---|---|---|
-| `on_message` | 문자열 배열 (argv) | 메시지마다 실행할 명령. 첫 요소가 실행 파일, 나머지가 인자예요. 셸을 거치지 않아요. **없으면 감지 기능이 꺼져요.** 빈 배열은 데몬 시작 시 설정 오류로 끝나요. |
+| `on_message` | 문자열 배열 (argv) | 메시지마다 실행할 명령. 첫 요소가 실행 파일, 나머지가 인자예요. 셸을 거치지 않아요. 빈 배열은 데몬 시작 시 설정 오류로 끝나요. |
+| `on_message_orca` | `{ "cli": "<orca 절대경로>", "bot": "<봇 이름>" }` | 메시지마다 넘길 Orca 봇. **`on_message`와 `on_message_orca`가 둘 다 없으면 감지 기능이 꺼져요.** |
 | `issue_channels` | 문자열 배열 | 멘션 없이도 새 글을 발행할 채널. 채널 ID나 `channels`의 별칭을 써요. 생략하면 멘션만 감지해요. |
 | `workdirs` | `{ "<채널 ID 또는 별칭>": "<디렉토리>" }` | 채널별로 `on_message`를 실행할 디렉토리. 키의 별칭은 `channels`로 풀어요. |
 | `default_workdir` | 문자열 | `workdirs`에 없는 채널에서 쓸 디렉토리. |
@@ -30,7 +34,7 @@
 }
 ```
 
-- `on_message`가 없는 기존 config도 그대로 읽혀요. 이때 데몬은 예전과 똑같이 동작해요(메시지 인텐트를 요청하지 않음).
+- `on_message`와 `on_message_orca`가 없는 기존 config도 그대로 읽혀요. 이때 데몬은 예전과 똑같이 동작해요(메시지 인텐트를 요청하지 않음).
 - `on_message`를 설정했다면 `workdirs`와 `default_workdir` 중 하나는 있어야 해요. 둘 다 없으면 어떤 메시지도 실행할 수 없어서 데몬 시작 시 설정 오류로 끝나요.
 - `on_message`를 설정했을 때만 경로·디렉토리 설정을 검증해요. 디렉토리는 절대경로이거나 `~/`로 시작해야 해요(`~/`는 홈 디렉토리로 펼쳐요). 상대경로와 `~user/...` 형식은 데몬 시작 시 설정 오류로 끝나요.
 - `workdirs`의 서로 다른 키(채널 ID나 별칭)가 같은 채널로 풀리면 디렉토리 값이 같아도 데몬 시작 시 설정 오류로 끝나요. 어느 디렉토리를 쓸지 모호해지기 때문이에요.
@@ -57,11 +61,11 @@
 1. https://discord.com/developers/applications 에서 봇 애플리케이션을 열어요.
 2. **Bot** → **Privileged Gateway Intents** → **Message Content Intent**를 켜고 저장해요.
 
-- 데몬은 `on_message`가 있을 때만 `GUILD_MESSAGES | MESSAGE_CONTENT` 인텐트를 요청해요. `on_message`를 쓰지 않으면 인텐트 요청이 없어서 Portal 설정과 무관하게 동작해요.
+- 데몬은 `on_message`나 `on_message_orca`가 있을 때만 `GUILD_MESSAGES | MESSAGE_CONTENT` 인텐트를 요청해요. 둘 다 쓰지 않으면 인텐트 요청이 없어서 Portal 설정과 무관하게 동작해요.
 - 인텐트를 켜지 않은 채 `on_message`를 설정하면 게이트웨이가 4014(Disallowed Intents)로 연결을 끊어요. 데몬은 재시도하지 않고 아래처럼 원인과 해결 방법을 담은 오류로 끝나요.
 
 ```
-error [config]: gateway closed with 4014 (Disallowed Intents): message detection (`on_message` in config) needs the privileged Message Content intent. Enable "Message Content Intent" under Bot > Privileged Gateway Intents in the Discord Developer Portal, or remove `on_message` from config; daemon will not retry
+error [config]: gateway closed with 4014 (Disallowed Intents): message detection (`on_message`/`on_message_orca` in config) needs the privileged Message Content intent. Enable "Message Content Intent" under Bot > Privileged Gateway Intents in the Discord Developer Portal, or remove `on_message`/`on_message_orca` from config; daemon will not retry
 ```
 
 ## 필터 규칙
@@ -113,23 +117,24 @@ error [config]: gateway closed with 4014 (Disallowed Intents): message detection
 | `parent_channel_id` | 문자열 \| `null` | 스레드일 때 상위 채널 ID, 아니면 `null` |
 | `is_thread` | bool | 스레드 안의 글인지 |
 | `message_id` | 문자열 | 메시지 ID |
+| `message_url` | 문자열 | 메시지 링크(`https://discord.com/channels/<guild>/<channel>/<message>`) |
 | `content` | 문자열 | 원문 그대로(`<@봇ID>` 같은 멘션 토큰 포함) |
 | `author` | `{id, username, bot}` | 작성자 |
 | `timestamp` | 문자열 | 메시지 작성 시각(ISO 8601) |
 | `bot_user_id` | 문자열 | 이 봇의 user ID. `content`에서 멘션 토큰을 걷어낼 때 써요 |
 | `message_reference` | 문자열 \| `null` | 답장이면 답장 대상 메시지 ID, 아니면 `null` |
-| `cwd` | 문자열 | 명령을 실행한 디렉토리. 심볼릭 링크를 풀어 정규화한 절대경로예요 |
+| `cwd` | 문자열 \| `null` | 명령을 실행한 디렉토리. 심볼릭 링크를 풀어 정규화한 절대경로예요. Orca로 넘기는 사본에서는 `null`이에요 |
 
 스레드 안에서 봇을 멘션한 예시(실제로는 한 줄):
 
 ```json
-{"trigger":"mention","guild_id":"111","channel_id":"333","parent_channel_id":"222","is_thread":true,"message_id":"444","content":"<@999> 이 에러 봐줘","author":{"id":"555","username":"alice","bot":false},"timestamp":"2026-10-04T01:02:03.000000+00:00","bot_user_id":"999","message_reference":null,"cwd":"/Users/me/work/app"}
+{"trigger":"mention","guild_id":"111","channel_id":"333","parent_channel_id":"222","is_thread":true,"message_id":"444","message_url":"https://discord.com/channels/111/333/444","content":"<@999> 이 에러 봐줘","author":{"id":"555","username":"alice","bot":false},"timestamp":"2026-10-04T01:02:03.000000+00:00","bot_user_id":"999","message_reference":null,"cwd":"/Users/me/work/app"}
 ```
 
 이슈 채널 최상위 글 예시:
 
 ```json
-{"trigger":"issue_channel","guild_id":"111","channel_id":"222","parent_channel_id":null,"is_thread":false,"message_id":"666","content":"로그인 버튼이 안 눌려요","author":{"id":"555","username":"alice","bot":false},"timestamp":"2026-10-04T01:05:00.000000+00:00","bot_user_id":"999","message_reference":null,"cwd":"/Users/me/work/app"}
+{"trigger":"issue_channel","guild_id":"111","channel_id":"222","parent_channel_id":null,"is_thread":false,"message_id":"666","message_url":"https://discord.com/channels/111/222/666","content":"로그인 버튼이 안 눌려요","author":{"id":"555","username":"alice","bot":false},"timestamp":"2026-10-04T01:05:00.000000+00:00","bot_user_id":"999","message_reference":null,"cwd":"/Users/me/work/app"}
 ```
 
 ## 실행 방식과 실패 시 동작
@@ -143,8 +148,8 @@ error [config]: gateway closed with 4014 (Disallowed Intents): message detection
 
 | 상황 | 결과 |
 |---|---|
-| 명령 실행 실패(파일 없음, 권한 없음) | `daemon: message handling failed: ...` 로그, 해당 메시지는 발행 안 됨 |
-| 명령이 0이 아닌 코드로 종료 | `daemon: on_message "..." exited with ...` 로그 |
+| 명령 실행 실패(파일 없음, 권한 없음) | `daemon: message handling failed: message <id>: on_message not started: ...` 로그. 그 대상만 실행 안 되고 다른 대상(`on_message_orca`)은 그대로 실행돼요 |
+| 명령이 0이 아닌 코드로 종료 | `daemon: command "<실행 파일>" exited with ...` 로그 |
 | 명령이 stdin을 읽지 않고 종료 | `failed to write stdin` 로그 |
 | 채널에 맞는 디렉토리가 없음(`workdirs`에도 `default_workdir`에도 없음) | 실행하지 않고 `no workdir for channel <id> ...` 로그 |
 | 정해진 디렉토리가 없거나 디렉토리가 아님 | 실행하지 않고 `workdir <path> for channel <id> is unusable ...` 또는 `... is not a directory` 로그. `default_workdir`로 대신하지 않음 |
@@ -152,8 +157,50 @@ error [config]: gateway closed with 4014 (Disallowed Intents): message detection
 | 채널 조회가 3초를 넘김 | 발행하지 않고 `channel lookup for <channel> timed out after 3s, message <id> not published` 로그 |
 | 인텐트 거부 close(4013/4014) | 데몬이 위 오류로 종료(재시도 안 함) |
 
-- 발행에 성공하면 `daemon: message <id> in <channel> -> on_message (Mention)` 로그가 남아요.
+- 설정한 대상을 모두 실행하면 `daemon: message <id> in <channel> -> dispatched (Mention)` 로그가 남아요.
 - 백그라운드 데몬(`discord daemon start`)은 stdio를 닫고 떠서 이 로그가 보이지 않아요. 확인하려면 `discord daemon start --foreground`로 띄우세요.
+
+## Orca 봇으로 전달 (`on_message_orca`)
+
+같은 컴퓨터에서 도는 Orca 앱의 봇에게 감지한 메시지를 넘겨요. 봇은 새 채팅에서 일을 받아 처리하고, `discord send`로 같은 채널(스레드)에 답해요.
+
+- **왜**: Orca 웹훅은 Orca Cloud를 거쳐서 로그인과 비밀 URL 관리가 필요해요. 로컬 `orca` CLI는 둘 다 필요 없어요.
+- `on_message`와 독립된 대상이에요. 둘 다 설정하면 메시지 하나에 둘 다 실행해요.
+
+```json
+{
+  "on_message": ["/Users/me/.local/bin/discord-connector-launch"],
+  "on_message_orca": { "cli": "/Applications/Orca.app/Contents/Resources/bin/orca", "bot": "요라" },
+  "default_workdir": "~/workspace/discord-scratch"
+}
+```
+
+| 필드 | 설명 |
+|---|---|
+| `cli` | `orca` CLI의 절대경로. 데몬은 로그인 셸의 PATH 없이 돌아서 절대경로만 받아요. 상대경로는 데몬 시작 시 설정 오류로 끝나요. |
+| `bot` | 받을 Orca 봇 이름(`orca bot list`에 나오는 이름). 비우면 데몬 시작 시 설정 오류로 끝나요. |
+
+데몬은 메시지마다 셸 없이 아래 명령을 실행하고, 본문은 stdin으로 넘겨요.
+
+```
+<cli> orchestration send --from bot:<bot> --to bot:<bot> --chat new --type handoff --subject "Discord 멘션: <작성자> · #<채널>" --body-file -
+```
+
+- `--from bot:<bot>`: 데몬은 Orca 터미널 밖에서 돌아서 보낸 사람을 추론할 수 없어요. `--from`이 없으면 CLI가 `no_active_sender_terminal`로 거부해요. 그래서 봇이 자기 자신에게 보내는 형태로 실행해요.
+- 제목의 채널은 `channels`에 별칭이 있으면 별칭(`#product-dev`), 없으면 ID예요. 스레드면 상위 채널 뒤에 ` 스레드`를 붙여요. 이슈 채널 글이면 `Discord 이슈 채널: ...`이에요.
+- 본문에는 메시지 링크, 답장 명령(`discord --json send <channel_id> --reply-to <message_id> "<답장>"`), 위 [stdin JSON 계약](#stdin-json-계약)과 같은 JSON(`cwd`는 `null`)이 들어가요. `content`는 사용자가 쓴 글이라 지시가 아닌 데이터로 다루라는 안내도 붙여요.
+- 명령은 `/`에서 실행해요. `workdirs` 설정과 무관해서, `on_message`의 디렉토리가 없어도 Orca 전달은 실행돼요.
+- 실패 처리는 `on_message`와 같아요. 재시도 없이 데몬 stderr에 한 줄 남겨요.
+  - 실행 실패: `daemon: message handling failed: message <id>: on_message_orca not started: ...`
+  - 0이 아닌 코드로 종료(Orca 앱이 꺼져 있음, 봇 이름 오타 등): `daemon: command "<cli>" exited with ...`
+- 데몬은 `orca` 명령의 종료를 기다리지 않고, 시간 제한도 두지 않아요.
+
+### 설정 절차
+
+1. `orca bot list`로 받을 봇 이름을 확인해요.
+2. `~/.areum/discord/config.json`에 `on_message_orca`를 넣어요.
+3. `discord daemon stop` 후 `discord daemon start`로 다시 띄워요.
+4. Discord에서 봇을 멘션하고, Orca에서 그 봇에게 `Discord 멘션: ...` 제목의 새 채팅이 열리는지 봐요.
 
 ## 확인 방법
 

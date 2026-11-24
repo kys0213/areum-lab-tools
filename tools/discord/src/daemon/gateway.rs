@@ -1,6 +1,6 @@
 //! Thin twilight-gateway wiring: keeps a `Shard` connected, feeds each
 //! `INTERACTION_CREATE` to the pure [`interactions`] logic and — when
-//! `on_message` is configured — each `MESSAGE_CREATE` to the
+//! `on_message`/`on_message_orca` is configured — each `MESSAGE_CREATE` to the
 //! [`message_trigger`], plus runs the periodic expire/cleanup passes. twilight
 //! owns Resume/reconnect/heartbeat and their backoff internally — our only
 //! responsibility is to stop the daemon on a fatal close code (the shard's
@@ -145,7 +145,8 @@ async fn dispatch(
     handle_interaction(api, store, &payload, &now_rfc3339()).await
 }
 
-/// Message intents are requested only when `on_message` is configured.
+/// Message intents are requested only when message detection is configured
+/// (`on_message` and/or `on_message_orca`).
 /// `MESSAGE_CONTENT` is privileged: if it is not enabled in the Developer
 /// Portal the gateway closes with 4014, so a daemon that does not use message
 /// detection must not ask for it.
@@ -173,7 +174,7 @@ async fn on_message_create<R: HookRunner>(
     };
     match result {
         Ok(Some(kind)) => eprintln!(
-            "daemon: message {} in {} -> on_message ({kind:?})",
+            "daemon: message {} in {} -> dispatched ({kind:?})",
             message.id, message.channel_id
         ),
         Ok(None) => {}
@@ -194,10 +195,10 @@ fn fatal_close_error(state: ShardState, close_code: Option<u16>) -> AppError {
         ) => AppError::new(
             ErrorKind::Config,
             format!(
-                "gateway closed with {} ({code}): message detection (`on_message` in config) \
+                "gateway closed with {} ({code}): message detection (`on_message`/`on_message_orca` in config) \
                  needs the privileged Message Content intent. Enable \"Message Content Intent\" \
                  under Bot > Privileged Gateway Intents in the Discord Developer Portal, or remove \
-                 `on_message` from config; daemon will not retry",
+                 `on_message`/`on_message_orca` from config; daemon will not retry",
                 code as u16
             ),
         ),

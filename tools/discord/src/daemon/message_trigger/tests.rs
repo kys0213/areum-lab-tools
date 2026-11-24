@@ -660,6 +660,7 @@ async fn stdin_payload_is_one_json_line_with_the_contract_fields() {
             "parent_channel_id": null,
             "is_thread": false,
             "message_id": "m1",
+            "message_url": format!("https://discord.com/channels/{GUILD}/c1/m1"),
             "content": "<@999> please look",
             "author": { "id": "u1", "username": "alice", "bot": false },
             "timestamp": "2026-10-04T01:02:03.000000+00:00",
@@ -829,4 +830,157 @@ async fn handles_a_twilight_message_create_round_trip() {
             .unwrap()
             .starts_with("2026-10-04T01:02:03")
     );
+}
+
+// ---- orca forward ----
+
+const ORCA: &str = "/opt/orca/bin/orca";
+
+fn orca_extra() -> String {
+    format!(r#","on_message_orca":{{"cli":"{ORCA}","bot":"요라"}}"#)
+}
+
+/// Settings with only the Orca forward: no `on_message`, no workdir.
+fn orca_only_settings() -> MessageTriggerSettings {
+    let config = parse(&format!(
+        r#"{{"issue_channels":["{ISSUE}"]{}}}"#,
+        orca_extra()
+    ));
+    MessageTriggerSettings::from_config(&config)
+        .unwrap()
+        .expect("on_message_orca alone enables detection")
+}
+
+/// Both `on_message` (default workdir) and the Orca forward.
+fn both_settings() -> MessageTriggerSettings {
+    settings_from(&format!(
+        r#","default_workdir":{}{}"#,
+        serde_json::to_string(default_dir().to_str().unwrap()).unwrap(),
+        orca_extra()
+    ))
+}
+
+fn orca_calls(runner: &FakeRunner) -> Vec<(Vec<String>, String)> {
+    runner
+        .calls
+        .borrow()
+        .iter()
+        .filter(|(argv, _)| argv[0] == ORCA)
+        .cloned()
+        .collect()
+}
+
+fn hook_calls(runner: &FakeRunner) -> usize {
+    runner
+        .calls
+        .borrow()
+        .iter()
+        .filter(|(argv, _)| argv[0] == HOOK)
+        .count()
+}
+
+#[test]
+fn settings_with_only_on_message_orca_need_no_workdir() {
+    orca_only_settings();
+}
+
+#[test]
+fn settings_reject_on_message_orca_with_a_relative_cli() {
+    let config = parse(r#"{"on_message_orca":{"cli":"orca","bot":"요라"}}"#);
+    let err = MessageTriggerSettings::from_config(&config).unwrap_err();
+    assert_eq!(err.kind, ErrorKind::Config);
+}
+
+#[tokio::test]
+async fn mention_runs_the_hook_and_forwards_to_orca() {
+    let runner = FakeRunner::new();
+    let api = api_with_channels(vec![thread("t1", "c1")]);
+
+    let outcome = trigger_with(both_settings(), &runner)
+        .handle(&api, &message("t1", &[BOT]))
+        .await
+        .unwrap();
+
+    assert_eq!(outcome, Some(Trigger::Mention));
+    assert_eq!(hook_calls(&runner), 1);
+    let orca = orca_calls(&runner);
+    assert_eq!(orca.len(), 1);
+    let (argv, body) = &orca[0];
+    assert!(argv.contains(&"bot:요라".to_owned()), "{argv:?}");
+    assert!(
+        body.contains(&format!("https://discord.com/channels/{GUILD}/t1/m1")),
+        "{body}"
+    );
+    assert!(
+        body.contains("discord --json send t1 --reply-to m1"),
+        "{body}"
+    );
+    assert!(body.contains(r#""parent_channel_id":"c1""#), "{body}");
+}
+
+#[tokio::test]
+async fn orca_only_settings_forward_without_running_a_hook() {
+    let runner = FakeRunner::new();
+    let api = api_with_channels(vec![text_channel("c1")]);
+
+    let outcome = trigger_with(orca_only_settings(), &runner)
+        .handle(&api, &message("c1", &[BOT]))
+        .await
+        .unwrap();
+
+    assert_eq!(outcome, Some(Trigger::Mention));
+    assert_eq!(runner.calls.borrow().len(), 1);
+    assert_eq!(orca_calls(&runner).len(), 1);
+    assert_eq!(runner.dirs.borrow().as_slice(), [PathBuf::from("/")]);
+}
+
+#[tokio::test]
+async fn filtered_message_is_not_forwarded_to_orca() {
+    let runner = FakeRunner::new();
+    let api = MockDiscordApi::new();
+
+    let outcome = trigger_with(both_settings(), &runner)
+        .handle(&api, &message("c1", &[]))
+        .await
+        .unwrap();
+
+    assert_eq!(outcome, None);
+    assert!(runner.calls.borrow().is_empty());
+}
+
+#[tokio::test]
+async fn unusable_workdir_still_forwards_to_orca_and_reports_the_hook_failure() {
+    let runner = FakeRunner::new();
+    let api = api_with_channels(vec![text_channel("c2")]);
+    let mapped = dir("orca-nodefault-other");
+    let extra = format!("{}{}", mapped_to("c1", &mapped), orca_extra());
+
+    let result = trigger_with(settings_from(&extra), &runner)
+        .handle(&api, &message("c2", &[BOT]))
+        .await;
+
+    let err = result.expect_err("the hook could not run");
+    assert!(err.message.contains("on_message"), "{}", err.message);
+    assert_eq!(hook_calls(&runner), 0);
+    assert_eq!(orca_calls(&runner).len(), 1);
+}
+
+#[tokio::test]
+async fn orca_start_failure_is_reported_after_the_hook_ran() {
+    let runner = FakeRunner::new();
+    {
+        let mut results = runner.results.borrow_mut();
+        results.push_back(Ok(()));
+        results.push_back(Err(AppError::new(ErrorKind::Internal, "spawn failed")));
+    }
+    let api = api_with_channels(vec![text_channel("c1")]);
+
+    let result = trigger_with(both_settings(), &runner)
+        .handle(&api, &message("c1", &[BOT]))
+        .await;
+
+    let err = result.expect_err("the orca forward could not start");
+    assert!(err.message.contains("on_message_orca"), "{}", err.message);
+    assert_eq!(hook_calls(&runner), 1);
+    assert_eq!(orca_calls(&runner).len(), 1);
 }
