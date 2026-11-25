@@ -9,7 +9,7 @@ clap = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 anyhow = { workspace = true }
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["process", "io-util"] }
 reqwest = { workspace = true }
 bytes = { workspace = true }
 mime_guess = { workspace = true }

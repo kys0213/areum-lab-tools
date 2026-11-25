@@ -29,6 +29,7 @@ use crate::common::time::now_rfc3339;
 use super::hook_runner::{HookRunner, ProcessHookRunner};
 use super::interactions::{ExpireRetryQueue, expire_and_disable, handle_interaction};
 use super::message_trigger::{MessageTrigger, MessageTriggerSettings};
+use super::orca_cli::{OrcaCli, ProcessOrcaCli};
 
 /// How often to scan for asks whose `timeout_at` has passed. A few seconds is
 /// timely enough for a human-in-the-loop deadline without busy-polling.
@@ -59,8 +60,8 @@ pub(crate) async fn run(
 ) -> Result<(), AppError> {
     let intents = gateway_intents(message_trigger.is_some());
     let mut shard = Shard::new(ShardId::ONE, token, intents);
-    let mut message_trigger =
-        message_trigger.map(|settings| MessageTrigger::new(settings, ProcessHookRunner));
+    let mut message_trigger = message_trigger
+        .map(|settings| MessageTrigger::new(settings, ProcessHookRunner, ProcessOrcaCli, store));
     // The code of the most recent gateway close frame; twilight emits it just
     // before ending the stream, so it explains a fatal close.
     let mut last_close_code: Option<u16> = None;
@@ -160,9 +161,9 @@ fn gateway_intents(message_detection: bool) -> Intents {
 
 /// Runs one `MESSAGE_CREATE` through the trigger. Failures are logged and the
 /// loop keeps serving — a bad message or hook must not stop the daemon.
-async fn on_message_create<R: HookRunner>(
+async fn on_message_create<R: HookRunner, O: OrcaCli>(
     api: &impl DiscordApi,
-    trigger: &mut MessageTrigger<R>,
+    trigger: &mut MessageTrigger<'_, R, O>,
     message: &MessageCreate,
 ) {
     let result = match serde_json::to_value(&message.0) {

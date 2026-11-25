@@ -1,4 +1,5 @@
-//! Shared SQLite-backed storage for HITL `ask` state. Both the CLI's `ask`
+//! Shared SQLite-backed storage for HITL `ask` state and the daemon's
+//! thread -> Orca chat mapping (`store/thread_chat.rs`). Both the CLI's `ask`
 //! command (`commands/ask.rs`) and the daemon's interaction handler
 //! (`daemon/interactions.rs`) open the same `~/.areum/discord/discord.db`
 //! file through this module — it owns the schema and the conditional updates
@@ -361,7 +362,7 @@ fn is_busy(err: &rusqlite::Error) -> bool {
 }
 
 /// Version the migration blocks in [`migrate`] bring the schema up to.
-const LATEST_SCHEMA_VERSION: i64 = 2;
+const LATEST_SCHEMA_VERSION: i64 = 3;
 
 /// Applies pending schema migrations, tracked via a single-row
 /// `schema_version` table. Safe to call on every `open` — a database already
@@ -411,6 +412,12 @@ fn migrate(conn: &mut Connection) -> Result<(), AppError> {
         tx.execute_batch(MIGRATE_ASKS_V2_SQL)
             .map_err(map_sqlite_err)?;
         tx.execute_batch("UPDATE schema_version SET version = 2")
+            .map_err(map_sqlite_err)?;
+    }
+    if current < 3 {
+        tx.execute_batch(thread_chat::CREATE_THREAD_CHATS_SQL)
+            .map_err(map_sqlite_err)?;
+        tx.execute_batch("UPDATE schema_version SET version = 3")
             .map_err(map_sqlite_err)?;
     }
 
@@ -489,6 +496,8 @@ fn normalize_utc(conn: &Connection, raw: &str) -> Result<String, AppError> {
 fn map_sqlite_err(err: rusqlite::Error) -> AppError {
     AppError::new(ErrorKind::Internal, format!("sqlite error: {err}"))
 }
+
+mod thread_chat;
 
 #[cfg(test)]
 mod tests;
