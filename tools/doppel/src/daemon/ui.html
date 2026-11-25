@@ -1,0 +1,454 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>doppel</title>
+<style>
+  :root {
+    --bg: #f6f6f4; --panel: #ffffff; --text: #1d1d1b; --muted: #6b6b66;
+    --line: #e2e2dd; --accent: #2f5fd0; --accent-text: #ffffff;
+    --warn: #b45309; --bad: #b42318; --ok: #157347;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #151514; --panel: #1f1f1d; --text: #ececea; --muted: #9a9a94;
+      --line: #33332f; --accent: #7fa2ff; --accent-text: #0b0b0a;
+      --warn: #f0a24a; --bad: #f07167; --ok: #5cc08a;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+         font: 15px/1.5 -apple-system, BlinkMacSystemFont, "Apple SD Gothic Neo", "Segoe UI", sans-serif; }
+  header { display: flex; align-items: baseline; gap: 12px; padding: 16px 20px; border-bottom: 1px solid var(--line); }
+  header h1 { font-size: 18px; margin: 0; }
+  header .status { color: var(--muted); font-size: 13px; }
+  main { display: grid; grid-template-columns: minmax(0, 3fr) minmax(0, 2fr); gap: 20px; padding: 20px; max-width: 1280px; margin: 0 auto; }
+  @media (max-width: 900px) { main { grid-template-columns: 1fr; padding: 16px; } }
+  h2 { font-size: 14px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); margin: 0 0 10px; }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px; margin-bottom: 12px; }
+  .empty { color: var(--muted); padding: 12px 0; }
+  .meta { color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
+  .question { font-weight: 600; margin: 8px 0 6px; }
+  .options { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 6px; }
+  button { font: inherit; border: 1px solid var(--line); background: var(--bg); color: var(--text);
+           border-radius: 8px; padding: 6px 12px; cursor: pointer; text-align: left; }
+  button:hover { border-color: var(--accent); }
+  button.primary { background: var(--accent); color: var(--accent-text); border-color: var(--accent); }
+  button .desc { display: block; font-size: 12px; color: var(--muted); }
+  button.primary .desc { color: inherit; opacity: .8; }
+  button.selected { border-color: var(--accent); box-shadow: inset 0 0 0 1px var(--accent); }
+  .other { display: flex; gap: 8px; margin-top: 8px; }
+  .other input { flex: 1; min-width: 0; font: inherit; padding: 6px 10px; border-radius: 8px;
+                 border: 1px solid var(--line); background: var(--bg); color: var(--text); }
+  table { width: 100%; border-collapse: collapse; }
+  td, th { text-align: left; padding: 8px 6px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  th { font-size: 12px; color: var(--muted); font-weight: 500; }
+  .state { font-size: 12px; padding: 2px 8px; border-radius: 999px; border: 1px solid var(--line); white-space: nowrap; }
+  .state.waiting_ask, .state.waiting_permission { color: var(--warn); border-color: var(--warn); }
+  .state.failing, .state.stalled, .state.disconnected { color: var(--bad); border-color: var(--bad); }
+  .state.running { color: var(--ok); border-color: var(--ok); }
+  .summary { color: var(--muted); font-size: 13px; }
+  .brief { border-left: 3px solid var(--accent); padding: 6px 10px; margin: 10px 0 4px; background: var(--bg); border-radius: 0 8px 8px 0; }
+  .brief .label { font-size: 12px; color: var(--accent); font-weight: 600; }
+  .brief .why { font-size: 13px; margin-top: 2px; }
+  .brief.failed { border-left-color: var(--bad); }
+  .brief.failed .label { color: var(--bad); }
+  .table-wrap { overflow-x: auto; }
+  .nowrap { white-space: nowrap; }
+  .board { grid-column: 1 / -1; }
+  .columns { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; }
+  @media (max-width: 900px) { .columns { grid-template-columns: 1fr; } }
+  .column h3 { font-size: 13px; margin: 0 0 8px; color: var(--muted); font-weight: 600; }
+  .ticket .title { font-weight: 600; overflow-wrap: anywhere; }
+  .ticket .body, .ticket .outcome { font-size: 13px; white-space: pre-wrap; overflow-wrap: anywhere; margin-top: 6px; }
+  .ticket .outcome { border-left: 3px solid var(--ok); padding-left: 8px; }
+  .ticket .error { font-size: 13px; color: var(--bad); margin-top: 6px; }
+  .row { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 8px; }
+  .row input, .row textarea, .row select { flex: 1; min-width: 0; font: inherit; padding: 6px 10px; border-radius: 8px;
+                 border: 1px solid var(--line); background: var(--bg); color: var(--text); }
+  .row textarea { min-height: 60px; flex-basis: 100%; }
+  #projects { white-space: pre-line; }
+  .forms { display: grid; grid-template-columns: minmax(0, 3fr) minmax(0, 2fr); gap: 12px; margin-bottom: 12px; }
+  @media (max-width: 900px) { .forms { grid-template-columns: 1fr; } }
+</style>
+</head>
+<body>
+<header>
+  <h1>doppel</h1>
+  <span class="status" id="status">연결 중…</span>
+</header>
+<main>
+  <section>
+    <h2>답을 기다리는 질문</h2>
+    <div id="inbox"></div>
+  </section>
+  <section>
+    <h2>세션</h2>
+    <div class="card table-wrap">
+      <table>
+        <thead><tr><th>상태</th><th>세션</th><th class="nowrap">마지막</th></tr></thead>
+        <tbody id="sessions"></tbody>
+      </table>
+    </div>
+  </section>
+  <section class="board">
+    <h2>작업 보드</h2>
+    <div class="forms">
+      <div class="card">
+        <div class="meta">새 작업</div>
+        <div class="row"><input id="card-title" placeholder="제목"></div>
+        <div class="row"><textarea id="card-body" placeholder="내용 (선택)"></textarea></div>
+        <div class="row"><button class="primary" onclick="addCard()">받은 작업에 넣기</button></div>
+      </div>
+      <div class="card">
+        <div class="meta">프로젝트</div>
+        <div id="projects" class="meta"></div>
+        <div class="row"><input id="project-name" placeholder="이름"><input id="project-path" placeholder="절대 경로"></div>
+        <div class="row"><button onclick="addProject()">프로젝트 추가</button></div>
+      </div>
+    </div>
+    <div class="columns" id="columns"></div>
+    <div class="meta" id="done-count"></div>
+  </section>
+</main>
+<script>
+const STATE_LABEL = {
+  running: "진행 중", waiting_ask: "질문 대기", waiting_permission: "권한 대기",
+  waiting_turn: "입력 대기", stalled: "정체", failing: "반복 실패",
+  disconnected: "끊김", ended: "종료",
+};
+
+function el(tag, attrs, children) {
+  const node = document.createElement(tag);
+  for (const [key, value] of Object.entries(attrs || {})) {
+    if (key === "class") node.className = value;
+    else if (key.startsWith("on")) node.addEventListener(key.slice(2), value);
+    else node.setAttribute(key, value);
+  }
+  for (const child of [].concat(children || [])) {
+    node.append(child instanceof Node ? child : document.createTextNode(String(child)));
+  }
+  return node;
+}
+
+async function api(path, body) {
+  const response = await fetch(path, body === undefined ? {} : {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "X-Doppel-Client": "ui" },
+    body: JSON.stringify(body),
+  });
+  const data = await response.json();
+  if (!response.ok) throw new Error(data.error ? data.error.message : response.statusText);
+  return data;
+}
+
+function shortTime(at) { return at ? at.slice(5, 16).replace("T", " ") : ""; }
+function shortId(id) { return id.length > 12 ? id.slice(0, 8) : id; }
+
+function renderSessions(sessions) {
+  const body = document.getElementById("sessions");
+  body.replaceChildren();
+  if (sessions.length === 0) {
+    body.append(el("tr", {}, el("td", { colspan: "3", class: "empty" }, "연결된 세션이 없습니다")));
+    return;
+  }
+  for (const s of sessions) {
+    body.append(el("tr", {}, [
+      el("td", {}, el("span", { class: "state " + s.state }, STATE_LABEL[s.state] || s.state)),
+      el("td", {}, [
+        el("div", {}, (s.cwd || "-") + "  "),
+        el("div", { class: "meta" }, shortId(s.session_id) + " · " + s.surface + (s.open_asks ? " · 질문 " + s.open_asks : "")),
+        s.last_summary ? el("div", { class: "summary" }, s.last_summary) : "",
+      ]),
+      el("td", { class: "meta nowrap" }, shortTime(s.last_event_at)),
+    ]));
+  }
+}
+
+const CONFIDENCE = { low: "확신 낮음", medium: "확신 보통", high: "확신 높음" };
+
+function answerText(answers) {
+  return Object.entries(answers).map(([q, a]) => (Array.isArray(a) ? a.join(", ") : a)).join(" / ");
+}
+
+function briefBlock(ask) {
+  const brief = ask.brief;
+  if (!brief) return "";
+  if (brief.state === "pending") {
+    return el("div", { class: "brief" }, el("div", { class: "label" }, "doppel 이 판례를 살펴보는 중…"));
+  }
+  if (brief.state === "failed") {
+    return el("div", { class: "brief failed" }, [
+      el("div", { class: "label" }, "브리프를 만들지 못했습니다"),
+      el("div", { class: "meta" }, brief.error || ""),
+    ]);
+  }
+  const facts = [CONFIDENCE[brief.confidence] || brief.confidence];
+  if (brief.reversible === true) facts.push("되돌리기 쉬움");
+  if (brief.reversible === false) facts.push("되돌리기 어려움");
+  if (brief.cited && brief.cited.length) facts.push("판례 " + brief.cited.join(", "));
+  const block = el("div", { class: "brief" }, [
+    el("div", { class: "label" }, brief.recommendation
+      ? "doppel 추천: " + answerText(brief.recommendation)
+      : "doppel 새 의견"),
+    brief.new_opinion && !brief.recommendation ? el("div", { class: "why" }, brief.new_opinion) : "",
+    el("div", { class: "why" }, brief.rationale || ""),
+    brief.background ? el("div", { class: "meta" }, brief.background) : "",
+    el("div", { class: "meta" }, facts.join(" · ")),
+  ]);
+  if (brief.recommendation) {
+    block.append(el("div", { class: "options" }, el("button", {
+      class: "primary",
+      onclick: () => sendAnswers(ask, brief.recommendation),
+    }, "추천 수락")));
+  }
+  return block;
+}
+
+async function sendAnswers(ask, answers) {
+  try {
+    await api("/v1/asks/" + ask.ask_id + "/answer", { answers, answered_by: "doppel-ui" });
+  } catch (error) {
+    alert("답을 보내지 못했습니다: " + error.message);
+  }
+  refresh();
+}
+
+function questionBlock(ask, question, picked) {
+  const multi = Boolean(question.multiSelect);
+  const options = el("div", { class: "options" });
+  for (const option of question.options || []) {
+    const button = el("button", {
+      onclick: () => {
+        if (multi) {
+          const set = picked[question.question] || (picked[question.question] = new Set());
+          set.has(option.label) ? set.delete(option.label) : set.add(option.label);
+          button.classList.toggle("selected");
+        } else {
+          picked[question.question] = option.label;
+          submit(ask, picked);
+        }
+      },
+    }, [option.label, option.description ? el("span", { class: "desc" }, option.description) : ""]);
+    options.append(button);
+  }
+  const input = el("input", { placeholder: "직접 입력" });
+  const other = el("div", { class: "other" }, [input, el("button", {
+    onclick: () => {
+      if (!input.value.trim()) return;
+      picked[question.question] = multi ? new Set([input.value.trim()]) : input.value.trim();
+      submit(ask, picked);
+    },
+  }, "보내기")]);
+  return el("div", {}, [el("div", { class: "question" }, question.question), options, other]);
+}
+
+async function submit(ask, picked) {
+  const answers = {};
+  for (const question of ask.questions) {
+    const value = picked[question.question];
+    if (value === undefined || (value instanceof Set && value.size === 0)) return;
+    answers[question.question] = value instanceof Set ? [...value] : value;
+  }
+  sendAnswers(ask, answers);
+}
+
+function renderInbox(asks) {
+  const inbox = document.getElementById("inbox");
+  inbox.replaceChildren();
+  const waiting = asks.filter(a => a.state === "open" || a.state === "deferred");
+  if (waiting.length === 0) {
+    inbox.append(el("div", { class: "empty" }, "기다리는 질문이 없습니다"));
+    return;
+  }
+  for (const ask of waiting) {
+    const picked = {};
+    const card = el("div", { class: "card" }, [
+      el("div", { class: "meta" }, (ask.kind === "permission" ? "권한 확인" : "질문") + " · " +
+        shortId(ask.session_id) + " · " + shortTime(ask.created_at) + (ask.state === "deferred" ? " · 보류됨" : "")),
+    ]);
+    card.append(briefBlock(ask));
+    for (const question of ask.questions) card.append(questionBlock(ask, question, picked));
+    if (ask.questions.some(q => q.multiSelect)) {
+      card.append(el("div", { class: "options" }, el("button", { class: "primary", onclick: () => submit(ask, picked) }, "선택 보내기")));
+    }
+    inbox.append(card);
+  }
+}
+
+const COLUMNS = [
+  ["inbox", "받은 작업"], ["triaged", "배정됨"], ["running", "실행 중"], ["review", "확인 대기"],
+];
+const PRIORITIES = ["P0", "P1", "P2", "P3"];
+let projects = [];
+
+async function act(path, body) {
+  try {
+    await api(path, body || {});
+  } catch (error) {
+    alert(error.message);
+  }
+  refresh();
+}
+
+async function addCard() {
+  const title = document.getElementById("card-title");
+  const body = document.getElementById("card-body");
+  if (!title.value.trim()) return;
+  await act("/v1/cards", { source: "ui", external_id: "ui-" + Date.now(), title: title.value.trim(), body: body.value });
+  title.value = ""; body.value = "";
+}
+
+async function addProject() {
+  const name = document.getElementById("project-name");
+  const path = document.getElementById("project-path");
+  if (!name.value.trim() || !path.value.trim()) return;
+  await act("/v1/projects", { name: name.value.trim(), path: path.value.trim() });
+  name.value = ""; path.value = "";
+}
+
+function select(values, current) {
+  const node = el("select");
+  for (const value of values) {
+    const option = el("option", { value }, value);
+    if (value === current) option.selected = true;
+    node.append(option);
+  }
+  return node;
+}
+
+function triageRow(card) {
+  if (projects.length === 0) return el("div", { class: "meta" }, "프로젝트를 먼저 추가하세요");
+  const project = select(projects.map(p => p.name), card.project);
+  const priority = select(PRIORITIES, card.priority);
+  return el("div", { class: "row" }, [project, priority, el("button", {
+    onclick: () => act("/v1/cards/" + card.card_id + "/triage", { project: project.value, priority: priority.value }),
+  }, card.state === "inbox" ? "배정" : "다시 배정")]);
+}
+
+function proposalBlock(card) {
+  const p = card.proposal;
+  if (!p) return "";
+  if (p.state === "pending") {
+    return el("div", { class: "brief" }, el("div", { class: "label" }, "doppel 이 배정을 살펴보는 중…"));
+  }
+  if (p.state === "failed") {
+    return el("div", { class: "brief failed" }, [
+      el("div", { class: "label" }, "배정 제안을 만들지 못했습니다"),
+      el("div", { class: "meta" }, p.error || ""),
+    ]);
+  }
+  const facts = [CONFIDENCE[p.confidence] || p.confidence];
+  if (p.applied) facts.push("doppel 이 자동 배정함");
+  if (p.accepted === true) facts.push("수락됨");
+  if (p.accepted === false) facts.push("뒤집힘");
+  if (p.cited && p.cited.length) facts.push("판례 " + p.cited.join(", "));
+  const block = el("div", { class: "brief" }, [
+    el("div", { class: "label" }, "doppel 제안: " + (p.project || "맞는 프로젝트 없음") + " · " + p.priority),
+    el("div", { class: "why" }, p.rationale || ""),
+    el("div", { class: "meta" }, facts.join(" · ")),
+  ]);
+  if (card.state === "inbox" && p.project) {
+    block.append(el("div", { class: "options" }, el("button", {
+      class: "primary",
+      onclick: () => act("/v1/cards/" + card.card_id + "/triage", { project: p.project, priority: p.priority }),
+    }, "제안대로 배정")));
+  }
+  return block;
+}
+
+async function sendBack(id, input) {
+  const note = input.value.trim();
+  try {
+    await api("/v1/cards/" + id + "/release", { reason: note || "다시 시킴" });
+    await api("/v1/cards/" + id + "/dispatch", { resume: true, note: note || null });
+  } catch (error) {
+    alert(error.message);
+  }
+  refresh();
+}
+
+function ticket(card) {
+  const node = el("div", { class: "card ticket" }, [
+    el("div", { class: "meta" }, card.priority + " · " + (card.project || "미배정") + " · " + card.source + " · " + shortTime(card.updated_at) +
+      (card.proposal && card.proposal.applied ? " · doppel 이 자동 배정" : "")),
+    el("div", { class: "title" }, card.title),
+    card.body ? el("div", { class: "body" }, card.body) : "",
+    card.last_error ? el("div", { class: "error" }, card.last_error) : "",
+  ]);
+  const id = card.card_id;
+  if (card.state === "inbox" || card.state === "triaged") node.append(proposalBlock(card));
+  if (card.state === "inbox" || card.state === "triaged") node.append(triageRow(card));
+  const buttons = el("div", { class: "row" });
+  if (card.state === "inbox" && card.proposal && card.proposal.state !== "pending") {
+    buttons.append(el("button", { onclick: () => act("/v1/cards/" + id + "/propose") }, "제안 다시 받기"));
+  }
+  if (card.state === "triaged") {
+    buttons.append(el("button", { class: "primary", onclick: () => act("/v1/cards/" + id + "/dispatch") }, card.session_id ? "새로 실행" : "실행"));
+    if (card.session_id) {
+      buttons.append(el("button", { onclick: () => act("/v1/cards/" + id + "/dispatch", { resume: true }) }, "이어서 실행"));
+    }
+  }
+  if (card.state === "running") {
+    if (card.session_id) node.append(el("div", { class: "meta" }, "세션 " + shortId(card.session_id)));
+    buttons.append(el("button", { onclick: () => act("/v1/cards/" + id + "/release", { reason: "UI 에서 멈춤" }) }, "멈추기"));
+  }
+  if (card.state === "review") {
+    node.append(el("div", { class: "outcome" }, card.outcome || ""));
+    const feedback = el("input", { placeholder: "고칠 점 (같은 세션에 이어서 전달)" });
+    node.append(el("div", { class: "row" }, [feedback, el("button", { onclick: () => sendBack(id, feedback) }, "다시 시키기")]));
+    buttons.append(el("button", { class: "primary", onclick: () => act("/v1/cards/" + id + "/done") }, "완료"));
+  }
+  if (card.state !== "running" && card.state !== "review") {
+    buttons.append(el("button", { onclick: () => act("/v1/cards/" + id + "/done") }, "닫기"));
+  }
+  node.append(buttons);
+  return node;
+}
+
+function renderBoard(cards) {
+  document.getElementById("projects").textContent =
+    projects.length ? projects.map(p => p.name + " — " + p.path).join("\n") : "등록된 프로젝트가 없습니다";
+  const columns = document.getElementById("columns");
+  columns.replaceChildren();
+  for (const [state, label] of COLUMNS) {
+    const mine = cards.filter(c => c.state === state);
+    const column = el("div", { class: "column" }, el("h3", {}, label + " " + mine.length));
+    if (mine.length === 0) column.append(el("div", { class: "empty" }, "없음"));
+    for (const card of mine) column.append(ticket(card));
+    columns.append(column);
+  }
+  const done = cards.filter(c => c.state === "done").length;
+  document.getElementById("done-count").textContent = done ? "완료 " + done + "건" : "";
+}
+
+async function refresh() {
+  try {
+    const [sessions, asks, cards, projectList] = await Promise.all([
+      api("/v1/sessions"), api("/v1/asks"), api("/v1/cards"), api("/v1/projects"),
+    ]);
+    renderSessions(sessions.sessions);
+    renderInbox(asks.asks);
+    projects = projectList.projects;
+    renderBoard(cards.cards);
+  } catch (error) {
+    document.getElementById("status").textContent = "불러오지 못함: " + error.message;
+  }
+}
+
+function connect() {
+  const socket = new WebSocket("ws://" + location.host + "/v1/ui");
+  socket.onopen = () => { document.getElementById("status").textContent = "연결됨"; refresh(); };
+  socket.onmessage = () => refresh();
+  socket.onclose = () => {
+    document.getElementById("status").textContent = "끊김 — 다시 연결하는 중";
+    setTimeout(connect, 2000);
+  };
+}
+
+connect();
+setInterval(refresh, 30000);
+</script>
+</body>
+</html>

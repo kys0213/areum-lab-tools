@@ -4,7 +4,9 @@
 # Spins up a local `python3 -m http.server` per case, serving a fake
 # GitHub-releases-shaped fixture tree, and runs install.sh against it via the
 # AREUM_API_BASE / AREUM_DOWNLOAD_BASE / INSTALL_ROOT overrides. No network
-# access and no real GitHub release is required.
+# access and no real GitHub release is required. The host platform is pinned
+# through AREUM_OS / AREUM_ARCH (Darwin/arm64 unless a case says otherwise),
+# so the suite runs the same on any machine.
 #
 # Usage: scripts/install_test.sh
 set -u
@@ -99,6 +101,7 @@ releases_fixture() {
 # run_install <www_dir> <install_root> <tool> [version]
 # Starts a server for <www_dir>, runs install.sh, stops the server, and
 # leaves stdout/stderr in $STDOUT_LOG/$STDERR_LOG plus the exit code in $RC.
+# TEST_OS / TEST_ARCH pick the pretended host (default Darwin/arm64).
 run_install() {
 	www="$1"
 	install_root="$2"
@@ -114,7 +117,8 @@ run_install() {
 		return
 	}
 
-	AREUM_API_BASE="$BASE_URL/api" AREUM_DOWNLOAD_BASE="$BASE_URL/download" INSTALL_ROOT="$install_root" \
+	AREUM_OS="${TEST_OS:-Darwin}" AREUM_ARCH="${TEST_ARCH:-arm64}" \
+		AREUM_API_BASE="$BASE_URL/api" AREUM_DOWNLOAD_BASE="$BASE_URL/download" INSTALL_ROOT="$install_root" \
 		"$INSTALL_SH" "$tool" "$version" >"$STDOUT_LOG" 2>"$STDERR_LOG"
 	RC=$?
 	stop_server
@@ -263,6 +267,7 @@ case_make_install_release_spaces() {
 	# VERSION is intentionally left unset: the recipe must both quote its
 	# variables and still behave as "latest" when no version is given.
 	( cd "$repo_root" &&
+		AREUM_OS=Darwin AREUM_ARCH=arm64 \
 		AREUM_API_BASE="$BASE_URL/api" AREUM_DOWNLOAD_BASE="$BASE_URL/download" \
 			make install-release TOOL=discord INSTALL_ROOT="$install_root" ) \
 		>"$STDOUT_LOG" 2>"$STDERR_LOG"
@@ -285,11 +290,93 @@ case_make_install_release_spaces() {
 	pass "$label"
 }
 
+# --- (f) an Intel mac installs the x86_64 build ---
+case_intel_mac_target() {
+	label="(f) Intel mac picks the x86_64-apple-darwin asset"
+	case_dir="$WORK_DIR/case_f"
+	www="$case_dir/www"
+
+	releases_fixture "$www" '[
+  {"tag_name": "doppel-v0.1.0"}
+]'
+	make_asset "$www/download/doppel-v0.1.0/doppel-0.1.0-aarch64-apple-darwin.tar.gz" "doppel" "WRONG-arm64-binary"
+	make_asset "$www/download/doppel-v0.1.0/doppel-0.1.0-x86_64-apple-darwin.tar.gz" "doppel" "doppel-x86_64-ok"
+
+	install_root="$case_dir/install_root"
+	TEST_ARCH=x86_64 run_install "$www" "$install_root" "doppel"
+
+	if [ "$RC" -ne 0 ]; then
+		fail "$label: install.sh exited $RC (expected 0); stderr: $(cat "$STDERR_LOG")"
+		return
+	fi
+	output="$("$install_root/bin/doppel")"
+	if [ "$output" != "doppel-x86_64-ok" ]; then
+		fail "$label: installed the wrong target (got '$output')"
+		return
+	fi
+	pass "$label"
+}
+
+# --- (g) a release without a build for this target errors before downloading ---
+case_missing_target_asset() {
+	label="(g) missing target build errors clearly"
+	case_dir="$WORK_DIR/case_g"
+	www="$case_dir/www"
+
+	releases_fixture "$www" '[
+  {"tag_name": "discord-v1.0.0"}
+]'
+	make_asset "$www/download/discord-v1.0.0/discord-1.0.0-aarch64-apple-darwin.tar.gz" "discord" "discord-arm64"
+
+	install_root="$case_dir/install_root"
+	TEST_ARCH=x86_64 run_install "$www" "$install_root" "discord"
+
+	if [ "$RC" -eq 0 ]; then
+		fail "$label: install.sh exited 0, expected non-zero without an x86_64 build"
+		return
+	fi
+	if ! grep -q "has no x86_64-apple-darwin build" "$STDERR_LOG"; then
+		fail "$label: expected error message not found in stderr: $(cat "$STDERR_LOG")"
+		return
+	fi
+	if [ -e "$install_root/bin/discord" ]; then
+		fail "$label: a binary was installed anyway"
+		return
+	fi
+	pass "$label"
+}
+
+# --- (h) an unsupported OS is refused before any request ---
+case_unsupported_os() {
+	label="(h) unsupported OS is refused"
+	case_dir="$WORK_DIR/case_h"
+	www="$case_dir/www"
+
+	releases_fixture "$www" '[
+  {"tag_name": "discord-v1.0.0"}
+]'
+	install_root="$case_dir/install_root"
+	TEST_OS=Linux TEST_ARCH=x86_64 run_install "$www" "$install_root" "discord"
+
+	if [ "$RC" -eq 0 ]; then
+		fail "$label: install.sh exited 0 on Linux"
+		return
+	fi
+	if ! grep -q "unsupported platform (Linux/x86_64)" "$STDERR_LOG"; then
+		fail "$label: expected error message not found in stderr: $(cat "$STDERR_LOG")"
+		return
+	fi
+	pass "$label"
+}
+
 case_normal_install
 case_checksum_mismatch
 case_no_release
 case_similar_name_guard
 case_make_install_release_spaces
+case_intel_mac_target
+case_missing_target_asset
+case_unsupported_os
 
 if [ "$FAIL" -ne 0 ]; then
 	echo "install.sh smoke tests: FAILED"

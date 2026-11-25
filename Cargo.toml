@@ -22,6 +22,16 @@ rusqlite = { version = "0.40", features = ["bundled"] }
 # (bundled roots, no platform-native verifier dep).
 twilight-gateway = { version = "0.17", default-features = false, features = ["rustls-webpki-roots"] }
 twilight-model = "0.17"
+# HTTP + WebSocket server for the doppel daemon, served on a Unix socket and a
+# loopback TCP port from one router.
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "query", "tokio", "ws"] }
+# Client side of the doppel daemon's Unix socket: plain HTTP/1 requests (hyper)
+# and the attach WebSocket (tokio-tungstenite).
+hyper = { version = "1", features = ["client", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
+tokio-tungstenite = { version = "0.28", default-features = false, features = ["handshake"] }
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 # Unix process signalling (kill(2) liveness probe + SIGTERM) for daemon stop/status.
 libc = "0.2"
 

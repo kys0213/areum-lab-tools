@@ -19,15 +19,22 @@ if [ -z "$TOOL" ]; then
 	exit 1
 fi
 
-# Only aarch64-apple-darwin release artifacts exist today; fail fast rather
-# than downloading a binary that won't run.
-OS="$(uname -s)"
-ARCH="$(uname -m)"
-if [ "$OS" != "Darwin" ] || [ "$ARCH" != "arm64" ]; then
-	echo "error: unsupported platform ($OS/$ARCH) - only Darwin/arm64 (aarch64-apple-darwin) is supported" >&2
+# Map the host to a release target. Only macOS is released today; another OS
+# gets its own mapping here (Linux) or its own installer (Windows
+# install.ps1) when a tool starts shipping for it. Which targets a given tool
+# ships is per tool (tools/<tool>/release-targets), so a mapped target can
+# still be missing for that tool - checked below before downloading.
+# AREUM_OS / AREUM_ARCH override uname for the smoke tests.
+OS="${AREUM_OS:-$(uname -s)}"
+ARCH="${AREUM_ARCH:-$(uname -m)}"
+case "$OS/$ARCH" in
+Darwin/arm64) TARGET="aarch64-apple-darwin" ;;
+Darwin/x86_64) TARGET="x86_64-apple-darwin" ;;
+*)
+	echo "error: unsupported platform ($OS/$ARCH) - only macOS (arm64, x86_64) is supported" >&2
 	exit 1
-fi
-TARGET="aarch64-apple-darwin"
+	;;
+esac
 
 API_BASE="${AREUM_API_BASE:-https://api.github.com}"
 DOWNLOAD_BASE="${AREUM_DOWNLOAD_BASE:-https://github.com/kys0213/areum-lab-tools/releases/download}"
@@ -63,8 +70,13 @@ DOWNLOAD_URL="$DOWNLOAD_BASE/$RELEASE_TAG/$ASSET"
 WORK_DIR="$(mktemp -d)"
 trap 'rm -rf "$WORK_DIR"' EXIT
 
+# The checksum is fetched first: a missing one means this release has no
+# build for this target, which deserves a clear error rather than a bare 404.
+if ! curl -fsSL -o "$WORK_DIR/$ASSET.sha256" "$DOWNLOAD_URL.sha256" 2>/dev/null; then
+	echo "error: $TOOL $VERSION has no $TARGET build (missing $ASSET)" >&2
+	exit 1
+fi
 curl -fsSL -o "$WORK_DIR/$ASSET" "$DOWNLOAD_URL"
-curl -fsSL -o "$WORK_DIR/$ASSET.sha256" "$DOWNLOAD_URL.sha256"
 
 # Fail fast on any checksum mismatch rather than installing an unverified
 # binary. Run from within WORK_DIR so the .sha256's recorded filename
