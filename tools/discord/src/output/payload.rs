@@ -53,6 +53,15 @@ pub struct ThreadData {
     pub name: String,
 }
 
+/// `react` result. `removed` is false for an added reaction.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReactData {
+    pub channel_id: String,
+    pub message_id: String,
+    pub emoji: String,
+    pub removed: bool,
+}
+
 /// `daemon start` result. `foreground` distinguishes a background launch
 /// (reports the detached child's pid) from a foreground run (reports this
 /// process's pid, emitted on graceful shutdown).
@@ -136,6 +145,7 @@ pub enum Payload {
     Read(ReadData),
     Wait(WaitData),
     Thread(ThreadData),
+    React(ReactData),
     DaemonStart(DaemonStartData),
     DaemonStop(DaemonStopData),
     DaemonStatus(DaemonStatusData),
@@ -192,6 +202,14 @@ impl Payload {
                 format_messages(&d.messages)
             ),
             Payload::Thread(d) => format!("created thread {} \"{}\"", d.thread_id, d.name),
+            Payload::React(d) if d.removed => format!(
+                "removed reaction {} from message {} in channel {}",
+                d.emoji, d.message_id, d.channel_id
+            ),
+            Payload::React(d) => format!(
+                "added reaction {} to message {} in channel {}",
+                d.emoji, d.message_id, d.channel_id
+            ),
             Payload::DaemonStart(d) if d.foreground => {
                 format!("daemon exited (pid {})", d.pid)
             }
@@ -561,6 +579,27 @@ mod tests {
         });
         let (_, text, _) = render("ask", &Ok(ask_expired), false);
         assert_eq!(text, "ask 111: timed out, no answer");
+    }
+
+    #[test]
+    fn human_react_renders_added_and_removed() {
+        let added = ReactData {
+            channel_id: "chan1".into(),
+            message_id: "msg1".into(),
+            emoji: "✅".into(),
+            removed: false,
+        };
+        let removed = ReactData {
+            removed: true,
+            ..added.clone()
+        };
+        let (_, text, _) = render("react", &Ok(Payload::React(added)), false);
+        assert_eq!(text, "added reaction ✅ to message msg1 in channel chan1");
+        let (_, text, _) = render("react", &Ok(Payload::React(removed)), false);
+        assert_eq!(
+            text,
+            "removed reaction ✅ from message msg1 in channel chan1"
+        );
     }
 
     #[test]

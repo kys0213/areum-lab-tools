@@ -34,6 +34,10 @@ pub struct Config {
     /// the same trigger filter as a person's. Empty keeps every bot ignored.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub trigger_bots: Vec<String>,
+    /// Emoji the daemon reacts with on each detected message (unicode, or a
+    /// custom emoji as `name:id`). Absent means no reaction.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ack_reaction: Option<String>,
     /// Directory for channels without a `workdirs` entry.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_workdir: Option<String>,

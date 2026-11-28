@@ -45,6 +45,21 @@ pub(crate) struct MockDiscordApi {
     /// When set, `get_channel` records the call and then never completes,
     /// standing in for a lookup that hangs (tests drive it with paused time).
     pub(crate) channel_hangs: Cell<bool>,
+    pub(crate) reaction_responses: RefCell<VecDeque<Result<(), AppError>>>,
+    /// One entry per `add_reaction` / `remove_reaction` call.
+    pub(crate) reaction_calls: RefCell<Vec<ReactionCall>>,
+    /// When set, reaction calls record themselves and then never complete,
+    /// standing in for a Discord response that hangs.
+    pub(crate) reaction_hangs: Cell<bool>,
+}
+
+/// A recorded reaction call: `remove` is false for `add_reaction`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ReactionCall {
+    pub(crate) remove: bool,
+    pub(crate) channel_id: String,
+    pub(crate) message_id: String,
+    pub(crate) emoji: String,
 }
 
 impl MockDiscordApi {
@@ -63,6 +78,9 @@ impl MockDiscordApi {
             channel_responses: RefCell::new(VecDeque::new()),
             channel_calls: RefCell::new(Vec::new()),
             channel_hangs: Cell::new(false),
+            reaction_responses: RefCell::new(VecDeque::new()),
+            reaction_calls: RefCell::new(Vec::new()),
+            reaction_hangs: Cell::new(false),
         }
     }
 
@@ -156,6 +174,52 @@ impl DiscordApi for MockDiscordApi {
             .borrow_mut()
             .pop_front()
             .expect("test must queue a channel response before calling get_channel")
+    }
+
+    async fn add_reaction(
+        &self,
+        channel_id: &str,
+        message_id: &str,
+        emoji: &str,
+    ) -> Result<(), AppError> {
+        self.record_reaction(false, channel_id, message_id, emoji)
+            .await
+    }
+
+    async fn remove_reaction(
+        &self,
+        channel_id: &str,
+        message_id: &str,
+        emoji: &str,
+    ) -> Result<(), AppError> {
+        self.record_reaction(true, channel_id, message_id, emoji)
+            .await
+    }
+}
+
+impl MockDiscordApi {
+    async fn record_reaction(
+        &self,
+        remove: bool,
+        channel_id: &str,
+        message_id: &str,
+        emoji: &str,
+    ) -> Result<(), AppError> {
+        self.reaction_calls.borrow_mut().push(ReactionCall {
+            remove,
+            channel_id: channel_id.to_owned(),
+            message_id: message_id.to_owned(),
+            emoji: emoji.to_owned(),
+        });
+        if self.reaction_hangs.get() {
+            std::future::pending::<()>().await;
+        }
+        // Default to success so trigger tests that do not care about the
+        // reaction need not script one.
+        self.reaction_responses
+            .borrow_mut()
+            .pop_front()
+            .unwrap_or(Ok(()))
     }
 }
 

@@ -127,6 +127,16 @@ async fn run(cli: Cli) -> Result<Payload, AppError> {
             let channel_id = config::resolve_channel(&channel, &channels);
             commands::run_thread_create(&api, &channel_id, &name, from_message.as_deref()).await
         }
+        Command::React {
+            channel,
+            message_id,
+            emoji,
+            remove,
+        } => {
+            let (api, channels) = authenticated_api(&config_path, cli.token.as_deref())?;
+            let channel_id = config::resolve_channel(&channel, &channels);
+            commands::run_react(&api, &channel_id, &message_id, &emoji, remove).await
+        }
         Command::Daemon(daemon_cmd) => {
             let db_path = config::default_db_path()?;
             let pid_path = config::default_pid_path()?;

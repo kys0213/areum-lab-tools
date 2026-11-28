@@ -43,7 +43,7 @@ mod tests {
     use super::*;
     use crate::common::api::{Attachment, Author, Message};
     use crate::common::error::ErrorKind;
-    use crate::output::payload::{InitData, ReadData, SendData, ThreadData, WaitData};
+    use crate::output::payload::{InitData, ReactData, ReadData, SendData, ThreadData, WaitData};
     use crate::output::{Sink, render};
 
     fn sample_message() -> Message {
@@ -354,6 +354,23 @@ mod tests {
         assert_eq!(
             json,
             r#"{"ok":true,"command":"ask","data":{"status":"pending","ask_id":"111","timed_out":true}}"#
+        );
+    }
+
+    #[test]
+    fn react_success_matches_contract() {
+        let payload = Payload::React(ReactData {
+            channel_id: "chan1".into(),
+            message_id: "msg1".into(),
+            emoji: "✅".into(),
+            removed: false,
+        });
+        let (sink, json, code) = render("react", &Ok(payload), true);
+        assert_eq!(sink, Sink::Stdout);
+        assert_eq!(code, 0);
+        assert_eq!(
+            json,
+            r#"{"ok":true,"command":"react","data":{"channel_id":"chan1","message_id":"msg1","emoji":"✅","removed":false}}"#
         );
     }
 

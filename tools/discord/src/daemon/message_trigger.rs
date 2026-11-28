@@ -39,6 +39,10 @@ const CHANNEL_LOOKUP_TIMEOUT: std::time::Duration = std::time::Duration::from_se
 /// in a fixed one and never waits on `workdirs` resolution.
 const ORCA_FORWARD_DIR: &str = "/";
 
+/// Upper bound for the ack reaction call. It runs on the gateway event loop
+/// after every target has started, so it only delays the next event.
+const ACK_REACTION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
 /// Validated message-trigger settings derived from config. Exists only when
 /// `on_message` or `on_message_orca` is configured — absence of both is how
 /// the feature is disabled.
@@ -48,6 +52,7 @@ pub(crate) struct MessageTriggerSettings {
     trigger_bots: HashSet<String>,
     hook: Option<HookTarget>,
     orca: Option<OrcaForward>,
+    ack_reaction: Option<String>,
 }
 
 /// `on_message` argv and where it runs. Workdirs belong to the hook only.
@@ -78,6 +83,16 @@ impl MessageTriggerSettings {
                 format!("trigger_bots entries must be numeric bot user ids, got {bad:?}"),
             ));
         }
+        if config
+            .ack_reaction
+            .as_deref()
+            .is_some_and(|emoji| emoji.trim().is_empty())
+        {
+            return Err(AppError::new(
+                ErrorKind::Config,
+                "ack_reaction must be an emoji (e.g. \"👀\") or omitted",
+            ));
+        }
         let issue_channels = config
             .issue_channels
             .iter()
@@ -98,6 +113,7 @@ impl MessageTriggerSettings {
             trigger_bots: config.trigger_bots.iter().cloned().collect(),
             hook,
             orca,
+            ack_reaction: config.ack_reaction.clone(),
         }))
     }
 }
@@ -321,6 +337,7 @@ impl<R: HookRunner> MessageTrigger<R> {
         .into_iter()
         .filter_map(Result::err)
         .collect();
+        self.acknowledge(api, &message).await;
         if failures.is_empty() {
             Ok(Some(trigger))
         } else {
@@ -329,6 +346,29 @@ impl<R: HookRunner> MessageTrigger<R> {
                 format!("message {}: {}", message.id, failures.join("; ")),
             ))
         }
+    }
+
+    /// Reacts with `ack_reaction` so the author sees the message was picked
+    /// up. Runs after the targets started, so it never delays them; it is a
+    /// courtesy, so a failure or timeout is one log line and no retry.
+    async fn acknowledge(&self, api: &impl DiscordApi, message: &IncomingMessage) {
+        let Some(emoji) = &self.settings.ack_reaction else {
+            return;
+        };
+        let result = tokio::time::timeout(
+            ACK_REACTION_TIMEOUT,
+            api.add_reaction(&message.channel_id, &message.id, emoji),
+        )
+        .await;
+        let reason = match result {
+            Ok(Ok(())) => return,
+            Ok(Err(e)) => e.to_human(),
+            Err(_) => format!("timed out after {ACK_REACTION_TIMEOUT:?}"),
+        };
+        eprintln!(
+            "daemon: ack reaction on message {} failed: {reason}",
+            message.id
+        );
     }
 
     /// `Err` carries a one-line reason naming the target.
