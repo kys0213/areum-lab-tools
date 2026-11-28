@@ -126,6 +126,22 @@ pub enum Command {
     /// and read back the answer.
     #[command(subcommand)]
     Ask(AskCommand),
+
+    /// Run a local MCP (Model Context Protocol) server over Streamable HTTP.
+    #[command(subcommand)]
+    Mcp(McpCommand),
+}
+
+#[derive(Subcommand, Debug)]
+pub enum McpCommand {
+    /// Serve send/read/react/thread_create as MCP tools at /mcp in the
+    /// foreground until SIGINT/SIGTERM. Holds no token: each request sends
+    /// `Authorization: Bot <token>`, so one server fronts several bots.
+    Serve {
+        /// Loopback address to listen on (127.0.0.1 or [::1] only).
+        #[arg(long, default_value = "127.0.0.1:8765")]
+        listen: String,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -225,6 +241,7 @@ impl Command {
             Command::React { .. } => "react",
             Command::Daemon(_) => "daemon",
             Command::Ask(_) => "ask",
+            Command::Mcp(_) => "mcp",
         }
     }
 }
@@ -325,6 +342,21 @@ mod tests {
             }
             other => panic!("expected Send, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn mcp_serve_defaults_to_loopback_port_8765_and_accepts_override() {
+        let cli = Cli::try_parse_from(["discord", "mcp", "serve"]).unwrap();
+        let Command::Mcp(McpCommand::Serve { listen }) = cli.command else {
+            panic!("expected mcp serve");
+        };
+        assert_eq!(listen, "127.0.0.1:8765");
+        let cli =
+            Cli::try_parse_from(["discord", "mcp", "serve", "--listen", "[::1]:9000"]).unwrap();
+        let Command::Mcp(McpCommand::Serve { listen }) = cli.command else {
+            panic!("expected mcp serve");
+        };
+        assert_eq!(listen, "[::1]:9000");
     }
 
     #[test]

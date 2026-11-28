@@ -168,6 +168,15 @@ pub(crate) struct ChannelInfo {
     pub parent_id: Option<String>,
 }
 
+/// Channel types that are threads (announcement, public, private).
+const THREAD_CHANNEL_TYPES: [u8; 3] = [10, 11, 12];
+
+impl ChannelInfo {
+    pub(crate) fn is_thread(&self) -> bool {
+        THREAD_CHANNEL_TYPES.contains(&self.kind)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

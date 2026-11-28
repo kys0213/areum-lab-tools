@@ -8,7 +8,7 @@ use crate::common::api::{
 };
 use crate::common::error::{AppError, ErrorKind};
 
-const API_BASE: &str = "https://discord.com/api/v10";
+pub(crate) const API_BASE: &str = "https://discord.com/api/v10";
 const USER_AGENT: &str = "DiscordBot (https://github.com/kys0213/areum-lab-tools, 0.0.0)";
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_RATE_LIMIT_RETRIES: u32 = 3;
@@ -24,18 +24,31 @@ pub struct HttpDiscordApi {
 
 impl HttpDiscordApi {
     pub fn new(token: String) -> Self {
-        let client = reqwest::Client::builder()
-            .timeout(REQUEST_TIMEOUT)
-            .user_agent(USER_AGENT)
-            .build()
-            .expect("static timeout + user-agent config is always a valid client");
+        Self::with_client(build_client(), token, API_BASE)
+    }
+
+    /// Reuses an existing connection pool. A long-running caller that acts
+    /// for a different bot on every request (the MCP server) shares one
+    /// [`reqwest::Client`] and only swaps the token.
+    pub(crate) fn with_client(client: reqwest::Client, token: String, base_url: &str) -> Self {
         Self {
             client,
             token,
-            base_url: API_BASE.to_string(),
+            base_url: base_url.to_owned(),
         }
     }
+}
 
+/// The REST client configuration every Discord call uses.
+pub(crate) fn build_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .timeout(REQUEST_TIMEOUT)
+        .user_agent(USER_AGENT)
+        .build()
+        .expect("static timeout + user-agent config is always a valid client")
+}
+
+impl HttpDiscordApi {
     fn authorized(&self, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
         request.header("Authorization", format!("Bot {}", self.token))
     }

@@ -88,6 +88,12 @@ pub struct DaemonStatusData {
     pub pending: usize,
 }
 
+/// `mcp serve` result, printed after the server shut down.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct McpServeData {
+    pub url: String,
+}
+
 /// `ask create` result. `status` is always `"pending"` — a freshly created
 /// ask cannot be anything else — but is carried as a field (rather than
 /// omitted) so the shape matches `ask result`'s status-bearing envelope.
@@ -152,6 +158,7 @@ pub enum Payload {
     AskCreate(AskCreateData),
     AskResult(AskResultData),
     AskWait(AskWaitData),
+    McpServe(McpServeData),
 }
 
 impl Payload {
@@ -225,6 +232,7 @@ impl Payload {
             Payload::DaemonStatus(d) => {
                 format!("daemon not running, {} pending ask(s)", d.pending)
             }
+            Payload::McpServe(d) => format!("mcp server at {} stopped", d.url),
             Payload::AskCreate(d) => format!(
                 "ask {} created in channel {} ({})",
                 d.ask_id, d.channel_id, d.status

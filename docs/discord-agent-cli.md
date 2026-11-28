@@ -89,6 +89,7 @@ discord [--token <TOKEN>] [--config <PATH>] [--json] <COMMAND>
   read <CHANNEL> [--after <MSG_ID>] [--limit N]          # limit 기본 50, 1..=100
   wait <CHANNEL> [--after <MSG_ID>] [--timeout SECS] [--interval SECS] [--limit N]  # 기본 60/5/50
   react <CHANNEL> <MESSAGE_ID> <EMOJI> [--remove]         # 봇의 반응 추가(--remove면 제거)
+  mcp serve [--listen <ADDR>]                             # 로컬 MCP 서버(기본 127.0.0.1:8765, loopback만). 상세는 docs/discord-mcp-server.md
 ```
 
 - `CHANNEL` = raw channel id 또는 config alias.
