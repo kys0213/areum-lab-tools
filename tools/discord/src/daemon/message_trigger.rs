@@ -31,9 +31,6 @@ use super::workdir::Workdirs;
 /// System messages (thread created, pins, joins) never trigger.
 const USER_MESSAGE_TYPES: [u8; 2] = [0, 19];
 
-/// Channel types that are threads (announcement, public, private).
-const THREAD_CHANNEL_TYPES: [u8; 3] = [10, 11, 12];
-
 /// Upper bound for the REST channel lookup. The lookup runs on the gateway
 /// event loop, so a slow Discord response must not stall every other event.
 const CHANNEL_LOOKUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
@@ -500,7 +497,7 @@ fn decide(
 /// Classifies a channel. A thread without `parent_id` violates Discord's
 /// channel contract, so it is an error rather than a guessed top level.
 fn placement_of(info: &ChannelInfo) -> Result<Placement, AppError> {
-    if !THREAD_CHANNEL_TYPES.contains(&info.kind) {
+    if !info.is_thread() {
         return Ok(Placement::TopLevel);
     }
     match &info.parent_id {
