@@ -3,7 +3,7 @@
 상주 데몬(`discord daemon`)이 봇 멘션이나 "이슈 채널"의 새 글을 감지하면, 메시지 정보를 설정한 대상에 넘겨요. 대상은 두 가지이고 함께 쓸 수 있어요.
 
 - `on_message`: 외부 명령을 실행하고 메시지 정보를 JSON 한 줄로 stdin에 넘겨요.
-- `on_message_orca`: 같은 컴퓨터의 Orca 봇에게 새 채팅으로 메시지를 넘겨요. 자세한 내용은 [Orca 봇으로 전달](#orca-봇으로-전달-on_message_orca)을 보세요.
+- `on_message_orca`: 같은 컴퓨터의 Orca 봇에게 메시지를 넘겨요. 스레드 하나가 Orca 채팅 하나로 이어져요. 자세한 내용은 [Orca 봇으로 전달](#orca-봇으로-전달-on_message_orca)을 보세요.
 
 - **왜**: Discord에서 봇을 부르면 다른 프로그램(런처 등)이 작업을 시작할 수 있게 하려고요. 게이트웨이 연결은 데몬 하나만 가지므로, 감지도 데몬이 맡아요.
 - **CLI가 하는 일**: 메시지를 거르고, 명령을 실행하고, JSON을 넘기는 것까지예요. 명령이 무엇을 하는지는 몰라요.
@@ -90,13 +90,14 @@ error [config]: gateway closed with 4014 (Disallowed Intents): message detection
 |---|---|---|
 | 1 | 작성자가 봇(`author.bot`)이거나 이 봇 자신이고, `trigger_bots`에 없음 | 발행 안 함 |
 | 2 | 사람이 쓴 일반 글·답장(메시지 type 0, 19)이 아님 — 스레드 생성 알림, 고정 알림, 입장 알림 같은 시스템 메시지 | 발행 안 함 |
-| 3 | 스레드 안의 글 | 봇 멘션이 있을 때만 `trigger: "mention"` |
+| 3 | 스레드 안의 글 | 봇 멘션이 있으면 `trigger: "mention"`. 멘션이 없어도 Orca 채팅이 이어진 스레드면 `trigger: "follow_up"`(Orca로만 전달) |
 | 4 | 이슈 채널의 최상위 글 | 멘션이 없어도 `trigger: "issue_channel"` (멘션이 있어도 이 한 번만) |
 | 5 | 그 밖의 채널 | 봇 멘션이 있을 때만 `trigger: "mention"` |
 
 - `trigger_bots`에 있는 봇(자기 자신 포함)의 메시지는 1번을 통과해 2~5번 규칙을 사람 메시지와 똑같이 거쳐요. stdin JSON에서는 `author.bot`이 `true`로 올 수 있어요.
 - **봇 멘션**은 메시지의 `mentions` 목록에 봇 user ID가 있는지로 판정해요. 역할 멘션과 `@everyone`/`@here`는 멘션으로 치지 않아요.
-- 이슈 채널 글에서 파생된 스레드 안의 글은 3번(스레드) 규칙을 따라요. 즉 스레드 답글은 멘션해야 발행돼요.
+- 이슈 채널 글에서 파생된 스레드 안의 글은 3번(스레드) 규칙을 따라요. 즉 Orca 채팅이 없는 스레드의 답글은 멘션해야 발행돼요.
+- `follow_up`은 `on_message_orca`를 설정했을 때만 생겨요. `on_message` 명령은 실행하지 않아요. 후속 메시지마다 Claude 세션이 뜨지 않게 하려는 거예요. 자세한 내용은 [스레드 대화 잇기](#스레드-대화-잇기)를 보세요.
 - 포럼 채널은 이슈 채널로 쓸 수 없어요. 포럼 글은 스레드라서 봇을 멘션해야 발행돼요.
 - 봇 user ID는 게이트웨이 READY 이벤트에서 얻어요.
 
@@ -106,13 +107,13 @@ error [config]: gateway closed with 4014 (Disallowed Intents): message detection
 
 - 채널 type 10·11·12(공지·공개·비공개 스레드)면 스레드로 보고 `parent_id`를 상위 채널로 써요.
 - 조회 결과는 데몬이 떠 있는 동안 캐시해요. 채널이 스레드인지와 상위 채널은 바뀌지 않기 때문이에요. 실패한 조회는 캐시하지 않고 다음 메시지에서 다시 조회해요.
-- 멘션도 없고 이슈 채널도 아닌 글은 조회 없이 바로 버려요.
+- 멘션도 없고 이슈 채널도 아니고 Orca 채팅이 이어진 스레드도 아닌 글은 조회 없이 바로 버려요.
 
 ### 루프 위험과 안전 조건
 
 `trigger_bots`에 이 봇 자신을 넣으면, 훅이 `discord send`로 올린 글이 다시 훅을 실행하는 순환이 생길 수 있어요.
 
-- 훅이 결과를 **스레드 안에 봇 멘션 없이** 올리면 스레드 규칙(3번) 때문에 다시 발행되지 않아요. 안전해요.
+- 훅이 결과를 **스레드 안에 봇 멘션 없이** 올리면, Orca 채팅이 없는 스레드에서는 3번 규칙 때문에 다시 발행되지 않아요. Orca 채팅이 이어진 스레드에서는 `follow_up`으로 요라에게 다시 전달돼요. 이 봇 자신을 `trigger_bots`에 넣었다면 이 순환을 조심하세요.
 - 훅이 **이슈 채널 최상위**에 글을 올리면 4번 규칙으로 다시 발행돼요. 무한 반복되므로 피하세요.
 - 목록의 봇이 이슈 채널이 아닌 일반 채널 최상위에 봇을 멘션해 글을 올려도 다시 트리거돼요.
 - `discord send --reply-to`로 봇 자신의 메시지에 답장하면, Discord가 답장 대상 작성자를 멘션 목록에 넣어(답장 알림이 켜진 기본 동작) 멘션으로 판정될 수 있어요. 이 CLI의 `send`는 답장 알림을 끄지 않으므로, 훅이 결과를 올릴 때는 `--reply-to`를 쓰지 마세요.
@@ -125,7 +126,7 @@ error [config]: gateway closed with 4014 (Disallowed Intents): message detection
 
 | 필드 | 형식 | 설명 |
 |---|---|---|
-| `trigger` | `"mention"` \| `"issue_channel"` | 발행 이유 |
+| `trigger` | `"mention"` \| `"issue_channel"` \| `"follow_up"` | 발행 이유. `follow_up`은 Orca로 넘기는 사본에만 나와요 |
 | `guild_id` | 문자열 | 서버 ID |
 | `channel_id` | 문자열 | 메시지가 올라온 채널. 스레드면 스레드 ID |
 | `parent_channel_id` | 문자열 \| `null` | 스레드일 때 상위 채널 ID, 아니면 `null` |
@@ -176,7 +177,7 @@ error [config]: gateway closed with 4014 (Disallowed Intents): message detection
 
 ## Orca 봇으로 전달 (`on_message_orca`)
 
-같은 컴퓨터에서 도는 Orca 앱의 봇에게 감지한 메시지를 넘겨요. 봇은 새 채팅에서 일을 받아 처리하고, `discord send`로 같은 채널(스레드)에 답해요.
+같은 컴퓨터에서 도는 Orca 앱의 봇에게 감지한 메시지를 넘겨요. 봇은 채팅에서 일을 받아 처리하고, `discord send`로 스레드에 답해요. 같은 스레드의 메시지는 같은 채팅으로 이어져요([스레드 대화 잇기](#스레드-대화-잇기)).
 
 - **왜**: Orca 웹훅은 Orca Cloud를 거쳐서 로그인과 비밀 URL 관리가 필요해요. 로컬 `orca` CLI는 둘 다 필요 없어요.
 - `on_message`와 독립된 대상이에요. 둘 다 설정하면 메시지 하나에 둘 다 실행해요.
@@ -197,17 +198,34 @@ error [config]: gateway closed with 4014 (Disallowed Intents): message detection
 데몬은 메시지마다 셸 없이 아래 명령을 실행하고, 본문은 stdin으로 넘겨요.
 
 ```
-<cli> orchestration send --from bot:<bot> --to bot:<bot> --chat new --type handoff --subject "Discord 멘션: <작성자> · #<채널>" --body-file -
+<cli> orchestration send --from bot:<bot> --to bot:<bot> --chat <new|채팅 ID> --type handoff --subject "Discord 멘션: <작성자> · #<채널>" --body-file - --json --full
 ```
 
+- `--chat`: 스레드에 이어진 채팅이 있으면 그 채팅 ID, 없으면 `new`예요.
+- `--json --full`: 결과의 `result.message.to_handle`(`orca_session_id:<채팅 ID>`)에서 새 채팅 ID를 읽으려고 붙여요.
 - `--from bot:<bot>`: 데몬은 Orca 터미널 밖에서 돌아서 보낸 사람을 추론할 수 없어요. `--from`이 없으면 CLI가 `no_active_sender_terminal`로 거부해요. 그래서 봇이 자기 자신에게 보내는 형태로 실행해요.
-- 제목의 채널은 `channels`에 별칭이 있으면 별칭(`#product-dev`), 없으면 ID예요. 스레드면 상위 채널 뒤에 ` 스레드`를 붙여요. 이슈 채널 글이면 `Discord 이슈 채널: ...`이에요.
-- 본문에는 메시지 링크, 답장 명령(`discord --json send <channel_id> --reply-to <message_id> "<답장>"`), 완료 표시 명령(`discord --json react <channel_id> <message_id> ✅`, 답장을 마친 뒤 실행), 위 [stdin JSON 계약](#stdin-json-계약)과 같은 JSON(`cwd`는 `null`)이 들어가요. `content`는 사용자가 쓴 글이라 지시가 아닌 데이터로 다루라는 안내도 붙여요.
+- 제목의 채널은 `channels`에 별칭이 있으면 별칭(`#product-dev`), 없으면 ID예요. 스레드면 상위 채널 뒤에 ` 스레드`를 붙여요. 이슈 채널 글이면 `Discord 이슈 채널: ...`, 후속 메시지면 `Discord 후속: ...`이에요.
+- 본문에는 메시지 링크, 답장 방법, 완료 표시 명령(`discord --json react <channel_id> <message_id> ✅`, 답장을 마친 뒤 실행), 위 [stdin JSON 계약](#stdin-json-계약)과 같은 JSON(`cwd`는 `null`)이 들어가요. `content`는 사용자가 쓴 글이라 지시가 아닌 데이터로 다루라는 안내도 붙여요.
+  - 스레드 안의 글: `discord --json send <스레드 ID> --reply-to <message_id> "<답장>"`
+  - 채널 최상위 글: 원본 메시지로 스레드를 만들고(`discord --json thread create <channel_id> --from-message <message_id> --name ...`) 그 스레드(ID = 원본 메시지 ID)에 답하라고 안내해요. 그래야 다음 메시지가 같은 채팅으로 이어져요.
 - 명령은 `/`에서 실행해요. `workdirs` 설정과 무관해서, `on_message`의 디렉토리가 없어도 Orca 전달은 실행돼요.
-- 실패 처리는 `on_message`와 같아요. 재시도 없이 데몬 stderr에 한 줄 남겨요.
-  - 실행 실패: `daemon: message handling failed: message <id>: on_message_orca not started: ...`
-  - 0이 아닌 코드로 종료(Orca 앱이 꺼져 있음, 봇 이름 오타 등): `daemon: command "<cli>" exited with ...`
-- 데몬은 `orca` 명령의 종료를 기다리지 않고, 시간 제한도 두지 않아요.
+- `on_message`와 달리 데몬은 `orca` 명령이 끝나기를 기다려요. 결과에서 채팅 ID를 읽어야 하기 때문이에요. 보통 0.1초쯤 걸리고, 10초가 넘으면 포기해요. 게이트웨이 이벤트 처리가 오래 밀리지 않게 하려는 제한이에요.
+- 실패는 데몬 stderr에 한 줄 남겨요.
+  - 실행 실패·0이 아닌 종료(Orca 앱이 꺼져 있음, 봇 이름 오타 등)·10초 초과: `daemon: message handling failed: message <id>: on_message_orca failed: ...`
+  - 결과에 채팅 ID가 없음: 같은 로그에 `orca send output has no chat id ...`가 붙어요. 추측한 ID를 저장하지 않아요.
+
+### 스레드 대화 잇기
+
+Discord 스레드 하나가 요라 채팅 하나예요. 스레드에서 이어지는 대화가 앞 맥락을 잃지 않게 하려는 거예요.
+
+- **대화 키**: 스레드 ID예요. 채널 최상위 글은 원본 메시지 ID를 키로 써요. 그 메시지로 만든 스레드가 같은 ID를 갖기 때문이에요.
+- **저장**: 새 채팅으로 처음 넘길 때 결과에서 채팅 ID를 읽어 `~/.areum/discord/discord.db`의 `thread_chats` 테이블에 `스레드 ID → 채팅 ID`로 저장해요.
+- **후속 메시지**: 채팅이 저장된 스레드의 글은 멘션이 없어도 그 채팅(`--chat <채팅 ID>`)으로 넘겨요(`trigger: "follow_up"`). 멘션이 있으면 `on_message`도 실행하고, Orca는 같은 채팅으로 넘겨요.
+- **봇 메시지**: 요라의 답장은 같은 Discord 봇으로 올라가서 필터 1번에 걸려요. 다시 요라에게 넘어가지 않아요.
+- **채팅이 없어졌을 때**: 저장된 채팅으로 보내기가 실패하면 로그를 남기고 새 채팅으로 한 번 보낸 뒤 저장 값을 바꿔요. 새 채팅도 실패하면 기존 저장 값을 그대로 두고 실패 로그를 남겨요.
+  - `daemon: orca chat <채팅 ID> for thread <스레드 ID> failed, starting a new chat: ...`
+- **감지 반응**: 후속 메시지에도 `ack_reaction`을 달아요.
+- **만료**: 저장 값은 지우지 않아요. 행 하나가 수십 바이트라 쌓여도 부담이 작고, 오래된 스레드에서 다시 말을 걸어도 같은 채팅으로 이어지는 편이 낫기 때문이에요.
 
 ### 설정 절차
 
@@ -215,6 +233,7 @@ error [config]: gateway closed with 4014 (Disallowed Intents): message detection
 2. `~/.areum/discord/config.json`에 `on_message_orca`를 넣어요.
 3. `discord daemon stop` 후 `discord daemon start`로 다시 띄워요.
 4. Discord에서 봇을 멘션하고, Orca에서 그 봇에게 `Discord 멘션: ...` 제목의 새 채팅이 열리는지 봐요.
+5. 요라가 만든 스레드에 멘션 없이 글을 쓰고, 같은 채팅에 `Discord 후속: ...` 메시지가 이어지는지 봐요.
 
 ## 확인 방법
 
@@ -246,3 +265,4 @@ tail -f /tmp/discord-trigger.log
 - **MESSAGE_CREATE 구독**: `on_message`를 설정했을 때 새 글이 데몬에 도착하는지 봐요. 이벤트 구독이 빠지면 아무 글도 쌓이지 않고 로그도 남지 않아요.
 - **채널별 실행 디렉토리**: 채널 2개를 서로 다른 디렉토리에 매핑하고 각 채널에서 멘션했을 때, 기록된 JSON의 `cwd`와 훅의 실제 현재 디렉토리(`pwd`)가 일치하는지 봐요. 매핑한 디렉토리를 지운 뒤 멘션하면 명령이 실행되지 않고 데몬 로그만 남는지도 봐요.
 - **4013/4014 close 처리**: Developer Portal에서 Message Content Intent를 끈 채 띄우면 데몬이 위 `4014 (Disallowed Intents)` 오류로 끝나고 재시도하지 않는지 봐요. 4013(Invalid Intents)은 데몬이 잘못된 인텐트 값을 보낼 때만 나서 수동 재현이 어렵고, close 코드 분류는 단위 테스트로 덮어요.
+- **스레드 대화 잇기**: 채널에서 봇을 멘션해 요라가 스레드를 만들어 답하게 한 뒤, 그 스레드에 멘션 없이 글을 써요. 요라의 같은 채팅에 `Discord 후속: ...` 메시지가 오고 새 채팅이 열리지 않는지, 요라의 답장이 다시 전달되지 않는지 봐요.

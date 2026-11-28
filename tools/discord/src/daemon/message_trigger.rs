@@ -6,10 +6,11 @@
 //! `docs/discord-message-trigger.md`).
 //!
 //! Filter rules: bots (including this bot) never trigger unless listed in
-//! `trigger_bots`, in which case they are judged like a person; inside a thread only
-//! a bot mention triggers; a top-level post in an issue channel triggers even
-//! without a mention (once, as `issue_channel`); anywhere else only a bot
-//! mention triggers.
+//! `trigger_bots`, in which case they are judged like a person; inside a thread a
+//! bot mention triggers, and so does any message in a thread that already has
+//! an Orca chat (`follow_up`, forwarded to Orca only); a top-level post in an
+//! issue channel triggers even without a mention (once, as `issue_channel`);
+//! anywhere else only a bot mention triggers.
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -19,8 +20,10 @@ use serde::{Deserialize, Serialize};
 use crate::common::api::{ChannelInfo, DiscordApi};
 use crate::common::config::{Config, resolve_channel};
 use crate::common::error::{AppError, ErrorKind};
+use crate::common::store::AskStore;
 
 use super::hook_runner::HookRunner;
+use super::orca_cli::OrcaCli;
 use super::orca_forward::{ForwardedMessage, OrcaForward};
 use super::workdir::Workdirs;
 
@@ -34,10 +37,6 @@ const THREAD_CHANNEL_TYPES: [u8; 3] = [10, 11, 12];
 /// Upper bound for the REST channel lookup. The lookup runs on the gateway
 /// event loop, so a slow Discord response must not stall every other event.
 const CHANNEL_LOOKUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
-
-/// The Orca CLI does not depend on its working directory, so the forward runs
-/// in a fixed one and never waits on `workdirs` resolution.
-const ORCA_FORWARD_DIR: &str = "/";
 
 /// Upper bound for the ack reaction call. It runs on the gateway event loop
 /// after every target has started, so it only delays the next event.
@@ -141,6 +140,9 @@ impl HookTarget {
 pub(super) enum Trigger {
     Mention,
     IssueChannel,
+    /// A message without a mention in a thread that already has an Orca
+    /// chat. Only the Orca forward sees it; `on_message` never runs for it.
+    FollowUp,
 }
 
 impl Trigger {
@@ -149,6 +151,7 @@ impl Trigger {
         match self {
             Trigger::Mention => "멘션",
             Trigger::IssueChannel => "이슈 채널",
+            Trigger::FollowUp => "후속",
         }
     }
 }
@@ -225,22 +228,32 @@ struct EventAuthor<'a> {
     bot: bool,
 }
 
-/// Stateful handler the gateway loop owns: settings, the hook runner, the bot
-/// user id learned from READY, and a channel-placement cache (a channel's
+/// Stateful handler the gateway loop owns: settings, the hook runner, the
+/// orca CLI, the store holding thread -> Orca chat mappings, the bot user id
+/// learned from READY, and a channel-placement cache (a channel's
 /// thread-ness and parent never change, so successful lookups are kept for
 /// the daemon's lifetime).
-pub(super) struct MessageTrigger<R: HookRunner> {
+pub(super) struct MessageTrigger<'s, R: HookRunner, O: OrcaCli> {
     settings: MessageTriggerSettings,
     runner: R,
+    orca_cli: O,
+    store: &'s AskStore,
     bot_user_id: Option<String>,
     placements: HashMap<String, Placement>,
 }
 
-impl<R: HookRunner> MessageTrigger<R> {
-    pub(super) fn new(settings: MessageTriggerSettings, runner: R) -> Self {
+impl<'s, R: HookRunner, O: OrcaCli> MessageTrigger<'s, R, O> {
+    pub(super) fn new(
+        settings: MessageTriggerSettings,
+        runner: R,
+        orca_cli: O,
+        store: &'s AskStore,
+    ) -> Self {
         Self {
             settings,
             runner,
+            orca_cli,
+            store,
             bot_user_id: None,
             placements: HashMap::new(),
         }
@@ -274,18 +287,20 @@ impl<R: HookRunner> MessageTrigger<R> {
         })?;
         let issue_channels = &self.settings.issue_channels;
         let trigger_bots = &self.settings.trigger_bots;
-        // A thread only ever publishes on a mention, which would also publish
-        // at top level — so a message that fails the top-level rule fails
-        // both, and the REST lookup can be skipped.
-        if decide(
+        // A thread publishes on a mention, which would also publish at top
+        // level, or as a follow-up in a thread with an Orca chat — so a
+        // message that fails the top-level rule and has no chat fails both,
+        // and the REST lookup can be skipped.
+        let top_level = decide(
             &message,
             bot_user_id,
             &Placement::TopLevel,
             issue_channels,
             trigger_bots,
-        )
-        .is_none()
-        {
+            false,
+        );
+        let in_conversation = top_level.is_none() && self.has_orca_chat(&message.channel_id)?;
+        if top_level.is_none() && !in_conversation {
             return Ok(None);
         }
         let placement = match self.placements.get(&message.channel_id) {
@@ -327,12 +342,14 @@ impl<R: HookRunner> MessageTrigger<R> {
             &placement,
             issue_channels,
             trigger_bots,
+            in_conversation,
         ) else {
             return Ok(None);
         };
         let failures: Vec<String> = [
             self.run_hook(&message, trigger, &placement, bot_user_id),
-            self.forward_to_orca(&message, trigger, &placement, bot_user_id),
+            self.forward_to_orca(&message, trigger, &placement, bot_user_id)
+                .await,
         ]
         .into_iter()
         .filter_map(Result::err)
@@ -346,6 +363,15 @@ impl<R: HookRunner> MessageTrigger<R> {
                 format!("message {}: {}", message.id, failures.join("; ")),
             ))
         }
+    }
+
+    /// Whether `channel_id` is a thread with a recorded Orca chat. Without
+    /// `on_message_orca` there is no conversation to continue.
+    fn has_orca_chat(&self, channel_id: &str) -> Result<bool, AppError> {
+        if self.settings.orca.is_none() {
+            return Ok(false);
+        }
+        Ok(self.store.thread_chat(channel_id)?.is_some())
     }
 
     /// Reacts with `ack_reaction` so the author sees the message was picked
@@ -382,6 +408,9 @@ impl<R: HookRunner> MessageTrigger<R> {
         let Some(hook) = &self.settings.hook else {
             return Ok(());
         };
+        if trigger == Trigger::FollowUp {
+            return Ok(());
+        }
         let not_started = |e: AppError| format!("on_message not started: {}", e.message);
         let cwd = hook
             .workdirs
@@ -395,7 +424,7 @@ impl<R: HookRunner> MessageTrigger<R> {
     }
 
     /// `Err` carries a one-line reason naming the target.
-    fn forward_to_orca(
+    async fn forward_to_orca(
         &self,
         message: &IncomingMessage,
         trigger: Trigger,
@@ -407,7 +436,7 @@ impl<R: HookRunner> MessageTrigger<R> {
         };
         let event_json = event_json(message, trigger, placement, bot_user_id, None);
         let message_url = message_url(message);
-        let (argv, body) = orca.command(&ForwardedMessage {
+        let forwarded = ForwardedMessage {
             trigger_label: trigger.label(),
             author_username: &message.author.username,
             channel_id: &message.channel_id,
@@ -415,10 +444,10 @@ impl<R: HookRunner> MessageTrigger<R> {
             message_id: &message.id,
             message_url: &message_url,
             event_json: &event_json,
-        });
-        self.runner
-            .run(&argv, Path::new(ORCA_FORWARD_DIR), body)
-            .map_err(|e| format!("on_message_orca not started: {}", e.message))
+        };
+        orca.forward(&self.orca_cli, self.store, &forwarded)
+            .await
+            .map_err(|e| format!("on_message_orca failed: {}", e.message))
     }
 }
 
@@ -436,14 +465,16 @@ fn message_url(message: &IncomingMessage) -> String {
     )
 }
 
-/// The filter table. Pure: given the message, the bot's id, and where the
-/// message lives, returns the trigger to publish (if any).
+/// The filter table. Pure: given the message, the bot's id, where the
+/// message lives, and whether its thread has an Orca chat, returns the
+/// trigger to publish (if any).
 fn decide(
     message: &IncomingMessage,
     bot_user_id: &str,
     placement: &Placement,
     issue_channels: &HashSet<String>,
     trigger_bots: &HashSet<String>,
+    in_conversation: bool,
 ) -> Option<Trigger> {
     // A bot (this one included) is judged like a person only when listed.
     let is_bot = message.author.bot || message.author.id == bot_user_id;
@@ -457,7 +488,8 @@ fn decide(
     // other fields (`mention_roles`, `mention_everyone`) and are ignored.
     let mentioned = message.mentions.iter().any(|m| m.id == bot_user_id);
     match placement {
-        Placement::Thread { .. } => mentioned.then_some(Trigger::Mention),
+        Placement::Thread { .. } if mentioned => Some(Trigger::Mention),
+        Placement::Thread { .. } => in_conversation.then_some(Trigger::FollowUp),
         Placement::TopLevel if issue_channels.contains(&message.channel_id) => {
             Some(Trigger::IssueChannel)
         }

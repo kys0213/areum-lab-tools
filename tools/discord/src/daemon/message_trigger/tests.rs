@@ -44,6 +44,70 @@ impl HookRunner for &FakeRunner {
     }
 }
 
+/// Records each orca CLI call and replays scripted outcomes (default: the
+/// send landed in a new chat `chat-new`).
+struct FakeOrca {
+    results: RefCell<VecDeque<Result<String, AppError>>>,
+    calls: RefCell<Vec<(Vec<String>, String)>>,
+}
+
+impl FakeOrca {
+    fn new() -> Self {
+        Self {
+            results: RefCell::new(VecDeque::new()),
+            calls: RefCell::new(Vec::new()),
+        }
+    }
+
+    fn then(self, result: Result<String, AppError>) -> Self {
+        self.results.borrow_mut().push_back(result);
+        self
+    }
+
+    /// The `--chat` value of each call, in order.
+    fn chats(&self) -> Vec<String> {
+        self.calls
+            .borrow()
+            .iter()
+            .map(|(argv, _)| {
+                let at = argv.iter().position(|a| a == "--chat").unwrap();
+                argv[at + 1].clone()
+            })
+            .collect()
+    }
+}
+
+/// `orchestration send --json --full` output naming the receiving chat.
+fn sent_to(chat: &str) -> Result<String, AppError> {
+    Ok(format!(
+        r#"{{"ok":true,"result":{{"message":{{"id":"msg_1","to_handle":"orca_session_id:{chat}"}}}}}}"#
+    ))
+}
+
+impl OrcaCli for &FakeOrca {
+    async fn run(&self, argv: &[String], body: &str) -> Result<String, AppError> {
+        self.calls
+            .borrow_mut()
+            .push((argv.to_vec(), body.to_owned()));
+        self.results
+            .borrow_mut()
+            .pop_front()
+            .unwrap_or_else(|| sent_to("chat-new"))
+    }
+}
+
+/// Fakes a test does not inspect; leaked so the trigger can borrow them for
+/// the whole test.
+fn unused_orca() -> &'static FakeOrca {
+    Box::leak(Box::new(FakeOrca::new()))
+}
+
+fn unused_store() -> &'static AskStore {
+    Box::leak(Box::new(AskStore::open_in_memory().unwrap()))
+}
+
+type TestTrigger<'a> = MessageTrigger<'a, &'a FakeRunner, &'a FakeOrca>;
+
 fn dir(label: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!(
         "areum-discord-trigger-{}-{label}",
@@ -73,11 +137,17 @@ fn settings() -> MessageTriggerSettings {
     ))
 }
 
-fn trigger_with(
+fn trigger_with(settings: MessageTriggerSettings, runner: &FakeRunner) -> TestTrigger<'_> {
+    trigger_full(settings, runner, unused_orca(), unused_store())
+}
+
+fn trigger_full<'a>(
     settings: MessageTriggerSettings,
-    runner: &FakeRunner,
-) -> MessageTrigger<&FakeRunner> {
-    let mut trigger = MessageTrigger::new(settings, runner);
+    runner: &'a FakeRunner,
+    orca: &'a FakeOrca,
+    store: &'a AskStore,
+) -> TestTrigger<'a> {
+    let mut trigger = MessageTrigger::new(settings, runner, orca, store);
     trigger.set_bot_user_id(BOT.to_owned());
     trigger
 }
@@ -93,10 +163,8 @@ fn parse(json: &str) -> Config {
     crate::common::config::parse_config(json).unwrap()
 }
 
-fn trigger(runner: &FakeRunner) -> MessageTrigger<&FakeRunner> {
-    let mut trigger = MessageTrigger::new(settings(), runner);
-    trigger.set_bot_user_id(BOT.to_owned());
-    trigger
+fn trigger(runner: &FakeRunner) -> TestTrigger<'_> {
+    trigger_with(settings(), runner)
 }
 
 fn message(channel_id: &str, mentions: &[&str]) -> serde_json::Value {
@@ -779,7 +847,7 @@ async fn thread_without_parent_id_is_an_error_not_a_guess() {
 async fn message_before_ready_is_an_error() {
     let runner = FakeRunner::new();
     let api = MockDiscordApi::new();
-    let mut trigger = MessageTrigger::new(settings(), &runner);
+    let mut trigger = MessageTrigger::new(settings(), &runner, unused_orca(), unused_store());
 
     let result = trigger.handle(&api, &message("c1", &[BOT])).await;
 
@@ -860,16 +928,6 @@ fn both_settings() -> MessageTriggerSettings {
     ))
 }
 
-fn orca_calls(runner: &FakeRunner) -> Vec<(Vec<String>, String)> {
-    runner
-        .calls
-        .borrow()
-        .iter()
-        .filter(|(argv, _)| argv[0] == ORCA)
-        .cloned()
-        .collect()
-}
-
 fn hook_calls(runner: &FakeRunner) -> usize {
     runner
         .calls
@@ -878,6 +936,21 @@ fn hook_calls(runner: &FakeRunner) -> usize {
         .filter(|(argv, _)| argv[0] == HOOK)
         .count()
 }
+
+fn thread_message(thread: &str, id: &str, mentions: &[&str]) -> serde_json::Value {
+    let mut msg = message(thread, mentions);
+    msg["id"] = serde_json::json!(id);
+    msg["content"] = serde_json::json!("이어서 이것도 봐줘");
+    msg
+}
+
+fn bot_message(thread: &str, author: &str) -> serde_json::Value {
+    let mut msg = thread_message(thread, "m9", &[]);
+    msg["author"] = serde_json::json!({ "id": author, "username": "요라봇", "bot": true });
+    msg
+}
+
+const NOW: &str = "2026-11-25T00:00:00Z";
 
 #[test]
 fn settings_with_only_on_message_orca_need_no_workdir() {
@@ -893,19 +966,24 @@ fn settings_reject_on_message_orca_with_a_relative_cli() {
 
 #[tokio::test]
 async fn mention_runs_the_hook_and_forwards_to_orca() {
-    let runner = FakeRunner::new();
+    let (runner, orca, store) = (
+        FakeRunner::new(),
+        FakeOrca::new(),
+        AskStore::open_in_memory().unwrap(),
+    );
     let api = api_with_channels(vec![thread("t1", "c1")]);
 
-    let outcome = trigger_with(both_settings(), &runner)
+    let outcome = trigger_full(both_settings(), &runner, &orca, &store)
         .handle(&api, &message("t1", &[BOT]))
         .await
         .unwrap();
 
     assert_eq!(outcome, Some(Trigger::Mention));
     assert_eq!(hook_calls(&runner), 1);
-    let orca = orca_calls(&runner);
-    assert_eq!(orca.len(), 1);
-    let (argv, body) = &orca[0];
+    let calls = orca.calls.borrow();
+    assert_eq!(calls.len(), 1);
+    let (argv, body) = &calls[0];
+    assert_eq!(argv[0], ORCA);
     assert!(argv.contains(&"bot:요라".to_owned()), "{argv:?}");
     assert!(
         body.contains(&format!("https://discord.com/channels/{GUILD}/t1/m1")),
@@ -920,27 +998,208 @@ async fn mention_runs_the_hook_and_forwards_to_orca() {
 
 #[tokio::test]
 async fn orca_only_settings_forward_without_running_a_hook() {
-    let runner = FakeRunner::new();
+    let (runner, orca) = (FakeRunner::new(), FakeOrca::new());
     let api = api_with_channels(vec![text_channel("c1")]);
 
-    let outcome = trigger_with(orca_only_settings(), &runner)
+    let outcome = trigger_full(orca_only_settings(), &runner, &orca, unused_store())
         .handle(&api, &message("c1", &[BOT]))
         .await
         .unwrap();
 
     assert_eq!(outcome, Some(Trigger::Mention));
-    assert_eq!(runner.calls.borrow().len(), 1);
-    assert_eq!(orca_calls(&runner).len(), 1);
-    assert_eq!(runner.dirs.borrow().as_slice(), [PathBuf::from("/")]);
+    assert!(runner.calls.borrow().is_empty());
+    assert_eq!(orca.calls.borrow().len(), 1);
 }
 
 #[tokio::test]
 async fn filtered_message_is_not_forwarded_to_orca() {
-    let runner = FakeRunner::new();
+    let (runner, orca) = (FakeRunner::new(), FakeOrca::new());
     let api = MockDiscordApi::new();
 
-    let outcome = trigger_with(both_settings(), &runner)
+    let outcome = trigger_full(both_settings(), &runner, &orca, unused_store())
         .handle(&api, &message("c1", &[]))
+        .await
+        .unwrap();
+
+    assert_eq!(outcome, None);
+    assert!(runner.calls.borrow().is_empty());
+    assert!(orca.calls.borrow().is_empty());
+}
+
+#[tokio::test]
+async fn unusable_workdir_still_forwards_to_orca_and_reports_the_hook_failure() {
+    let (runner, orca) = (FakeRunner::new(), FakeOrca::new());
+    let api = api_with_channels(vec![text_channel("c2")]);
+    let mapped = dir("orca-nodefault-other");
+    let extra = format!("{}{}", mapped_to("c1", &mapped), orca_extra());
+
+    let result = trigger_full(settings_from(&extra), &runner, &orca, unused_store())
+        .handle(&api, &message("c2", &[BOT]))
+        .await;
+
+    let err = result.expect_err("the hook could not run");
+    assert!(err.message.contains("on_message"), "{}", err.message);
+    assert_eq!(hook_calls(&runner), 0);
+    assert_eq!(orca.calls.borrow().len(), 1);
+}
+
+#[tokio::test]
+async fn orca_failure_is_reported_after_the_hook_ran() {
+    let runner = FakeRunner::new();
+    let orca = FakeOrca::new().then(Err(AppError::new(
+        ErrorKind::Internal,
+        "orca exited with 1",
+    )));
+    let api = api_with_channels(vec![text_channel("c1")]);
+
+    let result = trigger_full(both_settings(), &runner, &orca, unused_store())
+        .handle(&api, &message("c1", &[BOT]))
+        .await;
+
+    let err = result.expect_err("the orca forward failed");
+    assert!(err.message.contains("on_message_orca"), "{}", err.message);
+    assert_eq!(hook_calls(&runner), 1);
+    assert_eq!(orca.calls.borrow().len(), 1);
+}
+
+// ---- thread conversation (one thread = one Orca chat) ----
+
+#[tokio::test]
+async fn first_thread_mention_opens_a_new_chat_and_records_it_for_the_thread() {
+    let (runner, store) = (FakeRunner::new(), AskStore::open_in_memory().unwrap());
+    let orca = FakeOrca::new().then(sent_to("chat-a"));
+    let api = api_with_channels(vec![thread("t1", "c1")]);
+
+    trigger_full(orca_only_settings(), &runner, &orca, &store)
+        .handle(&api, &message("t1", &[BOT]))
+        .await
+        .unwrap();
+
+    assert_eq!(orca.chats(), ["new"]);
+    assert_eq!(store.thread_chat("t1").unwrap().as_deref(), Some("chat-a"));
+}
+
+#[tokio::test]
+async fn top_level_mention_records_the_chat_under_the_message_id() {
+    let (runner, store) = (FakeRunner::new(), AskStore::open_in_memory().unwrap());
+    let orca = FakeOrca::new().then(sent_to("chat-a"));
+    let api = api_with_channels(vec![text_channel("c1")]);
+
+    trigger_full(orca_only_settings(), &runner, &orca, &store)
+        .handle(&api, &message("c1", &[BOT]))
+        .await
+        .unwrap();
+
+    // A thread created from message m1 gets the id m1.
+    assert_eq!(store.thread_chat("m1").unwrap().as_deref(), Some("chat-a"));
+    let body = &orca.calls.borrow()[0].1;
+    assert!(
+        body.contains("discord --json thread create c1 --from-message m1"),
+        "{body}"
+    );
+}
+
+#[tokio::test]
+async fn follow_up_without_mention_continues_the_chat_and_skips_the_hook() {
+    let (runner, orca, store) = (
+        FakeRunner::new(),
+        FakeOrca::new(),
+        AskStore::open_in_memory().unwrap(),
+    );
+    store.set_thread_chat("t1", "chat-a", NOW).unwrap();
+    let api = api_with_channels(vec![thread("t1", "c1")]);
+
+    let outcome = trigger_full(both_settings(), &runner, &orca, &store)
+        .handle(&api, &thread_message("t1", "m2", &[]))
+        .await
+        .unwrap();
+
+    assert_eq!(outcome, Some(Trigger::FollowUp));
+    assert_eq!(hook_calls(&runner), 0);
+    assert_eq!(orca.chats(), ["chat-a"]);
+    let (argv, body) = &orca.calls.borrow()[0];
+    assert!(
+        argv.iter().any(|a| a.starts_with("Discord 후속: alice")),
+        "{argv:?}"
+    );
+    assert!(body.contains(r#""trigger":"follow_up""#), "{body}");
+    assert!(
+        body.contains("discord --json send t1 --reply-to m2"),
+        "{body}"
+    );
+}
+
+#[tokio::test]
+async fn mention_in_a_thread_with_a_chat_runs_the_hook_and_continues_the_chat() {
+    let (runner, orca, store) = (
+        FakeRunner::new(),
+        FakeOrca::new(),
+        AskStore::open_in_memory().unwrap(),
+    );
+    store.set_thread_chat("t1", "chat-a", NOW).unwrap();
+    let api = api_with_channels(vec![thread("t1", "c1")]);
+
+    let outcome = trigger_full(both_settings(), &runner, &orca, &store)
+        .handle(&api, &thread_message("t1", "m2", &[BOT]))
+        .await
+        .unwrap();
+
+    assert_eq!(outcome, Some(Trigger::Mention));
+    assert_eq!(hook_calls(&runner), 1);
+    assert_eq!(orca.chats(), ["chat-a"]);
+}
+
+#[tokio::test]
+async fn thread_without_a_chat_still_needs_a_mention() {
+    let (runner, orca, store) = (
+        FakeRunner::new(),
+        FakeOrca::new(),
+        AskStore::open_in_memory().unwrap(),
+    );
+    store.set_thread_chat("t-other", "chat-a", NOW).unwrap();
+    let api = api_with_channels(vec![thread("t1", "c1")]);
+
+    let outcome = trigger_full(both_settings(), &runner, &orca, &store)
+        .handle(&api, &thread_message("t1", "m2", &[]))
+        .await
+        .unwrap();
+
+    assert_eq!(outcome, None);
+    assert!(orca.calls.borrow().is_empty());
+}
+
+/// Loop guard: the Orca bot answers through the same Discord bot, so its
+/// replies in the thread must not be forwarded back to it.
+#[tokio::test]
+async fn own_reply_in_a_thread_with_a_chat_is_not_forwarded() {
+    let (runner, orca, store) = (
+        FakeRunner::new(),
+        FakeOrca::new(),
+        AskStore::open_in_memory().unwrap(),
+    );
+    store.set_thread_chat("t1", "chat-a", NOW).unwrap();
+    let api = api_with_channels(vec![thread("t1", "c1")]);
+    let mut trigger = trigger_full(both_settings(), &runner, &orca, &store);
+
+    let own = trigger.handle(&api, &bot_message("t1", BOT)).await.unwrap();
+    let other = trigger
+        .handle(&api, &bot_message("t1", "777"))
+        .await
+        .unwrap();
+
+    assert_eq!((own, other), (None, None));
+    assert!(orca.calls.borrow().is_empty());
+    assert!(runner.calls.borrow().is_empty());
+}
+
+#[tokio::test]
+async fn follow_up_is_ignored_without_on_message_orca() {
+    let (runner, store) = (FakeRunner::new(), AskStore::open_in_memory().unwrap());
+    store.set_thread_chat("t1", "chat-a", NOW).unwrap();
+    let api = api_with_channels(vec![thread("t1", "c1")]);
+
+    let outcome = trigger_full(settings(), &runner, unused_orca(), &store)
+        .handle(&api, &thread_message("t1", "m2", &[]))
         .await
         .unwrap();
 
@@ -949,40 +1208,97 @@ async fn filtered_message_is_not_forwarded_to_orca() {
 }
 
 #[tokio::test]
-async fn unusable_workdir_still_forwards_to_orca_and_reports_the_hook_failure() {
-    let runner = FakeRunner::new();
-    let api = api_with_channels(vec![text_channel("c2")]);
-    let mapped = dir("orca-nodefault-other");
-    let extra = format!("{}{}", mapped_to("c1", &mapped), orca_extra());
+async fn failed_recorded_chat_falls_back_to_a_new_chat_once_and_records_it() {
+    let (runner, store) = (FakeRunner::new(), AskStore::open_in_memory().unwrap());
+    store.set_thread_chat("t1", "chat-gone", NOW).unwrap();
+    let orca = FakeOrca::new()
+        .then(Err(AppError::new(
+            ErrorKind::Internal,
+            "요라 has no chat chat-gone",
+        )))
+        .then(sent_to("chat-b"));
+    let api = api_with_channels(vec![thread("t1", "c1")]);
 
-    let result = trigger_with(settings_from(&extra), &runner)
-        .handle(&api, &message("c2", &[BOT]))
-        .await;
+    let outcome = trigger_full(orca_only_settings(), &runner, &orca, &store)
+        .handle(&api, &thread_message("t1", "m2", &[]))
+        .await
+        .unwrap();
 
-    let err = result.expect_err("the hook could not run");
-    assert!(err.message.contains("on_message"), "{}", err.message);
-    assert_eq!(hook_calls(&runner), 0);
-    assert_eq!(orca_calls(&runner).len(), 1);
+    assert_eq!(outcome, Some(Trigger::FollowUp));
+    assert_eq!(orca.chats(), ["chat-gone", "new"]);
+    assert_eq!(store.thread_chat("t1").unwrap().as_deref(), Some("chat-b"));
 }
 
 #[tokio::test]
-async fn orca_start_failure_is_reported_after_the_hook_ran() {
-    let runner = FakeRunner::new();
-    {
-        let mut results = runner.results.borrow_mut();
-        results.push_back(Ok(()));
-        results.push_back(Err(AppError::new(ErrorKind::Internal, "spawn failed")));
-    }
-    let api = api_with_channels(vec![text_channel("c1")]);
+async fn failed_fallback_is_reported_and_keeps_the_old_mapping() {
+    let (runner, store) = (FakeRunner::new(), AskStore::open_in_memory().unwrap());
+    store.set_thread_chat("t1", "chat-gone", NOW).unwrap();
+    let orca = FakeOrca::new()
+        .then(Err(AppError::new(ErrorKind::Internal, "no chat")))
+        .then(Err(AppError::new(
+            ErrorKind::Internal,
+            "orca is not running",
+        )));
+    let api = api_with_channels(vec![thread("t1", "c1")]);
 
-    let result = trigger_with(both_settings(), &runner)
-        .handle(&api, &message("c1", &[BOT]))
-        .await;
+    let err = trigger_full(orca_only_settings(), &runner, &orca, &store)
+        .handle(&api, &thread_message("t1", "m2", &[]))
+        .await
+        .expect_err("both sends failed");
 
-    let err = result.expect_err("the orca forward could not start");
-    assert!(err.message.contains("on_message_orca"), "{}", err.message);
-    assert_eq!(hook_calls(&runner), 1);
-    assert_eq!(orca_calls(&runner).len(), 1);
+    assert!(
+        err.message.contains("orca is not running"),
+        "{}",
+        err.message
+    );
+    assert_eq!(orca.chats(), ["chat-gone", "new"]);
+    assert_eq!(
+        store.thread_chat("t1").unwrap().as_deref(),
+        Some("chat-gone")
+    );
+}
+
+#[tokio::test]
+async fn new_chat_output_without_a_chat_id_is_reported_and_records_nothing() {
+    let (runner, store) = (FakeRunner::new(), AskStore::open_in_memory().unwrap());
+    let orca = FakeOrca::new().then(Ok(
+        r#"{"ok":true,"result":{"messageId":"msg_1"}}"#.to_owned()
+    ));
+    let api = api_with_channels(vec![thread("t1", "c1")]);
+
+    let err = trigger_full(orca_only_settings(), &runner, &orca, &store)
+        .handle(&api, &message("t1", &[BOT]))
+        .await
+        .expect_err("chat id missing");
+
+    assert!(err.message.contains("no chat id"), "{}", err.message);
+    assert_eq!(store.thread_chat("t1").unwrap(), None);
+}
+
+#[tokio::test]
+async fn follow_up_gets_the_ack_reaction() {
+    let (runner, orca, store) = (
+        FakeRunner::new(),
+        FakeOrca::new(),
+        AskStore::open_in_memory().unwrap(),
+    );
+    store.set_thread_chat("t1", "chat-a", NOW).unwrap();
+    let api = api_with_channels(vec![thread("t1", "c1")]);
+    let settings = MessageTriggerSettings::from_config(&parse(&format!(
+        r#"{{"on_message_orca":{{"cli":"{ORCA}","bot":"요라"}},"ack_reaction":"👀"}}"#
+    )))
+    .unwrap()
+    .unwrap();
+
+    trigger_full(settings, &runner, &orca, &store)
+        .handle(&api, &thread_message("t1", "m2", &[]))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        reactions(&api),
+        [(false, "t1".to_owned(), "m2".to_owned(), "👀".to_owned())]
+    );
 }
 
 // ---- ack reaction ----
