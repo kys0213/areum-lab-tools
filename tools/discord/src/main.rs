@@ -2,6 +2,7 @@ mod cli;
 mod commands;
 mod common;
 mod daemon;
+mod mcp;
 mod output;
 
 use std::io::Read;
@@ -9,7 +10,7 @@ use std::path::PathBuf;
 
 use clap::Parser;
 
-use cli::{AskCommand, Cli, Command, DaemonCommand, ThreadCommand};
+use cli::{AskCommand, Cli, Command, DaemonCommand, McpCommand, ThreadCommand};
 use commands::TokioSleeper;
 use common::config;
 use common::http::HttpDiscordApi;
@@ -172,6 +173,9 @@ async fn run(cli: Cli) -> Result<Payload, AppError> {
             )
             .await
         }
+        // No token resolution: the MCP server takes the bot token from each
+        // request's Authorization header, never from config.
+        Command::Mcp(McpCommand::Serve { listen }) => commands::run_mcp_serve(&listen).await,
         Command::Ask(AskCommand::Result { ask_id }) => {
             let db_path = config::default_db_path()?;
             commands::run_ask_result(&db_path, &ask_id)

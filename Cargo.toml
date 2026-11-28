@@ -24,6 +24,8 @@ twilight-gateway = { version = "0.17", default-features = false, features = ["ru
 twilight-model = "0.17"
 # Unix process signalling (kill(2) liveness probe + SIGTERM) for daemon stop/status.
 libc = "0.2"
+rmcp = { version = "3.12", default-features = false, features = ["server", "transport-streamable-http-server"] }
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
 
 [profile.release]
 strip = true

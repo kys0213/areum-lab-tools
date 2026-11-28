@@ -4,7 +4,8 @@ mod payload;
 pub(crate) use crate::common::error::{AppError, ErrorKind, exit_code};
 pub(crate) use payload::{
     AskCreateData, AskResultData, AskWaitData, DaemonStartData, DaemonStatusData, DaemonStopData,
-    InitData, Payload, ReactData, ReadData, SendData, SendSplitData, ThreadData, WaitData,
+    InitData, McpServeData, Payload, ReactData, ReadData, SendData, SendSplitData, ThreadData,
+    WaitData,
 };
 
 /// Which stream a rendered line belongs on. Human-mode errors are
